@@ -134,16 +134,22 @@ class LibrarySidebar(ctk.CTkFrame):
         self.count_label.pack(pady=PADDING_SMALL)
     
     def _browse_folder(self):
-        """Open folder browser dialog."""
+        """Open folder browser dialog (macOS Sonoma safe)."""
+        # Delay the actual dialog slightly
+        self.after(800, self._open_folder_dialog)
+    
+    
+    def _open_folder_dialog(self):
         from tkinter import filedialog
-        
+    
         folder = filedialog.askdirectory(
             title="Select Music Folder",
             initialdir=self.current_folder or os.path.expanduser("~")
         )
-        
+    
         if folder:
             self.load_folder(folder)
+
     
     def load_folder(self, folder_path: str):
         """Load songs from a folder."""
@@ -215,4 +221,5 @@ class LibrarySidebar(ctk.CTkFrame):
                 self.song_buttons[i].configure(
                     fg_color="transparent",
                     text_color=COLOR_TEXT
+
                 )
