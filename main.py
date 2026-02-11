@@ -24,6 +24,8 @@ from tkinter import ttk
 import ctypes
 import sys
 
+from utils.ffmpeg_downloader import check_startup
+
 # PIL is required for handling the logo image
 from PIL import Image, ImageTk
 
@@ -210,9 +212,13 @@ def reset_python_imports():
     
     print(f"Cache cleared for {len(modules_to_reset)} UI modules.")
 
+# FILE: main.py
+
+
 def main():
     make_dpi_aware()
 
+    # 1. SETUP & LOGGING (Must happen first!)
     parser = argparse.ArgumentParser()
     parser.add_argument("--ffmpeg", default=None)
     parser.add_argument("--debug", action="store_true")
@@ -222,28 +228,49 @@ def main():
     logger = setup_logging(debug=args.debug)
     logger.info("Loop Station Starting")
     
+    # 2. DETERMINE PATHS
+    # We need to know where we expect ffmpeg to be before we check if it's there
     ffmpeg_path = args.ffmpeg or find_ffmpeg()
-    logger.info(f"Using ffmpeg: {ffmpeg_path}")
+    
+    # Import config after logging setup just in case
+    import config 
 
-    import config # Import config to reload theme
+    # 3. AUTO-DOWNLOAD CHECK
+    # We create a temporary hidden root window just for the download popup.
+    # We don't use the full app yet because it might try to load audio engine stuff.
+    try:
+        # Create a dummy window for the downloader to parent to
+        dummy_root = tk.Tk()
+        dummy_root.withdraw() # Hide it
+        
+        if not check_startup(dummy_root):
+            logger.error("FFmpeg missing and download declined. Exiting.")
+            dummy_root.destroy()
+            sys.exit(1)
+            
+        dummy_root.destroy() # Cleanup dummy window
+        
+        # Re-detect path in case we just downloaded it
+        ffmpeg_path = args.ffmpeg or find_ffmpeg()
+        logger.info(f"Using ffmpeg: {ffmpeg_path}")
+        
+    except Exception as e:
+        logger.exception(f"Startup check failed: {e}")
+        sys.exit(1)
 
-    # --- APP LIFECYCLE LOOP ---
+    # 4. APP LIFECYCLE LOOP (Now safe to start)
     first_run = True
     while True:
         try:
-            # 1. CLEAN SLATE (The Fix)
-            # If this isn't the first run, wipe the old UI code from memory
             if not first_run:
                 reset_python_imports()
 
-            # 2. RELOAD THEME & IMPORT APP
             config.load_theme()
             
-            # Re-import the app class AFTER clearing the cache
-            # This forces it to read the new colors from config
+            # Late import to ensure it uses fresh config
             from frontend.app import LoopStationApp 
 
-            # 3. CREATE APP SHELL
+            # Create the REAL app
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
             
             if first_run:
@@ -270,10 +297,8 @@ def main():
                 center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
                 app.initialize_audio_system()
 
-            # 4. RUN APP
             app.run()
             
-            # 5. CHECK FOR RESTART
             if not app.restart_required:
                 break 
                 
