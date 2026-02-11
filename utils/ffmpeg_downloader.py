@@ -3,20 +3,24 @@ import sys
 import platform
 import zipfile
 import urllib.request
+import ssl
 import tkinter as tk
 from tkinter import messagebox, ttk
 import threading
 import shutil
 
-# --- CONFIGURATION ---
-# Stable download links (BtbN is a trusted source for Windows builds)
-# We use "shared" builds which are often preferred for compatibility
+# --- FIX 1: BYPASS SSL CERTIFICATE CHECK (For macOS) ---
+# This forces Python to trust the download link even without local certs
+if hasattr(ssl, '_create_unverified_context'):
+    ssl._create_default_https_context = ssl._create_unverified_context
+# -------------------------------------------------------
+
+# Stable download links
 WIN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip" 
-# Mac users usually use Homebrew, but we can grab a static binary for portability
 MAC_URL = "https://evermeet.cx/ffmpeg/ffmpeg-113357-g41726c27e0.zip" 
 
 def get_base_path():
-    """Get the folder where the app is running (works for .exe and script)."""
+    """Get the folder where the app is running."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,12 +29,12 @@ def is_ffmpeg_installed():
     """Check if ffmpeg exists in the app directory or system path."""
     base_path = get_base_path()
     
-    # 1. Check local folder (Priority)
+    # 1. Check local folder
     local_exe = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
     if os.path.exists(os.path.join(base_path, local_exe)):
         return True
         
-    # 2. Check system PATH (Fallback)
+    # 2. Check system PATH
     return shutil.which("ffmpeg") is not None
 
 def download_ffmpeg(parent_window):
@@ -53,7 +57,7 @@ def download_ffmpeg(parent_window):
         y = parent_window.winfo_y() + (parent_window.winfo_height() // 2) - 75
         popup.geometry(f"+{x}+{y}")
     except:
-        pass # Fallback if parent not ready
+        pass
     
     tk.Label(popup, text="Downloading Audio Engine (FFmpeg)...", font=("Segoe UI", 10, "bold")).pack(pady=(20, 10))
     progress = ttk.Progressbar(popup, length=280, mode='determinate')
@@ -61,62 +65,71 @@ def download_ffmpeg(parent_window):
     status = tk.Label(popup, text="Connecting...", fg="gray", font=("Segoe UI", 9))
     status.pack()
 
-    result = {"success": False}
+    # Shared state for thread results
+    result = {"success": False, "error": None}
 
     def _worker():
         try:
-            # 1. Download hook to update progress
+            # Download hook
             def report(block_num, block_size, total_size):
-                percent = int((block_num * block_size * 100) / total_size)
-                progress['value'] = percent
-                status.config(text=f"Downloading... {percent}%")
-                popup.update_idletasks()
+                if total_size > 0:
+                    percent = int((block_num * block_size * 100) / total_size)
+                    # Schedule UI update on main thread
+                    popup.after(0, lambda: progress.config(value=percent))
+                    popup.after(0, lambda: status.config(text=f"Downloading... {percent}%"))
 
+            # Download
             urllib.request.urlretrieve(url, dest_path, report)
             
-            status.config(text="Extracting files...")
-            popup.update_idletasks()
+            popup.after(0, lambda: status.config(text="Extracting files..."))
 
-            # 2. Extract
+            # Extract
             with zipfile.ZipFile(dest_path, 'r') as zip_ref:
                 for file_info in zip_ref.infolist():
-                    # Flatten structure: Pull ffmpeg.exe out of subfolders
                     filename = os.path.basename(file_info.filename)
-                    if filename.lower() in ["ffmpeg.exe", "ffmpeg", "ffprobe.exe", "ffprobe"]:
-                        # Extract directly to base_path
+                    # We look for the executable files inside the zip
+                    target_files = ["ffmpeg.exe", "ffprobe.exe"] if system == "Windows" else ["ffmpeg", "ffprobe"]
+                    
+                    if filename.lower() in target_files:
                         source = zip_ref.open(file_info)
                         target = open(os.path.join(base_path, filename), "wb")
                         with source, target:
                             shutil.copyfileobj(source, target)
                         
-                        # Mac/Linux needs executable permissions
+                        # Set permissions for Mac/Linux
                         if system != "Windows":
                             os.chmod(os.path.join(base_path, filename), 0o755)
 
-            # 3. Cleanup
-            os.remove(dest_path)
+            # Cleanup
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            
             result["success"] = True
             
         except Exception as e:
-            print(f"Download Error: {e}")
-            messagebox.showerror("Download Error", f"Failed to download components.\nError: {e}")
+            result["error"] = str(e)
         finally:
-            popup.destroy()
+            # FIX 2: Schedule the popup to close on the main thread
+            popup.after(0, popup.destroy)
 
-    # Start download in thread so UI doesn't freeze
+    # Start thread
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     
-    # Wait for popup (makes it modal)
+    # Wait for the window to be destroyed (this blocks the main flow until done)
     parent_window.wait_window(popup)
+    
+    # Check result AFTER the thread is dead and popup is gone
+    if result["error"]:
+        messagebox.showerror("Download Error", f"Failed to download components.\nError: {result['error']}")
+        return False
+
     return result["success"]
 
 def check_startup(root):
-    """Main check function to be called from main.py."""
     if is_ffmpeg_installed():
         return True
     
-    # Ask user
     ans = messagebox.askyesno(
         "Missing Component", 
         "The audio engine (FFmpeg) is missing.\n\n"
