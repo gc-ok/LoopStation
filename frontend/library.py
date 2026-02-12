@@ -9,7 +9,8 @@ import os
 import logging
 import tkinter as tk
 import platform
-import subprocess  # <--- Added for macOS fix
+import subprocess
+import threading
 from typing import Callable, Optional, List
 
 import customtkinter as ctk
@@ -45,6 +46,10 @@ class LibrarySidebar(ctk.CTkFrame):
         self.songs: List[str] = []
         self.current_song: str = ""
         self.song_buttons: List[ctk.CTkButton] = []
+        
+        # Threading state for folder picker
+        self._picker_thread = None
+        self._picker_result = None
         
         self._create_widgets()
         logger.debug("LibrarySidebar initialized")
@@ -90,8 +95,6 @@ class LibrarySidebar(ctk.CTkFrame):
 
         ctk.CTkLabel(theme_frame, text="🎨 Theme:", font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
 
-        # Get current theme name from config indirectly or defaults
-        # For simplicity, we just show the dropdown
         theme_names = sorted(list(THEMES.keys()))
         
         self.theme_menu = ctk.CTkOptionMenu(
@@ -105,7 +108,7 @@ class LibrarySidebar(ctk.CTkFrame):
             button_color=COLOR_BTN_PRIMARY,
             text_color=COLOR_BTN_TEXT,
         )
-        self.theme_menu.set("Select Theme") # Or set to current if you pass it in
+        self.theme_menu.set("Select Theme")
         self.theme_menu.pack(side="right")
         
         # Folder path label
@@ -136,23 +139,29 @@ class LibrarySidebar(ctk.CTkFrame):
         self.count_label.pack(pady=PADDING_SMALL)
     
     def _browse_folder(self):
-        """Open folder browser dialog (Safe Wrapper)."""
-        # Even with the robust fix, a small delay helps UI settle
-        self.after(200, self._open_folder_dialog)
-    
-    
-    def _open_folder_dialog(self):
-        """
-        Opens a directory picker.
-        ROBUST FIX: Uses AppleScript on macOS to avoid Tkinter crashing on Sonoma.
-        """
+        """Start the folder picker process."""
+        self.btn_browse.configure(state="disabled")
+        
+        # Reset result
+        self._picker_result = None
+        
+        # Start worker thread
+        self._picker_thread = threading.Thread(target=self._worker_browse, daemon=True)
+        self._picker_thread.start()
+        
+        # Start polling for result on Main Thread
+        self.after(100, self._check_picker_thread)
+
+    def _worker_browse(self):
+        """Run the actual OS dialog in a background thread to prevent Main Thread freeze."""
         folder = None
         
         # 1. macOS Robust Fix (AppleScript)
         if platform.system() == "Darwin":
             try:
-                # AppleScript to choose folder
-                script = 'tell application "System Events" to return POSIX path of (choose folder with prompt "Select Music Folder")'
+                # SIMPLIFIED SCRIPT: Removed "System Events" dependency to reduce permission friction.
+                # "choose folder" is a standard addition that usually works standalone.
+                script = 'return POSIX path of (choose folder with prompt "Select Music Folder")'
                 result = subprocess.run(
                     ['osascript', '-e', script], 
                     capture_output=True, 
@@ -162,22 +171,48 @@ class LibrarySidebar(ctk.CTkFrame):
                     folder = result.stdout.strip()
             except Exception as e:
                 logger.error(f"macOS picker failed: {e}")
-                # Fallback to standard (risky on macOS 14, but better than nothing if script fails)
-                from tkinter import filedialog
-                folder = filedialog.askdirectory(title="Select Music Folder")
         
         # 2. Windows / Linux (Standard Tkinter)
+        # Note: Tkinter filedialog must run on main thread usually, but since 
+        # we are avoiding it on Mac, we only use this path for Win/Linux.
+        # On Windows, filedialog is generally thread-safe enough or requires main thread.
+        # For safety across all OSs in this hybrid approach:
         else:
+            # We cannot run tkinter widget calls in a thread. 
+            # So for non-Mac, we signal a special flag to run it on main thread.
+            self._picker_result = "RUN_ON_MAIN"
+            return
+
+        # Store result
+        if folder:
+            self._picker_result = folder
+        else:
+            self._picker_result = "CANCELLED"
+
+    def _check_picker_thread(self):
+        """Poll for the picker thread result."""
+        # Case 1: Thread is still running
+        if self._picker_thread and self._picker_thread.is_alive():
+            self.after(100, self._check_picker_thread)
+            return
+
+        # Case 2: Thread finished
+        result = self._picker_result
+        self.btn_browse.configure(state="normal")
+        
+        if result == "RUN_ON_MAIN":
+            # Fallback for Windows/Linux: Run standard dialog on main thread
             from tkinter import filedialog
             folder = filedialog.askdirectory(
                 title="Select Music Folder",
                 initialdir=self.current_folder or os.path.expanduser("~")
             )
-    
-        # 3. Load if valid
-        if folder:
-            self.load_folder(folder)
-
+            if folder:
+                self.load_folder(folder)
+                
+        elif result and result != "CANCELLED":
+            # macOS result
+            self.load_folder(result)
     
     def load_folder(self, folder_path: str):
         """Load songs from a folder."""
