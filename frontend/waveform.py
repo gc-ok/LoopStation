@@ -47,6 +47,11 @@ class WaveformWidget:
         # State
         self.duration = 0.0
         self.waveform_data: Optional[np.ndarray] = None
+
+        self.view_start = 0.0  # 0.0 = start of song
+        self.view_end = 1.0    # 1.0 = end of song
+        self.min_zoom_window = 0.05 # Max zoom in (5% of song)
+        
         self.loop_in = 0.0
         self.loop_out = 0.0
         
@@ -97,7 +102,7 @@ class WaveformWidget:
         
         # After matplotlib draws, redraw our overlay items on top
         self.canvas.mpl_connect('draw_event', self._on_mpl_draw)
-        
+        self.canvas.mpl_connect('scroll_event', self._on_scroll)
         # Resize: need to resize the figure to match the widget
         self.container.bind("<Configure>", self._on_configure)
         
@@ -133,10 +138,55 @@ class WaveformWidget:
     def _setup_axes(self):
         """Configure the matplotlib axes to fill the entire figure."""
         self.ax.set_facecolor(COLOR_WAVEFORM_BG)
-        self.ax.set_xlim(0, 1)
+        self.ax.set_xlim(self.view_start, self.view_end)
         self.ax.set_ylim(-1, 1)
         self.ax.axis('off')
         self.figure.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    def _on_scroll(self, event):
+        """Handle mouse wheel for zooming."""
+        if event.inaxes != self.ax:
+            return
+            
+        # Get mouse position in data coordinates (0.0 - 1.0 relative to song)
+        mouse_x = event.xdata
+        if mouse_x is None: 
+            return
+
+        base_scale = 1.1
+        if event.button == 'up':
+            # Zoom In
+            scale_factor = 1 / base_scale
+        else:
+            # Zoom Out
+            scale_factor = base_scale
+
+        # Current window width
+        cur_width = self.view_end - self.view_start
+        new_width = cur_width * scale_factor
+        
+        # Limit zoom
+        if new_width < self.min_zoom_window:
+            new_width = self.min_zoom_window
+        if new_width > 1.0:
+            new_width = 1.0
+            
+        # Calculate new bounds, keeping mouse position stationary
+        # Formula: new_start = mouse_x - (mouse_x - old_start) * (new_width / old_width)
+        ratio = (mouse_x - self.view_start) / cur_width
+        self.view_start = mouse_x - (new_width * ratio)
+        self.view_end = self.view_start + new_width
+        
+        # Clamp to 0-1
+        if self.view_start < 0:
+            self.view_start = 0
+            self.view_end = new_width
+        if self.view_end > 1:
+            self.view_end = 1
+            self.view_start = 1 - new_width
+            
+        # Trigger redraw
+        self._draw_waveform()
     
     def get_widget(self) -> tk.Widget:
         return self.container
@@ -153,16 +203,24 @@ class WaveformWidget:
     
     def _frac_to_pixel_x(self, frac):
         """
-        Convert 0-1 data fraction to pixel X on the tk canvas.
-        
-        Since we resize the figure to match the widget in _on_configure,
-        and axes fill the entire figure (left=0, right=1), the mapping
-        is simply frac * widget_width.
+        Convert 0-1 data fraction to pixel X on the tk canvas,
+        accounting for the current Zoom Viewport.
         """
         canvas_width = self._tk_canvas.winfo_width()
         if canvas_width <= 1:
             return 0
-        return frac * canvas_width
+            
+        # 1. Check if the point is visible
+        if frac < self.view_start or frac > self.view_end:
+            # Return off-screen coordinates
+            if frac < self.view_start: return -10
+            if frac > self.view_end: return canvas_width + 10
+
+        # 2. Normalize fraction to the current viewport
+        view_width = self.view_end - self.view_start
+        rel_frac = (frac - self.view_start) / view_width
+        
+        return rel_frac * canvas_width
     
     # =========================================================================
     # OVERLAY DRAWING (playhead + markers on tk canvas)
@@ -262,19 +320,22 @@ class WaveformWidget:
         self._draw_waveform()
 
     def _draw_waveform(self):
-        """Draw the waveform on the axes (triggers matplotlib redraw)."""
+        """Draw the waveform on the axes."""
         if self.waveform_data is None:
             return
         
         self.ax.clear()
-        self._setup_axes()
+        self._setup_axes() # This now applies set_xlim(view_start, view_end)
         
+        # We plot the WHOLE waveform data (0 to 1), but set_xlim clips it visibly.
+        # This is fast enough for matplotlib if data isn't huge.
         x = np.linspace(0, 1, len(self.waveform_data))
+        
         self.ax.fill_between(x, -self.waveform_data, self.waveform_data, 
                              color=COLOR_WAVEFORM, alpha=0.8)
         
-        # DRAW SKIPS FIRST (so loops draw on top if they overlap)
-        self._draw_skip_regions() # <--- NEW CALL
+        # Draw regions (Loops, Skips)
+        self._draw_skip_regions() 
         self._draw_loop_regions()
         
         if self.selection_start is not None and self.selection_end is not None:
@@ -475,4 +536,5 @@ class WaveformWidget:
             self.selection_rect = None
         self.selection_start = None
         self.selection_end = None
+
         self.canvas.draw_idle()
