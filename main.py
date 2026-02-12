@@ -276,26 +276,25 @@ def main():
     import config 
 
     # 3. AUTO-DOWNLOAD CHECK
-    # We create a temporary hidden root window just for the download popup.
+    # NOTE: We do NOT create a dummy tk.Tk() here anymore.
+    # On macOS, creating tk.Tk() then destroying it before creating ctk.CTk()
+    # corrupts the Tcl/Tk interpreter and causes SIGSEGV in the frozen app.
+    # Instead, we just check if ffmpeg exists. If it's bundled (frozen), it
+    # will always be found. If running from source and it's missing, we
+    # print an error and exit — the user can install ffmpeg via brew/choco.
     try:
-        # Create a dummy window for the downloader to parent to
-        dummy_root = tk.Tk()
-        dummy_root.withdraw() # Hide it
-        
-        # This will download to get_base_path() if user accepts
-        if not check_startup(dummy_root):
-            # Only exit if ffmpeg is TRULY missing and they declined download
-            if not shutil.which(ffmpeg_path) and not os.path.exists(ffmpeg_path):
-                logger.error("FFmpeg missing and download declined. Exiting.")
-                dummy_root.destroy()
-                sys.exit(1)
-            
-        dummy_root.destroy() # Cleanup dummy window
-        
-        # RE-DETECT PATH after potential download
-        # This is the critical step to pick up the file we just downloaded
         ffmpeg_path = args.ffmpeg or find_ffmpeg()
         logger.info(f"Using ffmpeg: {ffmpeg_path}")
+        
+        # Verify it actually exists (not just a fallback "ffmpeg" string)
+        if ffmpeg_path == "ffmpeg" and not shutil.which("ffmpeg"):
+            # ffmpeg not found anywhere — in frozen mode this shouldn't happen
+            # In dev mode, tell the user to install it
+            if getattr(sys, 'frozen', False):
+                logger.error("FFmpeg not found in bundled app. This is a build error.")
+            else:
+                logger.error("FFmpeg not found. Install it: brew install ffmpeg (Mac) or choco install ffmpeg (Windows)")
+            sys.exit(1)
         
     except Exception as e:
         logger.exception(f"Startup check failed: {e}")
