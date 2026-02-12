@@ -36,19 +36,25 @@ def get_base_path():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def is_ffmpeg_installed():
-    base_path = get_base_path()
-    
     # Check for BOTH files
     if platform.system() == "Windows":
         files = ["ffmpeg.exe", "ffprobe.exe"]
     else:
         files = ["ffmpeg", "ffprobe"]
-        
-    # 1. Check local folder (Must have both)
+    
+    # 1. Check PyInstaller bundle (sys._MEIPASS) — this is where --add-binary lands
+    #    On macOS .app: Contents/Resources/
+    #    On Windows --onedir: same as exe dir 
+    if getattr(sys, '_MEIPASS', None):
+        if all(os.path.exists(os.path.join(sys._MEIPASS, f)) for f in files):
+            return True
+    
+    # 2. Check local folder next to executable/script
+    base_path = get_base_path()
     if all(os.path.exists(os.path.join(base_path, f)) for f in files):
         return True
         
-    # 2. Check system PATH (Fallback)
+    # 3. Check system PATH (Fallback)
     return (shutil.which("ffmpeg") is not None) and (shutil.which("ffprobe") is not None)
 
 
