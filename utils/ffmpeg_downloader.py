@@ -2,6 +2,7 @@ import os
 import sys
 import platform
 import zipfile
+import gzip
 import urllib.request
 import ssl
 import tkinter as tk
@@ -9,6 +10,7 @@ from tkinter import messagebox, ttk
 import threading
 import shutil
 import queue
+import time
 
 # --- BYPASS SSL CERTIFICATE CHECK (For macOS) ---
 if hasattr(ssl, '_create_unverified_context'):
@@ -18,9 +20,15 @@ if hasattr(ssl, '_create_unverified_context'):
 # Windows: BtbN builds contain BOTH ffmpeg and ffprobe in one zip
 WIN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
 
-# Mac: Evermeet distributes them separately. We use the "getrelease" permalink to always get the latest.
+# Mac: Use ONE archive that contains BOTH ffmpeg and ffprobe
+# osxexperts bundles both in a single zip (~80MB)
 MAC_FFMPEG_URL = "https://evermeet.cx/ffmpeg/getrelease/zip"
 MAC_FFPROBE_URL = "https://evermeet.cx/ffprobe/getrelease/zip"
+
+# Timeout for each download attempt (seconds)
+DOWNLOAD_TIMEOUT = 60
+# Number of retry attempts
+MAX_RETRIES = 3
 
 def get_base_path():
     if getattr(sys, 'frozen', False):
@@ -41,8 +49,65 @@ def is_ffmpeg_installed():
         return True
         
     # 2. Check system PATH (Fallback)
-    # On Mac/Linux we accept system installs if both are present
     return (shutil.which("ffmpeg") is not None) and (shutil.which("ffprobe") is not None)
+
+
+def _download_with_retry(url, dest_path, progress_callback, max_retries=MAX_RETRIES, timeout=DOWNLOAD_TIMEOUT):
+    """
+    Download a file with retry logic and timeout.
+    
+    Args:
+        url: URL to download
+        dest_path: Local path to save to
+        progress_callback: function(percent_int) called with 0-100
+        max_retries: Number of attempts
+        timeout: Seconds before giving up per attempt
+    
+    Raises:
+        Exception on final failure
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait = min(2 ** attempt, 10)  # exponential backoff, max 10s
+                time.sleep(wait)
+            
+            # Build request with timeout
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'LoopStation/1.0'
+            })
+            
+            response = urllib.request.urlopen(req, timeout=timeout)
+            total_size = int(response.headers.get('Content-Length', 0))
+            
+            downloaded = 0
+            block_size = 65536  # 64KB chunks (faster than default 8KB)
+            
+            with open(dest_path, 'wb') as f:
+                while True:
+                    chunk = response.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress_callback(int(downloaded * 100 / total_size))
+            
+            return  # Success
+            
+        except Exception as e:
+            last_error = e
+            # Clean up partial download
+            if os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except:
+                    pass
+    
+    raise Exception(f"Download failed after {max_retries} attempts: {last_error}")
+
 
 def download_ffmpeg(parent_window):
     """Downloads FFmpeg (and FFprobe on Mac) using a thread-safe queue."""
@@ -61,12 +126,12 @@ def download_ffmpeg(parent_window):
     # 1. Setup UI
     popup = tk.Toplevel(parent_window)
     popup.title("Downloading Components")
-    popup.geometry("350x180") # Taller for multiple files
+    popup.geometry("400x200")
     popup.resizable(False, False)
     
     try:
-        x = parent_window.winfo_x() + (parent_window.winfo_width() // 2) - 175
-        y = parent_window.winfo_y() + (parent_window.winfo_height() // 2) - 90
+        x = parent_window.winfo_x() + (parent_window.winfo_width() // 2) - 200
+        y = parent_window.winfo_y() + (parent_window.winfo_height() // 2) - 100
         popup.geometry(f"+{x}+{y}")
     except:
         pass
@@ -77,7 +142,11 @@ def download_ffmpeg(parent_window):
     lbl_status = tk.Label(popup, text="Initializing...", fg="gray", font=("Segoe UI", 9))
     lbl_status.pack()
     
-    progress = ttk.Progressbar(popup, length=280, mode='determinate')
+    # Show which file we're on (e.g. "File 1 of 2")
+    lbl_file_count = tk.Label(popup, text="", fg="gray", font=("Segoe UI", 8))
+    lbl_file_count.pack()
+    
+    progress = ttk.Progressbar(popup, length=340, mode='determinate')
     progress.pack(pady=10)
 
     # 2. Thread Communication
@@ -94,15 +163,14 @@ def download_ffmpeg(parent_window):
                 
                 # Update UI for current file
                 msg_queue.put(("status", f"Downloading {desc}..."))
+                msg_queue.put(("file_count", f"File {index + 1} of {total_items}"))
                 msg_queue.put(("progress", 0))
 
-                # Download hook
-                def report(block_num, block_size, total_size):
-                    if total_size > 0:
-                        percent = int((block_num * block_size * 100) / total_size)
-                        msg_queue.put(("progress", percent))
-
-                urllib.request.urlretrieve(url, dest_path, report)
+                # Download with retry and timeout
+                def report_progress(percent):
+                    msg_queue.put(("progress", min(percent, 100)))
+                
+                _download_with_retry(url, dest_path, report_progress)
                 
                 msg_queue.put(("status", f"Extracting {desc}..."))
                 
@@ -127,6 +195,17 @@ def download_ffmpeg(parent_window):
                 # Cleanup zip
                 if os.path.exists(dest_path):
                     os.remove(dest_path)
+            
+            # --- VERIFY both files exist ---
+            if system == "Windows":
+                required = ["ffmpeg.exe", "ffprobe.exe"]
+            else:
+                required = ["ffmpeg", "ffprobe"]
+            
+            missing = [f for f in required if not os.path.exists(os.path.join(base_path, f))]
+            if missing:
+                msg_queue.put(("error", f"Download completed but missing files: {', '.join(missing)}"))
+                return
 
             msg_queue.put(("done", True))
             
@@ -147,6 +226,8 @@ def download_ffmpeg(parent_window):
                     progress['value'] = data
                 elif msg_type == "status":
                     lbl_status.config(text=data)
+                elif msg_type == "file_count":
+                    lbl_file_count.config(text=data)
                 elif msg_type == "error":
                     popup.destroy()
                     messagebox.showerror("Download Error", f"Failed to download.\nError: {data}")
@@ -158,9 +239,9 @@ def download_ffmpeg(parent_window):
         except queue.Empty:
             pass
         
-        popup.after(100, check_queue)
+        popup.after(50, check_queue)
 
-    popup.after(100, check_queue)
+    popup.after(50, check_queue)
     parent_window.wait_window(popup)
     
     return result["success"]
