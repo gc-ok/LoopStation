@@ -596,14 +596,14 @@ class LoopStationApp(ctk.CTk):
                     fn()
             return wrapper
         
-        self.bind("<space>", _safe(lambda: self.app_state.toggle_play_pause()))
-        self.bind("<Escape>", _safe(lambda: self.app_state.stop()))
-        self.bind("i", lambda e: self._on_set_in() if self.app_state else None)
-        self.bind("o", lambda e: self._on_set_out() if self.app_state else None)
-        self.bind("e", _safe(lambda: self.app_state.queue_exit()))
-        self.bind("f", _safe(lambda: self.app_state.queue_exit(fade_mode=True)))
-        self.bind("s", _safe(lambda: self.app_state.save_loop()))
-        self.bind("<Left>", _safe(lambda: self.app_state.nudge(-0.1)))
+        <space>", _safe(lambda: self.app_state.toggle_play_pause()))
+        <Escape>", _safe(lambda: self.app_state.stop()))
+        i", lambda e: self._on_set_in() if self.app_state else None)
+        o", lambda e: self._on_set_out() if self.app_state else None)
+        e", _safe(lambda: self.app_state.queue_exit()))
+        f", _safe(lambda: self.app_state.queue_exit(fade_mode=True)))
+        s", _safe(lambda: self.app_state.save_loop()))
+        <Left>", _safe(lambda: self.app_state.nudge(-0.1)))
         self.bind("<Right>", _safe(lambda: self.app_state.nudge(0.1)))
         self.bind("<Control-Left>", _safe(lambda: self.app_state.nudge(-1.0)))
         self.bind("<Control-Right>", _safe(lambda: self.app_state.nudge(1.0)))
@@ -612,25 +612,27 @@ class LoopStationApp(ctk.CTk):
         self.bind("<bracketleft>", _safe(lambda: self.app_state.jump_to_prev_marker()))
         # Only steal focus when clicking empty background areas, not buttons/widgets
         # This prevents the root binding from interfering with CTkButton clicks
-        self.bind("<Button-1>", self._on_background_click)
 
-    def _on_background_click(self, event):
-        """Only set focus to root when clicking on non-interactive areas.
+        #OLD CODE
+        # self.bind("<Button-1>", self._on_background_click)
+
+    # def _on_background_click(self, event):
+        # """Only set focus to root when clicking on non-interactive areas.
         
-        The old binding (self.bind('<Button-1>', focus_set)) fired on
-        EVERY click including CTkButtons. Root bindings fire after widget
-        bindings in Tk's event propagation, which interfered with click
-        handling, especially on macOS where event timing is tighter.
-        """
-        widget = event.widget
-        widget_class = widget.winfo_class()
+        # The old binding (self.bind('<Button-1>', focus_set)) fired on
+        # EVERY click including CTkButtons. Root bindings fire after widget
+        # bindings in Tk's event propagation, which interfered with click
+        # handling, especially on macOS where event timing is tighter.
+        # """
+        # widget = event.widget
+        # widget_class = widget.winfo_class()
         
         # Don't steal focus from interactive widgets
-        interactive = {'Button', 'TButton', 'Canvas', 'Entry', 'Text', 
-                       'Checkbutton', 'Radiobutton', 'Scale', 'Spinbox',
-                       'Listbox', 'OptionMenu', 'TCombobox'}
-        if widget_class not in interactive:
-            self.focus_set()
+        # interactive = {'Button', 'TButton', 'Canvas', 'Entry', 'Text', 
+        #               'Checkbutton', 'Radiobutton', 'Scale', 'Spinbox',
+        #               'Listbox', 'OptionMenu', 'TCombobox'}
+        # if widget_class not in interactive:
+        #    self.focus_set()
     
     # =========================================================================
     # UI -> State
@@ -989,3 +991,4 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
