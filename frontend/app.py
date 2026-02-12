@@ -610,7 +610,27 @@ class LoopStationApp(ctk.CTk):
         self.bind("m", lambda e: self._on_add_marker() if self.app_state else None)
         self.bind("<bracketright>", _safe(lambda: self.app_state.jump_to_next_marker()))
         self.bind("<bracketleft>", _safe(lambda: self.app_state.jump_to_prev_marker()))
-        self.bind("<Button-1>", lambda e: self.focus_set())
+        # Only steal focus when clicking empty background areas, not buttons/widgets
+        # This prevents the root binding from interfering with CTkButton clicks
+        self.bind("<Button-1>", self._on_background_click)
+
+    def _on_background_click(self, event):
+        """Only set focus to root when clicking on non-interactive areas.
+        
+        The old binding (self.bind('<Button-1>', focus_set)) fired on
+        EVERY click including CTkButtons. Root bindings fire after widget
+        bindings in Tk's event propagation, which interfered with click
+        handling, especially on macOS where event timing is tighter.
+        """
+        widget = event.widget
+        widget_class = widget.winfo_class()
+        
+        # Don't steal focus from interactive widgets
+        interactive = {'Button', 'TButton', 'Canvas', 'Entry', 'Text', 
+                       'Checkbutton', 'Radiobutton', 'Scale', 'Spinbox',
+                       'Listbox', 'OptionMenu', 'TCombobox'}
+        if widget_class not in interactive:
+            self.focus_set()
     
     # =========================================================================
     # UI -> State
