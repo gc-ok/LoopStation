@@ -127,6 +127,7 @@ class AudioEngine:
             Tuple of (song_duration, sync_ratio)
             sync_ratio is used to align waveform with audio if they differ slightly
         """
+        self.cleanup()
         logger.info(f"=== LOADING FILE: {os.path.basename(path)} ===")
         self.stop()
         self.current_file_path = path
@@ -273,19 +274,31 @@ class AudioEngine:
             logger.error(f"Error loading raw audio: {e}")
 
    def cleanup(self):
-        """Clean up temporary memory mapped files."""
-        if hasattr(self, '_temp_audio_data') and isinstance(self.raw_audio_data, np.memmap):
-            # Attempt to close the memmap (tricky in Python, usually GC handles it)
-            del self.raw_audio_data
-            self.raw_audio_data = None
-            
+        """
+        Permanently clean up resources and delete temporary files.
+        Call this ONLY when the app is closing or loading a new song.
+        """
+        logger.info("Cleaning up AudioEngine resources...")
+        
+        # 1. Close the memory map to release the file handle
+        if hasattr(self, 'raw_audio_data') and isinstance(self.raw_audio_data, np.memmap):
+            try:
+                # Force delete the reference so Python releases the file lock
+                self.raw_audio_data._mmap.close()
+                del self.raw_audio_data
+                self.raw_audio_data = None
+            except Exception as e:
+                logger.warning(f"Error closing memmap: {e}")
+
+        # 2. Delete the actual temp file from disk
         if hasattr(self, '_temp_audio_path') and self._temp_audio_path:
             if os.path.exists(self._temp_audio_path):
                 try:
                     os.unlink(self._temp_audio_path)
-                    logger.debug(f"Deleted temp audio file: {self._temp_audio_path}")
+                    logger.info(f"Deleted temp file: {self._temp_audio_path}")
                 except Exception as e:
                     logger.warning(f"Could not delete temp file: {e}")
+            self._temp_audio_path = None
 
     def get_raw_audio_data(self):
         """Get the raw audio data for waveform generation."""
@@ -821,5 +834,6 @@ class AudioEngine:
             # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
             # which is too heavy for random skips.
             self.seek_transport(target_pos)
+
 
 
