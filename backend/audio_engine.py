@@ -23,8 +23,6 @@ import logging
 import tempfile
 import threading
 import subprocess
-import tempfile
-import shutil
 import numpy as np
 
 # Add parent directory to path for config import
@@ -205,7 +203,7 @@ class AudioEngine:
             logger.warning(f"ffprobe error: {e}")
             return 0.0
     
-   def _load_raw_audio(self, path):
+    def _load_raw_audio(self, path):
         """
         Load audio data using memory mapping to prevent RAM spikes.
         Streams ffmpeg output to a temporary file, then maps it.
@@ -273,7 +271,7 @@ class AudioEngine:
             self.raw_audio_data = None
             logger.error(f"Error loading raw audio: {e}")
 
-   def cleanup(self):
+    def cleanup(self):
         """
         Permanently clean up resources and delete temporary files.
         Call this ONLY when the app is closing or loading a new song.
@@ -576,7 +574,7 @@ class AudioEngine:
             self.is_paused = True
             logger.info(f"[PAUSE] TRANSPORT PAUSED at {self.transport_offset:.3f}s")
 
-   def unpause_transport(self):
+    def unpause_transport(self):
         """Resume transport playback."""
         if self.mode == "transport" and self.is_paused:
             # FIX: Use play() instead of unpause(). 
@@ -834,6 +832,3 @@ class AudioEngine:
             # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
             # which is too heavy for random skips.
             self.seek_transport(target_pos)
-
-
-
