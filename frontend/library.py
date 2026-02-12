@@ -8,6 +8,8 @@ Allows browsing and loading songs.
 import os
 import logging
 import tkinter as tk
+import platform
+import subprocess  # <--- Added for macOS fix
 from typing import Callable, Optional, List
 
 import customtkinter as ctk
@@ -134,19 +136,45 @@ class LibrarySidebar(ctk.CTkFrame):
         self.count_label.pack(pady=PADDING_SMALL)
     
     def _browse_folder(self):
-        """Open folder browser dialog (macOS Sonoma safe)."""
-        # Delay the actual dialog slightly
-        self.after(800, self._open_folder_dialog)
+        """Open folder browser dialog (Safe Wrapper)."""
+        # Even with the robust fix, a small delay helps UI settle
+        self.after(200, self._open_folder_dialog)
     
     
     def _open_folder_dialog(self):
-        from tkinter import filedialog
+        """
+        Opens a directory picker.
+        ROBUST FIX: Uses AppleScript on macOS to avoid Tkinter crashing on Sonoma.
+        """
+        folder = None
+        
+        # 1. macOS Robust Fix (AppleScript)
+        if platform.system() == "Darwin":
+            try:
+                # AppleScript to choose folder
+                script = 'tell application "System Events" to return POSIX path of (choose folder with prompt "Select Music Folder")'
+                result = subprocess.run(
+                    ['osascript', '-e', script], 
+                    capture_output=True, 
+                    text=True
+                )
+                if result.returncode == 0:
+                    folder = result.stdout.strip()
+            except Exception as e:
+                logger.error(f"macOS picker failed: {e}")
+                # Fallback to standard (risky on macOS 14, but better than nothing if script fails)
+                from tkinter import filedialog
+                folder = filedialog.askdirectory(title="Select Music Folder")
+        
+        # 2. Windows / Linux (Standard Tkinter)
+        else:
+            from tkinter import filedialog
+            folder = filedialog.askdirectory(
+                title="Select Music Folder",
+                initialdir=self.current_folder or os.path.expanduser("~")
+            )
     
-        folder = filedialog.askdirectory(
-            title="Select Music Folder",
-            initialdir=self.current_folder or os.path.expanduser("~")
-        )
-    
+        # 3. Load if valid
         if folder:
             self.load_folder(folder)
 
