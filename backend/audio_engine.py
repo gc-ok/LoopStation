@@ -23,6 +23,8 @@ import logging
 import tempfile
 import threading
 import subprocess
+import tempfile
+import shutil
 import numpy as np
 
 # Add parent directory to path for config import
@@ -202,28 +204,89 @@ class AudioEngine:
             logger.warning(f"ffprobe error: {e}")
             return 0.0
     
-    def _load_raw_audio(self, path):
-        """Load the entire audio file as a numpy array for slicing."""
-        logger.debug("Loading raw audio data into memory for slicing...")
+   def _load_raw_audio(self, path):
+        """
+        Load audio data using memory mapping to prevent RAM spikes.
+        Streams ffmpeg output to a temporary file, then maps it.
+        """
+        logger.debug("Loading raw audio data via memory map...")
+        
+        # Clean up previous temp file if it exists
+        if hasattr(self, '_temp_audio_file') and self._temp_audio_file:
+            try:
+                self._temp_audio_file.close()
+                os.unlink(self._temp_audio_path)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup old temp file: {e}")
+        
+        self.raw_audio_data = None
+        self._temp_audio_file = None
+        self._temp_audio_path = None
+
         try:
+            # 1. Create a temporary file on disk
+            # delete=False is required so we can close it and re-open it with memmap
+            self._temp_audio_file = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
+            self._temp_audio_path = self._temp_audio_file.name
+            
+            # 2. Stream ffmpeg output directly to this file
             cmd = [
                 self.ffmpeg_path, '-i', path,
                 '-f', 's16le', '-ar', str(SAMPLE_RATE), '-ac', str(CHANNELS),
                 '-v', 'quiet', '-'
             ]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             
-            if proc.returncode == 0 and len(proc.stdout) > 0:
-                self.raw_audio_data = np.frombuffer(proc.stdout, dtype=np.int16).reshape(-1, CHANNELS)
-                duration = len(self.raw_audio_data) / SAMPLE_RATE
-                logger.info(f"Raw audio loaded: {len(self.raw_audio_data)} samples ({duration:.2f}s)")
-            else:
-                self.raw_audio_data = None
-                logger.warning("Could not load raw audio data")
+            # Use stdout=self._temp_audio_file to write directly to disk
+            proc = subprocess.run(cmd, stdout=self._temp_audio_file, stderr=subprocess.PIPE, timeout=120)
+            
+            # Flush and close the file handle so memmap can safely take over
+            self._temp_audio_file.flush()
+            self._temp_audio_file.close()
+            
+            if proc.returncode != 0:
+                logger.error("FFmpeg failed to decode audio")
+                return
+
+            # 3. Calculate dimensions based on file size
+            file_size = os.path.getsize(self._temp_audio_path)
+            # 16-bit audio = 2 bytes per sample per channel
+            total_samples = file_size // (2 * CHANNELS)
+            
+            if total_samples == 0:
+                logger.warning("Decoded audio file is empty")
+                return
+
+            # 4. Create the Memory Map (This is the magic part)
+            # It behaves like a numpy array but reads from disk on demand
+            self.raw_audio_data = np.memmap(
+                self._temp_audio_path, 
+                dtype=np.int16, 
+                mode='r', 
+                shape=(total_samples, CHANNELS)
+            )
+            
+            duration = total_samples / SAMPLE_RATE
+            logger.info(f"Memory map created: {total_samples} samples ({duration:.2f}s) at {self._temp_audio_path}")
+            
         except Exception as e:
             self.raw_audio_data = None
             logger.error(f"Error loading raw audio: {e}")
-    
+
+   def cleanup(self):
+        """Clean up temporary memory mapped files."""
+        if hasattr(self, '_temp_audio_data') and isinstance(self.raw_audio_data, np.memmap):
+            # Attempt to close the memmap (tricky in Python, usually GC handles it)
+            del self.raw_audio_data
+            self.raw_audio_data = None
+            
+        if hasattr(self, '_temp_audio_path') and self._temp_audio_path:
+            if os.path.exists(self._temp_audio_path):
+                try:
+                    os.unlink(self._temp_audio_path)
+                    logger.debug(f"Deleted temp audio file: {self._temp_audio_path}")
+                except Exception as e:
+                    logger.warning(f"Could not delete temp file: {e}")
+
     def get_raw_audio_data(self):
         """Get the raw audio data for waveform generation."""
         return self.raw_audio_data
@@ -758,4 +821,5 @@ class AudioEngine:
             # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
             # which is too heavy for random skips.
             self.seek_transport(target_pos)
+
 
