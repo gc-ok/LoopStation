@@ -12,6 +12,31 @@ Usage:
 import os
 import sys
 
+# [START OF NEW BLOCK]
+# FORCE PYINSTALLER TO BUNDLE THESE MODULES
+# Since we import them inside main() for the "Restart" feature, 
+# PyInstaller's static analyzer misses them. We list them here 
+# inside 'if False' so they are bundled but not executed on launch.
+if False:
+    import config
+    import frontend.app
+    import frontend.waveform
+    import frontend.transport
+    import frontend.library
+    import frontend.cue_sheet
+    import frontend.detector_panel
+    import frontend.loop_controls
+    import frontend.marker_panel
+    import frontend.splash
+    import frontend.vamp_settings
+    import frontend.vamp_modal
+    import backend.audio_engine
+    import backend.state_manager
+    import backend.loop_detector
+    import utils.ffmpeg_downloader
+    import utils.formatting
+    import utils.preferences
+
 # Must be done BEFORE importing pygame (which happens in backend imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
 
@@ -356,3 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
