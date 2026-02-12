@@ -14,6 +14,7 @@ Layout:
 
 import os
 import sys
+import time
 import logging
 import webbrowser
 import queue  # <--- FIXED: Added for thread safety
@@ -163,8 +164,9 @@ class LoopStationApp(ctk.CTk):
         
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        # Start queue polling loop (Main Thread)
-        self.after(100, self._check_msg_queue)
+        # Start queue polling loop (Main Thread) — 16ms ≈ 60fps for responsive clicks
+        self._last_ui_update = 0
+        self.after(16, self._check_msg_queue)
         
         logger.info("LoopStationApp UI Shell initialized")
 
@@ -211,8 +213,8 @@ class LoopStationApp(ctk.CTk):
         except queue.Empty:
             pass
         
-        # Schedule next check
-        self.after(50, self._check_msg_queue)
+        # Schedule next check — 16ms ≈ 60fps
+        self.after(16, self._check_msg_queue)
 
     def initialize_audio_system(self):
         """
@@ -499,27 +501,6 @@ class LoopStationApp(ctk.CTk):
             loop = self.app_state.loops[loop_idx]
             self.app_state.play_from(loop.start)
 
-    def _open_vamp_settings(self, loop_idx=None):
-        """Open the vamp settings modal."""
-        if self.app_state is None:
-            return
-        
-        if loop_idx is None:
-            loop_idx = self.app_state.selected_loop_index
-        
-        if loop_idx < 0 or loop_idx >= len(self.app_state.loops):
-            return
-        
-        self.app_state.select_loop(loop_idx)
-        current_loop = self.app_state.loops[loop_idx]
-        
-        modal = VampModal(
-            parent=self,
-            loop=current_loop,
-            state_manager=self.app_state,
-            on_close=lambda: self._refresh_cue_sheet()
-        )
-
     def _format_time(self, seconds):
         """Format seconds as M:SS.ss"""
         minutes = int(seconds // 60)
@@ -556,34 +537,6 @@ class LoopStationApp(ctk.CTk):
                 text_color="#888888"
             )
             self.loop_indicator.configure(text="")
-
-    def _update_state(self, state):
-        """Update transport buttons based on playback state."""
-        is_playing = state == PlaybackState.PLAYING
-        
-        if is_playing:
-            self.btn_play.configure(text="⏸  PAUSE")
-        else:
-            self.btn_play.configure(text="▶  PLAY")
-        
-        if state == PlaybackState.STOPPED:
-            self.status_label.configure(text="Stopped")
-            self.btn_exit_loop.configure(
-                state="disabled",
-                fg_color=COLOR_BTN_DISABLED,
-                text_color="#888888",
-                text="⮑  EXIT LOOP"
-            )
-            self.btn_fade_exit.configure(
-                state="disabled",
-                fg_color=COLOR_BTN_DISABLED,
-                text_color="#888888"
-            )
-            self.loop_indicator.configure(text="")
-        elif state == PlaybackState.PAUSED:
-            self.status_label.configure(text="Paused")
-        elif state == PlaybackState.PLAYING:
-            self.status_label.configure(text="Playing")
 
 
 
@@ -628,20 +581,27 @@ class LoopStationApp(ctk.CTk):
         self.app_state.on('cut_detection_complete', q('cut_detection_complete'))
     
     def _bind_shortcuts(self):
-        self.bind("<space>", lambda e: self.app_state.toggle_play_pause())
-        self.bind("<Escape>", lambda e: self.app_state.stop())
-        self.bind("i", lambda e: self._on_set_in())
-        self.bind("o", lambda e: self._on_set_out())
-        self.bind("e", lambda e: self.app_state.queue_exit())
-        self.bind("f", lambda e: self.app_state.queue_exit(fade_mode=True))
-        self.bind("s", lambda e: self.app_state.save_loop())
-        self.bind("<Left>", lambda e: self.app_state.nudge(-0.1))
-        self.bind("<Right>", lambda e: self.app_state.nudge(0.1))
-        self.bind("<Control-Left>", lambda e: self.app_state.nudge(-1.0))
-        self.bind("<Control-Right>", lambda e: self.app_state.nudge(1.0))
-        self.bind("m", lambda e: self._on_add_marker())
-        self.bind("<bracketright>", lambda e: self.app_state.jump_to_next_marker())
-        self.bind("<bracketleft>", lambda e: self.app_state.jump_to_prev_marker())
+        def _safe(fn):
+            """Wrap callback so it's a no-op if app_state isn't ready."""
+            def wrapper(e):
+                if self.app_state is not None:
+                    fn()
+            return wrapper
+        
+        self.bind("<space>", _safe(lambda: self.app_state.toggle_play_pause()))
+        self.bind("<Escape>", _safe(lambda: self.app_state.stop()))
+        self.bind("i", lambda e: self._on_set_in() if self.app_state else None)
+        self.bind("o", lambda e: self._on_set_out() if self.app_state else None)
+        self.bind("e", _safe(lambda: self.app_state.queue_exit()))
+        self.bind("f", _safe(lambda: self.app_state.queue_exit(fade_mode=True)))
+        self.bind("s", _safe(lambda: self.app_state.save_loop()))
+        self.bind("<Left>", _safe(lambda: self.app_state.nudge(-0.1)))
+        self.bind("<Right>", _safe(lambda: self.app_state.nudge(0.1)))
+        self.bind("<Control-Left>", _safe(lambda: self.app_state.nudge(-1.0)))
+        self.bind("<Control-Right>", _safe(lambda: self.app_state.nudge(1.0)))
+        self.bind("m", lambda e: self._on_add_marker() if self.app_state else None)
+        self.bind("<bracketright>", _safe(lambda: self.app_state.jump_to_next_marker()))
+        self.bind("<bracketleft>", _safe(lambda: self.app_state.jump_to_prev_marker()))
         self.bind("<Button-1>", lambda e: self.focus_set())
     
     # =========================================================================
@@ -676,12 +636,6 @@ class LoopStationApp(ctk.CTk):
         # OLD CODE: self.transport.set_time(position) 
         # NEW CODE:
         self.time_label.configure(text=self._format_time(position))
-    
-    def _on_play(self):
-        self.app_state.play()
-    
-    def _on_pause(self):
-        self.app_state.pause()
     
     def _on_stop(self):
         self.app_state.stop()
@@ -753,14 +707,6 @@ class LoopStationApp(ctk.CTk):
     
     # --- Combined update for cue sheet ---
     
-    def _refresh_cue_sheet(self):
-        """Refresh the cue sheet with current markers and loops."""
-        self.cue_sheet.update_data(
-            self.app_state.markers,
-            self.app_state.loops,
-            self.app_state.selected_loop_index
-        )
-    
     def _on_loops_changed(self, loops, selected_index):
         # NOTE: Called via queue mechanism now, essentially wrapping _handle_loops_changed
         self._handle_loops_changed(loops, selected_index)
@@ -821,12 +767,15 @@ class LoopStationApp(ctk.CTk):
         self._update_position(position, is_loop_mode)
     
     def _update_position(self, position, is_loop_mode):
-        """Update position display."""
+        """Update position display. Throttled to ~30fps to reduce UI load."""
+        now = time.time()
+        if now - self._last_ui_update < 0.033:  # 30fps cap
+            return
+        self._last_ui_update = now
+        
         self.waveform.update_playhead(position)
         actual_pos = self.app_state.get_position()
         self.time_label.configure(text=self._format_time(actual_pos))
-        
-        # REMOVED: self.transport.set_time(actual_pos)
         
         # Update cue sheet highlighting
         self.cue_sheet.update_position(actual_pos)
@@ -840,14 +789,6 @@ class LoopStationApp(ctk.CTk):
     def _on_loop_mode_exit(self, exit_position):
         # We ignore exit_position because _update_loop_mode only needs a bool
         self._update_loop_mode(False)
-    
-    def _update_loop_mode(self, in_loop):
-        if in_loop:
-            self.status_label.configure(text="♻ Seamless loop active")
-            self.loop_controls.set_exit_enabled(True, active=True)
-        else:
-            self.status_label.configure(text="Exited loop")
-            self.loop_controls.set_exit_enabled(False)
     
     def _on_song_loaded(self, song_name, duration):
         self._update_song_loaded(song_name, duration)
@@ -897,84 +838,6 @@ class LoopStationApp(ctk.CTk):
         self.sel_end = end_frac * self.app_state.song_length
         self.detector.enable_find(True)
 
-    def _start_detection(self):
-        if self.detector.mode == "cut":
-            self.app_state.run_smart_cut_detection(self.sel_start, self.sel_end)
-        else:
-            self.app_state.run_loop_detection(self.sel_start, self.sel_end)
-
-    def _on_detection_complete(self, candidates):
-        self.detector.show_results(candidates)
-
-    def _preview_candidate(self, candidate):
-        if self.detector.mode == "cut":
-            # Play from 2 seconds before the cut
-            preroll = max(0, candidate.start - 2.0)
-            self.app_state.play_from(preroll)
-            self.status_label.configure(text="Previewing cut transition...")
-        else:
-            self.app_state.set_loop_points(candidate.start, candidate.end)
-            self.app_state.seek(candidate.start)
-            if not self.app_state.is_playing():
-                self.app_state.play()
-
-    def _use_candidate(self, candidate):
-        if self.detector.mode == "cut":
-            # Add as a SKIP region
-            self.app_state.add_skip(candidate.start, candidate.end)
-            self.status_label.configure(text=f"Cut created: {candidate.duration:.2f}s removed")
-        else:
-            # Add as a LOOP region (Existing logic)
-            self.app_state.set_loop_points(candidate.start, candidate.end)
-            
-        if self.waveform.selection_mode_active:
-            self._toggle_selection_mode()
-        self.status_label.configure(text=f"Loop set: {candidate.duration:.2f}s")
-
-    def _open_vamp_settings(self, loop_idx=None):
-        """Open the vamp settings modal."""
-        # If no index provided, use current selected
-        if loop_idx is None:
-            loop_idx = self.app_state.selected_loop_index
-        
-        # Validate index
-        if loop_idx < 0 or loop_idx >= len(self.app_state.loops):
-            return
-        
-        # Select the loop
-        self.app_state.select_loop(loop_idx)
-        
-        # Get the loop object
-        current_loop = self.app_state.loops[loop_idx]
-        
-        # Create and show modal
-        modal = VampModal(
-            parent=self,
-            loop=current_loop,
-            state_manager=self.app_state,
-            on_close=lambda: self._refresh_cue_sheet()
-        )
-        
-
-    def _on_vamp_setting_change(self, key, value):
-        """Callback when a slider moves."""
-        if self.app_state.selected_loop_index < 0:
-            return
-            
-        loop = self.app_state.loops[self.app_state.selected_loop_index]
-        
-        # Update value
-        setattr(loop, key, value)
-        
-        # If crossfade changed, we need to regenerate the audio
-        if key == "crossfade_ms":
-            # This triggers re-generation in background
-            self.app_state._sync_audio_engine(loop) 
-            
-        # For other keys (entry fade, timing), they are applied at runtime 
-        # so no immediate regeneration is needed, but we should save state
-        self.app_state.save_loop()
-    
     def _on_detector_mode_change(self, mode):
         """Handle switch between Loop and Cut finding."""
         if mode == "cut":
@@ -1021,6 +884,48 @@ class LoopStationApp(ctk.CTk):
             self.app_state.seek(candidate.start)
             if not self.app_state.is_playing():
                 self.app_state.play()
+
+    # =========================================================================
+    # VAMP SETTINGS
+    # =========================================================================
+
+    def _open_vamp_settings(self, loop_idx=None):
+        """Open the vamp settings modal."""
+        if self.app_state is None:
+            return
+        
+        if loop_idx is None:
+            loop_idx = self.app_state.selected_loop_index
+        
+        if loop_idx < 0 or loop_idx >= len(self.app_state.loops):
+            return
+        
+        self.app_state.select_loop(loop_idx)
+        current_loop = self.app_state.loops[loop_idx]
+        
+        modal = VampModal(
+            parent=self,
+            loop=current_loop,
+            state_manager=self.app_state,
+            on_close=lambda: self._refresh_cue_sheet()
+        )
+
+    def _on_vamp_setting_change(self, key, value):
+        """Callback when a slider moves."""
+        if self.app_state is None or self.app_state.selected_loop_index < 0:
+            return
+            
+        loop = self.app_state.loops[self.app_state.selected_loop_index]
+        setattr(loop, key, value)
+        
+        if key == "crossfade_ms":
+            self.app_state._sync_audio_engine(loop) 
+            
+        self.app_state.save_loop()
+
+    # =========================================================================
+    # SKIPS
+    # =========================================================================
 
     def _on_skips_changed(self, skips):
         """Backend updated the list of skips."""
