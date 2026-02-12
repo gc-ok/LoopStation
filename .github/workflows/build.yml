@@ -41,7 +41,8 @@ jobs:
       run: |
         $ffmpegPath = (Get-Command ffmpeg).Source
         $ffprobePath = (Get-Command ffprobe).Source
-        pyinstaller --noconsole --name "LoopStation" --icon=logo.ico --collect-all customtkinter --add-data "logo.png;." --add-data "logo.ico;." --add-binary "$ffmpegPath;." --add-binary "$ffprobePath;." main.py
+        # FIX: Added --hidden-import for pygame/PIL and --collect-all for matplotlib
+        pyinstaller --noconsole --name "LoopStation" --icon=logo.ico --collect-all customtkinter --collect-all matplotlib --hidden-import pygame --hidden-import PIL --add-data "logo.png;." --add-data "logo.ico;." --add-binary "$ffmpegPath;." --add-binary "$ffprobePath;." main.py
 
     # BUILD MAC (bundles ffmpeg + ffprobe so users never need to download)
     - name: Build Mac .app
@@ -50,8 +51,12 @@ jobs:
         FFMPEG_PATH=$(which ffmpeg)
         FFPROBE_PATH=$(which ffprobe)
         # Mac uses colon (:) separator instead of semicolon (;)
+        # FIX: Added --hidden-import for pygame/PIL and --collect-all for matplotlib
         pyinstaller --noconsole --name "LoopStation" --icon=logo.png \
           --collect-all customtkinter \
+          --collect-all matplotlib \
+          --hidden-import pygame \
+          --hidden-import PIL \
           --add-data "logo.png:." --add-data "logo.ico:." \
           --add-binary "$FFMPEG_PATH:." \
           --add-binary "$FFPROBE_PATH:." \
