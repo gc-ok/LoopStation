@@ -35,18 +35,27 @@ jobs:
       run: |
         pip install pygame numpy matplotlib customtkinter librosa pyinstaller Pillow
 
-    # BUILD WINDOWS
+    # BUILD WINDOWS (bundles ffmpeg + ffprobe)
     - name: Build Windows .exe
       if: runner.os == 'Windows'
       run: |
-        pyinstaller --noconsole --name "LoopStation" --icon=logo.ico --collect-all customtkinter --add-data "logo.png;." --add-data "logo.ico;." main.py
+        $ffmpegPath = (Get-Command ffmpeg).Source
+        $ffprobePath = (Get-Command ffprobe).Source
+        pyinstaller --noconsole --name "LoopStation" --icon=logo.ico --collect-all customtkinter --add-data "logo.png;." --add-data "logo.ico;." --add-binary "$ffmpegPath;." --add-binary "$ffprobePath;." main.py
 
-    # BUILD MAC
+    # BUILD MAC (bundles ffmpeg + ffprobe so users never need to download)
     - name: Build Mac .app
       if: runner.os == 'macOS'
       run: |
+        FFMPEG_PATH=$(which ffmpeg)
+        FFPROBE_PATH=$(which ffprobe)
         # Mac uses colon (:) separator instead of semicolon (;)
-        pyinstaller --noconsole --name "LoopStation" --icon=logo.png --collect-all customtkinter --add-data "logo.png:." --add-data "logo.ico:." main.py
+        pyinstaller --noconsole --name "LoopStation" --icon=logo.png \
+          --collect-all customtkinter \
+          --add-data "logo.png:." --add-data "logo.ico:." \
+          --add-binary "$FFMPEG_PATH:." \
+          --add-binary "$FFPROBE_PATH:." \
+          main.py
 
     # UPLOAD RESULT
     - name: Upload Artifacts
