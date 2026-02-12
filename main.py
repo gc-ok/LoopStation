@@ -179,18 +179,31 @@ def setup_logging(debug: bool = False) -> logging.Logger:
 def find_ffmpeg() -> str:
     """
     Robustly find FFmpeg.
-    PRIORITY 1: Check the local folder (where the app/script is running).
-    PRIORITY 2: Check global system PATH.
+    PRIORITY 1: Check sys._MEIPASS (PyInstaller bundles --add-binary files here).
+    PRIORITY 2: Check the local folder (next to the .exe or script).
+    PRIORITY 3: Check global system PATH.
     """
-    base_path = get_base_path()
-    
-    # 1. Check Local Folder (Important for macOS .app bundles)
-    # On macOS, this will be inside LoopStation.app/Contents/MacOS/
     binary_name = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
+    
+    # 1. Check PyInstaller bundle directory (CRITICAL for macOS .app)
+    # On macOS: LoopStation.app/Contents/Resources/ (sys._MEIPASS)
+    # On Windows --onefile: temp _MEIPASS dir
+    # On Windows --onedir: same as exe dir
+    if getattr(sys, '_MEIPASS', None):
+        meipass_binary = os.path.join(sys._MEIPASS, binary_name)
+        if os.path.isfile(meipass_binary):
+            if os.name != 'nt':
+                try:
+                    os.chmod(meipass_binary, 0o755)
+                except:
+                    pass
+            return meipass_binary
+    
+    # 2. Check Local Folder (next to executable or script)
+    base_path = get_base_path()
     local_binary = os.path.join(base_path, binary_name)
     
     if os.path.isfile(local_binary):
-        # Ensure it is executable
         if os.name != 'nt':
             try:
                 os.chmod(local_binary, 0o755)
@@ -198,11 +211,11 @@ def find_ffmpeg() -> str:
                 pass
         return local_binary
 
-    # 2. Check Global PATH
+    # 3. Check Global PATH
     if shutil.which("ffmpeg"): 
         return "ffmpeg"
         
-    # 3. Fallback (likely to fail if not found above)
+    # 4. Fallback (likely to fail if not found above)
     return "ffmpeg"
 
 def check_dependencies():
