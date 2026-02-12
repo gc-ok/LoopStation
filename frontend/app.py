@@ -854,9 +854,20 @@ class LoopStationApp(ctk.CTk):
     # =========================================================================
     
     def _on_close(self):
+        """Handle application shutdown."""
         logger.info("Application closing")
-        self.app_state.stop()
+        
+        # 1. Stop playback
+        if self.app_state:
+            self.app_state.stop()
+            
+            # 2. TRIGGER THE CLEANUP
+            # This deletes the temporary files on disk
+            self.app_state.cleanup()
+        
+        # 3. Destroy window
         self.destroy()
+        sys.exit(0)
     
     def run(self):
         logger.info("Starting application")
@@ -991,4 +1002,5 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
 
