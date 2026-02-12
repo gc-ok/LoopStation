@@ -499,11 +499,16 @@ class AudioEngine:
             pygame.mixer.music.pause()
             self.is_paused = True
             logger.info(f"[PAUSE] TRANSPORT PAUSED at {self.transport_offset:.3f}s")
-    
-    def unpause_transport(self):
+
+   def unpause_transport(self):
         """Resume transport playback."""
         if self.mode == "transport" and self.is_paused:
-            pygame.mixer.music.unpause()
+            # FIX: Use play() instead of unpause(). 
+            # unpause() on macOS often fails to reset the internal get_pos() timer,
+            # causing the display to "double count" the time (Offset + Old Time).
+            # play() forces a clean restart from the specific timestamp.
+            pygame.mixer.music.play(start=self.transport_offset)
+            
             self.is_paused = False
             logger.info(f"[PLAY] TRANSPORT RESUMED from {self.transport_offset:.3f}s")
     
@@ -753,3 +758,4 @@ class AudioEngine:
             # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
             # which is too heavy for random skips.
             self.seek_transport(target_pos)
+
