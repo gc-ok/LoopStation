@@ -223,6 +223,13 @@ class LoopStationApp(ctk.CTk):
         """
         logger.info("Initializing Audio Backend...")
         
+        # 0. Create the WaveformWidget NOW (deferred from __init__ to avoid
+        #    matplotlib segfault on macOS ARM during splash screen rendering)
+        if self.waveform is None:
+            self.waveform = WaveformWidget(self.wave_container, on_seek=self._on_waveform_seek)
+            self.waveform.on_selection_change = self._on_selection_change
+            self.waveform.pack(fill="x")
+        
         # 1. Create the heavy Audio Engine / State Manager now
         self.app_state = StateManager(ffmpeg_path=self.ffmpeg_path)
         
@@ -289,13 +296,12 @@ class LoopStationApp(ctk.CTk):
         )
         self.title_label.pack(side="left")
 
-        # Waveform (fixed height)
-        wave_container = ctk.CTkFrame(self.content_frame, fg_color="transparent")
-        wave_container.pack(fill="x", padx=PADDING_MEDIUM, pady=(PADDING_SMALL, 0))
+        # Waveform container (fixed height) — actual WaveformWidget created later
+        # to avoid matplotlib segfault on macOS ARM during splash screen
+        self.wave_container = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        self.wave_container.pack(fill="x", padx=PADDING_MEDIUM, pady=(PADDING_SMALL, 0))
         
-        self.waveform = WaveformWidget(wave_container, on_seek=self._on_waveform_seek)
-        self.waveform.on_selection_change = self._on_selection_change
-        self.waveform.pack(fill="x")
+        self.waveform = None  # Created in initialize_audio_system()
 
         # =========================================================
         # NEW: TOP-LEVEL TRANSPORT (Always Visible)
@@ -480,6 +486,8 @@ class LoopStationApp(ctk.CTk):
 
     def _start_auto_detect_workflow(self):
         """Start the auto-detect workflow."""
+        if not self.waveform:
+            return
         if not self.finder_section._is_open:
             self.finder_section.toggle()
         
@@ -628,6 +636,8 @@ class LoopStationApp(ctk.CTk):
             self.msg_queue.put(('hide_loading', ()))
     
     def _on_waveform_seek(self, position_frac: float):
+        if self.app_state is None or self.waveform is None:
+            return
         position = position_frac * self.app_state.song_length
         self.app_state.seek(position)
         self.waveform.update_playhead(position)
@@ -638,8 +648,11 @@ class LoopStationApp(ctk.CTk):
         self.time_label.configure(text=self._format_time(position))
     
     def _on_stop(self):
+        if self.app_state is None:
+            return
         self.app_state.stop()
-        self.waveform.update_playhead(0)
+        if self.waveform:
+            self.waveform.update_playhead(0)
         # self.transport.set_time(0)
     
     def _on_set_in(self):
@@ -743,12 +756,14 @@ class LoopStationApp(ctk.CTk):
 
     def _update_loop_points(self, loop_in, loop_out):
         """Update waveform display with new loop points."""
-        self.waveform.update_loop_markers(loop_in, loop_out)
+        if self.waveform:
+            self.waveform.update_loop_markers(loop_in, loop_out)
         # REMOVED: self.loop_controls.set_loop_points(loop_in, loop_out)
 
     def _handle_loops_changed(self, loops, selected_index):
         """Update UI when loops change."""
-        self.waveform.update_loops_display(loops, selected_index)
+        if self.waveform:
+            self.waveform.update_loops_display(loops, selected_index)
         # REMOVED: self.loop_controls.update_loop_status(loops, selected_index)
         self._refresh_cue_sheet()
 
@@ -756,7 +771,8 @@ class LoopStationApp(ctk.CTk):
         self._handle_markers_changed(markers)
     
     def _handle_markers_changed(self, markers):
-        self.waveform.update_markers_display(markers)
+        if self.waveform:
+            self.waveform.update_markers_display(markers)
         self._refresh_cue_sheet()
     
     # =========================================================================
@@ -773,7 +789,8 @@ class LoopStationApp(ctk.CTk):
             return
         self._last_ui_update = now
         
-        self.waveform.update_playhead(position)
+        if self.waveform:
+            self.waveform.update_playhead(position)
         actual_pos = self.app_state.get_position()
         self.time_label.configure(text=self._format_time(actual_pos))
         
@@ -798,7 +815,7 @@ class LoopStationApp(ctk.CTk):
         self.title_label.configure(text=display_name)
         self.library.set_current_song(song_name)
         raw_audio = self.app_state.get_raw_audio_for_waveform()
-        if raw_audio is not None:
+        if raw_audio is not None and self.waveform:
             self.waveform.load_waveform(raw_audio, duration)
         self._refresh_cue_sheet()
         self.status_label.configure(text=f"Loaded: {duration:.1f}s")
@@ -828,6 +845,8 @@ class LoopStationApp(ctk.CTk):
     # =========================================================================
 
     def _toggle_selection_mode(self):
+        if not self.waveform:
+            return False
         current = self.waveform.selection_mode_active
         new_state = not current
         self.waveform.set_selection_mode(new_state)
@@ -868,7 +887,7 @@ class LoopStationApp(ctk.CTk):
             # Add as a LOOP region (Existing logic)
             self.app_state.set_loop_points(candidate.start, candidate.end)
             
-        if self.waveform.selection_mode_active:
+        if self.waveform and self.waveform.selection_mode_active:
             self._toggle_selection_mode()
 
     def _preview_candidate(self, candidate):
@@ -932,7 +951,8 @@ class LoopStationApp(ctk.CTk):
         self._update_skips_ui(skips)
 
     def _update_skips_ui(self, skips):
-        self.waveform.update_skips_display(skips)
+        if self.waveform:
+            self.waveform.update_skips_display(skips)
         self._refresh_cue_sheet()
 
     def _refresh_cue_sheet(self):
