@@ -1026,7 +1026,11 @@ class StateManager:
     # =========================================================================
     # DATA PERSISTENCE
     # =========================================================================
-    
+    def cleanup(self):
+        """Pass the cleanup signal down to the audio engine."""
+        if self.audio:
+            self.audio.cleanup()
+            
     def _load_loop_data(self) -> dict:
         """Load saved loop data from disk."""
         if not os.path.exists(DATA_DIR):
@@ -1206,4 +1210,5 @@ class StateManager:
             return hasher.hexdigest()
         except Exception as e:
             logger.error(f"Error generating fingerprint: {e}")
+
             return None
