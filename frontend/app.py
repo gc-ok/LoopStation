@@ -16,12 +16,12 @@ import os
 import sys
 import logging
 import webbrowser
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
+import queue  # <--- FIXED: Added for thread safety
 import threading
 import tkinter as tk
 import customtkinter as ctk
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from config import (
     WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT,
@@ -31,7 +31,7 @@ from config import (
     COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, COLOR_BTN_DANGER,
     COLOR_BTN_WARNING, COLOR_BTN_DISABLED, COLOR_BTN_TEXT,
     SIDEBAR_WIDTH, PADDING_SMALL, PADDING_MEDIUM, PADDING_LARGE,
-    FADE_EXIT_DURATION_MS, COLOR_BTN_SKIP, COLOR_BTN_WARNING, get_asset_path  # Add this import
+    FADE_EXIT_DURATION_MS, COLOR_BTN_SKIP, COLOR_BTN_WARNING, get_asset_path
 )
 from backend import StateManager, PlaybackState
 from .waveform import WaveformWidget
@@ -41,7 +41,7 @@ from .library import LibrarySidebar
 from .detector_panel import DetectorPanel
 from .cue_sheet import CueSheetPanel
 from .vamp_settings import VampSettingsPanel
-from .vamp_modal import VampModal  # Add this import
+from .vamp_modal import VampModal
 
 logger = logging.getLogger("LoopStation.App")
 
@@ -113,10 +113,12 @@ class LoopStationApp(ctk.CTk):
     def __init__(self, ffmpeg_path: str = "ffmpeg"):
         super().__init__()
         
+        # --- FIX: THREAD SAFETY QUEUE ---
+        self.msg_queue = queue.Queue()
+
         # --- FIX: WINDOWS TASKBAR ICON ---
         
         # 1. Separate this app from the generic "Python" taskbar group
-        # This makes the icon stick properly on the taskbar
         try:
             import ctypes
             myappid = 'gceducation.loopstation.pro.v1' # Arbitrary unique string
@@ -156,12 +158,61 @@ class LoopStationApp(ctk.CTk):
         
         # 2. CRITICAL FIX: Do NOT call _wire_callbacks() here!
         # It requires app_state to exist. We moved it to initialize_audio_system.
-        # self._wire_callbacks()  <-- DELETE OR COMMENT THIS LINE
         
         self._bind_shortcuts()
         
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        # Start queue polling loop (Main Thread)
+        self.after(100, self._check_msg_queue)
+        
         logger.info("LoopStationApp UI Shell initialized")
+
+    def _check_msg_queue(self):
+        """
+        Poll the message queue for events from background threads.
+        This runs strictly on the main thread to prevent macOS crashes.
+        """
+        try:
+            while True:
+                # Non-blocking get
+                msg_type, args = self.msg_queue.get_nowait()
+                
+                # Dispatch to actual UI update methods
+                if msg_type == 'position_update':
+                    self._update_position(*args)
+                elif msg_type == 'state_change':
+                    self._update_state(*args)
+                elif msg_type == 'loop_mode_enter':
+                    self._update_loop_mode(True)
+                elif msg_type == 'loop_mode_exit':
+                    self._update_loop_mode(False)
+                elif msg_type == 'song_loaded':
+                    self._update_song_loaded(*args)
+                elif msg_type == 'song_ended':
+                    self.status_label.configure(text="Song ended")
+                elif msg_type == 'loop_points_changed':
+                    self._update_loop_points(*args)
+                elif msg_type == 'loops_changed':
+                    self._handle_loops_changed(*args)
+                elif msg_type == 'markers_changed':
+                    self._handle_markers_changed(*args)
+                elif msg_type == 'detection_started':
+                    self.detector.show_loading()
+                elif msg_type == 'detection_complete':
+                    self.detector.show_results(*args)
+                elif msg_type == 'skips_changed':
+                    self._update_skips_ui(*args)
+                elif msg_type == 'cut_detection_complete':
+                    self.detector.show_results(*args)
+                elif msg_type == 'hide_loading':
+                    self.hide_loading()
+                    
+        except queue.Empty:
+            pass
+        
+        # Schedule next check
+        self.after(50, self._check_msg_queue)
 
     def initialize_audio_system(self):
         """
@@ -377,6 +428,11 @@ class LoopStationApp(ctk.CTk):
         
         # Loading overlay (shown during song load)
         self.loader = LoadingOverlay(self.content_frame)
+        self.loop_controls = LoopControls(
+            self.content_frame, # Note: This object doesn't seem attached to a parent frame in original, assuming usage via VampModal now
+            on_set_in=self._on_set_in,
+            on_set_out=self._on_set_out
+        ) 
 
     # Add these methods to LoopStationApp class
 
@@ -550,19 +606,26 @@ class LoopStationApp(ctk.CTk):
             self.sidebar_visible = True
 
     def _wire_callbacks(self):
-        self.app_state.on('position_update', self._on_position_update)
-        self.app_state.on('state_change', self._on_state_change)
-        self.app_state.on('loop_mode_enter', self._on_loop_mode_enter)
-        self.app_state.on('loop_mode_exit', self._on_loop_mode_exit)
-        self.app_state.on('song_loaded', self._on_song_loaded)
-        self.app_state.on('song_ended', self._on_song_ended)
-        self.app_state.on('loop_points_changed', self._on_loop_points_updated)
-        self.app_state.on('loops_changed', self._on_loops_changed)
-        self.app_state.on('markers_changed', self._on_markers_changed)
-        self.app_state.on('detection_started', lambda: self.detector.show_loading())
-        self.app_state.on('detection_complete', self._on_detection_complete)
-        self.app_state.on('skips_changed', self._on_skips_changed) # NEW
-        self.app_state.on('cut_detection_complete', self._on_cut_detection_complete) # NEW
+        """
+        Wire up StateManager events to push to the thread-safe queue.
+        This prevents macOS crash EXC_BREAKPOINT by avoiding Tkinter calls in bg threads.
+        """
+        # Helper to simplify queue putting
+        def q(key): return lambda *args: self.msg_queue.put((key, args))
+
+        self.app_state.on('position_update', q('position_update'))
+        self.app_state.on('state_change', q('state_change'))
+        self.app_state.on('loop_mode_enter', q('loop_mode_enter'))
+        self.app_state.on('loop_mode_exit', q('loop_mode_exit'))
+        self.app_state.on('song_loaded', q('song_loaded'))
+        self.app_state.on('song_ended', q('song_ended'))
+        self.app_state.on('loop_points_changed', q('loop_points_changed'))
+        self.app_state.on('loops_changed', q('loops_changed'))
+        self.app_state.on('markers_changed', q('markers_changed'))
+        self.app_state.on('detection_started', q('detection_started'))
+        self.app_state.on('detection_complete', q('detection_complete'))
+        self.app_state.on('skips_changed', q('skips_changed'))
+        self.app_state.on('cut_detection_complete', q('cut_detection_complete'))
     
     def _bind_shortcuts(self):
         self.bind("<space>", lambda e: self.app_state.toggle_play_pause())
@@ -593,13 +656,16 @@ class LoopStationApp(ctk.CTk):
         threading.Thread(target=self._load_song_thread, args=(path,), daemon=True).start()
 
     def _load_song_thread(self, path):
-        """The worker thread for loading."""
+        """
+        The worker thread for loading.
+        CRITICAL: Use msg_queue for UI updates to ensure thread safety on macOS.
+        """
         success = self.app_state.load_song(path)
         
-        # If loading failed, we must manually hide the loader.
-        # If it succeeded, the 'song_loaded' event will handle hiding it.
+        # If loading failed, we must manually hide the loader via queue.
+        # If it succeeded, the 'song_loaded' event will handle hiding it via queue.
         if not success:
-            self.after(0, self.hide_loading)
+            self.msg_queue.put(('hide_loading', ()))
     
     def _on_waveform_seek(self, position_frac: float):
         position = position_frac * self.app_state.song_length
@@ -620,7 +686,7 @@ class LoopStationApp(ctk.CTk):
     def _on_stop(self):
         self.app_state.stop()
         self.waveform.update_playhead(0)
-        self.transport.set_time(0)
+        # self.transport.set_time(0)
     
     def _on_set_in(self):
         self.app_state.update_selected_loop(start=self.app_state.get_position())
@@ -696,7 +762,8 @@ class LoopStationApp(ctk.CTk):
         )
     
     def _on_loops_changed(self, loops, selected_index):
-        self.after(0, lambda: self._handle_loops_changed(loops, selected_index))
+        # NOTE: Called via queue mechanism now, essentially wrapping _handle_loops_changed
+        self._handle_loops_changed(loops, selected_index)
     
     def _update_state(self, state):
         """Update transport buttons based on playback state."""
@@ -740,7 +807,7 @@ class LoopStationApp(ctk.CTk):
         self._refresh_cue_sheet()
 
     def _on_markers_changed(self, markers):
-        self.after(0, lambda: self._handle_markers_changed(markers))
+        self._handle_markers_changed(markers)
     
     def _handle_markers_changed(self, markers):
         self.waveform.update_markers_display(markers)
@@ -751,7 +818,7 @@ class LoopStationApp(ctk.CTk):
     # =========================================================================
     
     def _on_position_update(self, position, is_loop_mode):
-        self.after(0, lambda: self._update_position(position, is_loop_mode))
+        self._update_position(position, is_loop_mode)
     
     def _update_position(self, position, is_loop_mode):
         """Update position display."""
@@ -765,13 +832,14 @@ class LoopStationApp(ctk.CTk):
         self.cue_sheet.update_position(actual_pos)
     
     def _on_state_change(self, state):
-        self.after(0, lambda: self._update_state(state))
+        self._update_state(state)
         
     def _on_loop_mode_enter(self):
-        self.after(0, lambda: self._update_loop_mode(True))
+        self._update_loop_mode(True)
     
     def _on_loop_mode_exit(self, exit_position):
-        self.after(0, lambda: self._update_loop_mode(False))
+        # We ignore exit_position because _update_loop_mode only needs a bool
+        self._update_loop_mode(False)
     
     def _update_loop_mode(self, in_loop):
         if in_loop:
@@ -782,7 +850,7 @@ class LoopStationApp(ctk.CTk):
             self.loop_controls.set_exit_enabled(False)
     
     def _on_song_loaded(self, song_name, duration):
-        self.after(0, lambda: self._update_song_loaded(song_name, duration))
+        self._update_song_loaded(song_name, duration)
     
     def _update_song_loaded(self, song_name, duration):
         display_name = os.path.splitext(song_name)[0]
@@ -796,10 +864,10 @@ class LoopStationApp(ctk.CTk):
         self.hide_loading()
 
     def _on_song_ended(self):
-        self.after(0, lambda: self.status_label.configure(text="Song ended"))
+        self.status_label.configure(text="Song ended")
     
     def _on_loop_points_updated(self, loop_in, loop_out):
-        self.after(0, lambda: self._update_loop_points(loop_in, loop_out))
+        self._update_loop_points(loop_in, loop_out)
         
     # =========================================================================
     # LIFECYCLE
@@ -830,19 +898,35 @@ class LoopStationApp(ctk.CTk):
         self.detector.enable_find(True)
 
     def _start_detection(self):
-        self.app_state.run_loop_detection(self.sel_start, self.sel_end)
+        if self.detector.mode == "cut":
+            self.app_state.run_smart_cut_detection(self.sel_start, self.sel_end)
+        else:
+            self.app_state.run_loop_detection(self.sel_start, self.sel_end)
 
     def _on_detection_complete(self, candidates):
-        self.after(0, lambda: self.detector.show_results(candidates))
+        self.detector.show_results(candidates)
 
     def _preview_candidate(self, candidate):
-        self.app_state.set_loop_points(candidate.start, candidate.end)
-        self.app_state.seek(candidate.start)
-        if not self.app_state.is_playing():
-            self.app_state.play()
+        if self.detector.mode == "cut":
+            # Play from 2 seconds before the cut
+            preroll = max(0, candidate.start - 2.0)
+            self.app_state.play_from(preroll)
+            self.status_label.configure(text="Previewing cut transition...")
+        else:
+            self.app_state.set_loop_points(candidate.start, candidate.end)
+            self.app_state.seek(candidate.start)
+            if not self.app_state.is_playing():
+                self.app_state.play()
 
     def _use_candidate(self, candidate):
-        self.app_state.set_loop_points(candidate.start, candidate.end)
+        if self.detector.mode == "cut":
+            # Add as a SKIP region
+            self.app_state.add_skip(candidate.start, candidate.end)
+            self.status_label.configure(text=f"Cut created: {candidate.duration:.2f}s removed")
+        else:
+            # Add as a LOOP region (Existing logic)
+            self.app_state.set_loop_points(candidate.start, candidate.end)
+            
         if self.waveform.selection_mode_active:
             self._toggle_selection_mode()
         self.status_label.configure(text=f"Loop set: {candidate.duration:.2f}s")
@@ -909,7 +993,7 @@ class LoopStationApp(ctk.CTk):
 
     def _on_cut_detection_complete(self, candidates):
         """Handle Cut candidates returning from backend."""
-        self.after(0, lambda: self.detector.show_results(candidates))
+        self.detector.show_results(candidates)
 
     def _use_candidate(self, candidate):
         """Handle 'Use' button click from detector."""
@@ -940,7 +1024,7 @@ class LoopStationApp(ctk.CTk):
 
     def _on_skips_changed(self, skips):
         """Backend updated the list of skips."""
-        self.after(0, lambda: self._update_skips_ui(skips))
+        self._update_skips_ui(skips)
 
     def _update_skips_ui(self, skips):
         self.waveform.update_skips_display(skips)
