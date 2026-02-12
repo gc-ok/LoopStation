@@ -22,7 +22,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
 import ctypes
-import sys
+import shutil # Needed for which
 
 from utils.ffmpeg_downloader import check_startup
 
@@ -33,6 +33,18 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import WINDOW_WIDTH, WINDOW_HEIGHT, get_asset_path
+
+# =============================================================================
+# HELPER: DETECT BASE PATH
+# =============================================================================
+def get_base_path():
+    """Returns the directory where the executable or script is running."""
+    if getattr(sys, 'frozen', False):
+        # Running as compiled app/exe
+        return os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        return os.path.dirname(os.path.abspath(__file__))
 
 # =============================================================================
 # HELPER: CENTER WINDOW & HIGH DPI FIX
@@ -56,9 +68,6 @@ def center_window(window, width, height):
     y = int((screen_height / 2) - (height / 2))
     window.geometry(f"{width}x{height}+{x}+{y}")
 
-# =============================================================================
-# BOOTSTRAP SPLASH SCREEN (Fixed Spacing & Sizes)
-# =============================================================================
 # =============================================================================
 # BOOTSTRAP SPLASH SCREEN (Fixed Spacing & Sizes)
 # =============================================================================
@@ -154,7 +163,7 @@ class BootstrapSplash(tk.Toplevel):
 # =============================================================================
 
 def setup_logging(debug: bool = False) -> logging.Logger:
-    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    log_dir = os.path.join(get_base_path(), "logs") # Use base path for logs too
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"loop_station_{timestamp}.log")
@@ -168,11 +177,32 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     return logging.getLogger("LoopStation")
 
 def find_ffmpeg() -> str:
-    import shutil
-    if shutil.which("ffmpeg"): return "ffmpeg"
-    common = [r"C:\ffmpeg\bin\ffmpeg.exe", os.path.expanduser("~/ffmpeg/bin/ffmpeg")]
-    for p in common:
-        if os.path.isfile(p): return p
+    """
+    Robustly find FFmpeg.
+    PRIORITY 1: Check the local folder (where the app/script is running).
+    PRIORITY 2: Check global system PATH.
+    """
+    base_path = get_base_path()
+    
+    # 1. Check Local Folder (Important for macOS .app bundles)
+    # On macOS, this will be inside LoopStation.app/Contents/MacOS/
+    binary_name = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
+    local_binary = os.path.join(base_path, binary_name)
+    
+    if os.path.isfile(local_binary):
+        # Ensure it is executable
+        if os.name != 'nt':
+            try:
+                os.chmod(local_binary, 0o755)
+            except:
+                pass
+        return local_binary
+
+    # 2. Check Global PATH
+    if shutil.which("ffmpeg"): 
+        return "ffmpeg"
+        
+    # 3. Fallback (likely to fail if not found above)
     return "ffmpeg"
 
 def check_dependencies():
@@ -212,8 +242,6 @@ def reset_python_imports():
     
     print(f"Cache cleared for {len(modules_to_reset)} UI modules.")
 
-# FILE: main.py
-
 
 def main():
     make_dpi_aware()
@@ -228,8 +256,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     logger.info("Loop Station Starting")
     
-    # 2. DETERMINE PATHS
-    # We need to know where we expect ffmpeg to be before we check if it's there
+    # 2. DETERMINE PATHS (Initial check)
     ffmpeg_path = args.ffmpeg or find_ffmpeg()
     
     # Import config after logging setup just in case
@@ -237,20 +264,23 @@ def main():
 
     # 3. AUTO-DOWNLOAD CHECK
     # We create a temporary hidden root window just for the download popup.
-    # We don't use the full app yet because it might try to load audio engine stuff.
     try:
         # Create a dummy window for the downloader to parent to
         dummy_root = tk.Tk()
         dummy_root.withdraw() # Hide it
         
+        # This will download to get_base_path() if user accepts
         if not check_startup(dummy_root):
-            logger.error("FFmpeg missing and download declined. Exiting.")
-            dummy_root.destroy()
-            sys.exit(1)
+            # Only exit if ffmpeg is TRULY missing and they declined download
+            if not shutil.which(ffmpeg_path) and not os.path.exists(ffmpeg_path):
+                logger.error("FFmpeg missing and download declined. Exiting.")
+                dummy_root.destroy()
+                sys.exit(1)
             
         dummy_root.destroy() # Cleanup dummy window
         
-        # Re-detect path in case we just downloaded it
+        # RE-DETECT PATH after potential download
+        # This is the critical step to pick up the file we just downloaded
         ffmpeg_path = args.ffmpeg or find_ffmpeg()
         logger.info(f"Using ffmpeg: {ffmpeg_path}")
         
@@ -271,6 +301,7 @@ def main():
             from frontend.app import LoopStationApp 
 
             # Create the REAL app
+            # Pass the ABSOLUTE PATH to ffmpeg we found
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
             
             if first_run:
