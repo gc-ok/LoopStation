@@ -357,27 +357,27 @@ class AudioEngine:
                     logger.debug(f"Generation {gen_id} superseded after processing, bailing")
                     return
             
-            # Create pygame.mixer.Sound from the numpy array
-            temp_path = None
+            # Create pygame.mixer.Sound directly from buffer (no disk I/O)
             try:
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    temp_path = temp_file.name
+                # pygame.mixer.Sound(buffer=...) expects raw PCM in a bytes object
+                # but it needs to be wrapped in a WAV-like sndarray or use the wav approach
+                # safest cross-platform: use pygame.sndarray
+                import io
                 
-                with wave.open(temp_path, 'wb') as wf:
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wf:
                     wf.setnchannels(CHANNELS)
                     wf.setsampwidth(2)  # 16-bit = 2 bytes
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(loop_audio_int.tobytes())
                 
-                new_loop_sound = pygame.mixer.Sound(temp_path)
-                logger.debug("Created pygame.mixer.Sound from temp file")
+                wav_buffer.seek(0)
+                new_loop_sound = pygame.mixer.Sound(file=wav_buffer)
+                logger.debug("Created pygame.mixer.Sound from in-memory buffer (no disk I/O)")
                 
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
+            except Exception as loop_sound_err:
+                logger.error(f"Error creating loop sound from buffer: {loop_sound_err}")
+                return
             
             # Generate exit patch
             logger.debug("Generating exit patch...")
