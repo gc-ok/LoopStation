@@ -36,13 +36,11 @@ def get_asset_path(relative_path):
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative_path)
 
-# DATA DIRECTORY (For saving loops/preferences)
+# Data directory for saved loop points (uses BASE_DIR so it works in frozen builds)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# Data directory for saved loop points
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 LOOP_DATA_FILE = os.path.join(DATA_DIR, "loop_data.json")
 
 # Show data file (future cue sheet support)
