@@ -188,7 +188,10 @@ class BootstrapSplash(tk.Toplevel):
 # =============================================================================
 
 def setup_logging(debug: bool = False) -> logging.Logger:
-    log_dir = os.path.join(get_base_path(), "logs") # Use base path for logs too
+    if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+        log_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "LoopStation", "logs")
+    else:
+        log_dir = os.path.join(get_base_path(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"loop_station_{timestamp}.log")
@@ -381,4 +384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
