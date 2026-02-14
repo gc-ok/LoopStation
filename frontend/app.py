@@ -207,6 +207,10 @@ class LoopStationApp(ctk.CTk):
                     self._update_skips_ui(*args)
                 elif msg_type == 'cut_detection_complete':
                     self.detector.show_results(*args)
+                elif msg_type == 'loop_skip_queued':
+                    self._on_loop_skip_queued(*args)
+                elif msg_type == 'loop_skip_cleared':
+                    self._on_loop_skip_cleared()
                 elif msg_type == 'hide_loading':
                     self.hide_loading()
                     
@@ -533,6 +537,24 @@ class LoopStationApp(ctk.CTk):
             self.loop_indicator.configure(text="♻ LOOPING")
         else:
             self.status_label.configure(text="Exited loop")
+            self.loop_indicator.configure(text="")
+            # If still playing (transport resumed after loop exit), show SKIP VAMP
+            if self.app_state and self.app_state.is_playing():
+                has_active_loops = any(l.active for l in self.app_state.loops)
+                if has_active_loops:
+                    self.btn_exit_loop.configure(
+                        state="normal",
+                        fg_color=COLOR_BTN_PRIMARY,
+                        text_color="#ffffff",
+                        text="⏭  SKIP VAMP"
+                    )
+                    self.btn_fade_exit.configure(
+                        state="normal",
+                        fg_color=COLOR_BTN_WARNING,
+                        text_color="#000000"
+                    )
+                    return
+            # Otherwise disable
             self.btn_exit_loop.configure(
                 state="disabled",
                 fg_color=COLOR_BTN_DISABLED,
@@ -544,7 +566,6 @@ class LoopStationApp(ctk.CTk):
                 fg_color=COLOR_BTN_DISABLED,
                 text_color="#888888"
             )
-            self.loop_indicator.configure(text="")
 
 
 
@@ -587,6 +608,8 @@ class LoopStationApp(ctk.CTk):
         self.app_state.on('detection_complete', q('detection_complete'))
         self.app_state.on('skips_changed', q('skips_changed'))
         self.app_state.on('cut_detection_complete', q('cut_detection_complete'))
+        self.app_state.on('loop_skip_queued', q('loop_skip_queued'))
+        self.app_state.on('loop_skip_cleared', q('loop_skip_cleared'))
     
     def _bind_shortcuts(self):
         def _safe(fn):
@@ -696,14 +719,55 @@ class LoopStationApp(ctk.CTk):
         self.app_state.set_loop_points(loop_in, loop_out)
     
     def _on_exit_loop(self):
-        self.app_state.queue_exit(fade_mode=False)
-        self.loop_controls.set_exit_waiting()
-        self.status_label.configure(text="Exiting at loop boundary...")
+        if self.app_state.is_in_loop_mode():
+            self.app_state.queue_exit(fade_mode=False)
+            self.loop_controls.set_exit_waiting()
+            self.status_label.configure(text="Exiting at loop boundary...")
+        else:
+            # Transport mode - skip the upcoming vamp
+            self.app_state.queue_exit(fade_mode=False)
     
     def _on_fade_exit(self, fade_ms):
-        self.app_state.queue_exit(fade_mode=True, fade_ms=fade_ms)
-        self.loop_controls.set_exit_waiting()
-        self.status_label.configure(text=f"Fading out ({fade_ms}ms)...")
+        if self.app_state.is_in_loop_mode():
+            self.app_state.queue_exit(fade_mode=True, fade_ms=fade_ms)
+            self.loop_controls.set_exit_waiting()
+            self.status_label.configure(text=f"Fading out ({fade_ms}ms)...")
+        else:
+            # Transport mode - skip the upcoming vamp
+            self.app_state.queue_exit(fade_mode=False)
+    
+    def _on_loop_skip_queued(self, loop_name):
+        """Handle vamp skip queued from transport mode."""
+        self.status_label.configure(text=f"⏭ Skipping vamp: {loop_name}")
+        self.btn_exit_loop.configure(
+            text="⏭  SKIPPING...",
+            fg_color=COLOR_BTN_DISABLED,
+            text_color="#aaaaaa",
+            state="disabled"
+        )
+        self.btn_fade_exit.configure(
+            state="disabled",
+            fg_color=COLOR_BTN_DISABLED,
+            text_color="#888888"
+        )
+    
+    def _on_loop_skip_cleared(self):
+        """Handle skip flag cleared - re-enable skip button if still playing."""
+        if self.app_state and self.app_state.is_playing() and not self.app_state.is_in_loop_mode():
+            has_active_loops = any(l.active for l in self.app_state.loops)
+            if has_active_loops:
+                self.btn_exit_loop.configure(
+                    state="normal",
+                    fg_color=COLOR_BTN_PRIMARY,
+                    text_color="#ffffff",
+                    text="⏭  SKIP VAMP"
+                )
+                self.btn_fade_exit.configure(
+                    state="normal",
+                    fg_color=COLOR_BTN_WARNING,
+                    text_color="#000000"
+                )
+                self.status_label.configure(text="Playing")
     
     def _on_rename_loop(self, index, new_name):
         self.app_state.rename_loop(index, new_name)
@@ -758,8 +822,6 @@ class LoopStationApp(ctk.CTk):
         else:
             self.btn_play.configure(text="▶  PLAY")
         
-        # REMOVED: self.transport.set_playing(is_playing)
-        
         if state == PlaybackState.STOPPED:
             self.status_label.configure(text="Stopped")
             self.btn_exit_loop.configure(
@@ -778,6 +840,22 @@ class LoopStationApp(ctk.CTk):
             self.status_label.configure(text="Paused")
         elif state == PlaybackState.PLAYING:
             self.status_label.configure(text="Playing")
+            # Enable exit/skip buttons during playback if there are active loops
+            # (they can be used to skip upcoming vamps in transport mode)
+            if self.app_state and not self.app_state.is_in_loop_mode():
+                has_active_loops = any(l.active for l in self.app_state.loops)
+                if has_active_loops:
+                    self.btn_exit_loop.configure(
+                        state="normal",
+                        fg_color=COLOR_BTN_PRIMARY,
+                        text_color="#ffffff",
+                        text="⏭  SKIP VAMP"
+                    )
+                    self.btn_fade_exit.configure(
+                        state="normal",
+                        fg_color=COLOR_BTN_WARNING,
+                        text_color="#000000"
+                    )
 
     def _update_loop_points(self, loop_in, loop_out):
         """Update waveform display with new loop points."""
@@ -1005,6 +1083,3 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
-
-
-
