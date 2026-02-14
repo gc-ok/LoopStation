@@ -92,32 +92,10 @@ jobs:
           --add-binary "$FFPROBE_PATH:." \
           main.py
 
-    # Codesign: --deep is deprecated; sign the app properly
-    - name: Code Sign (Mac)
+    - name: Ad-hoc Code Sign (Mac)
       if: runner.os == 'macOS'
       run: |
-        # Remove any existing signatures first
-        codesign --remove-signature dist/LoopStation.app 2>/dev/null || true
-        
-        # Sign all embedded frameworks/dylibs first, then the app
-        find dist/LoopStation.app -name "*.dylib" -o -name "*.so" -o -name "*.framework" | while read f; do
-          codesign --force --sign - "$f" 2>/dev/null || true
-        done
-        
-        # Sign the main executable
-        codesign --force --options runtime --sign - dist/LoopStation.app
-
-    # Remove quarantine attribute info file so users don't have to
-    - name: Create README for Mac users
-      if: runner.os == 'macOS'
-      run: |
-        cat > dist/READ_ME_FIRST.txt << 'EOF'
-        If LoopStation won't open, run this command in Terminal:
-        
-          xattr -cr ~/Downloads/LoopStation.app
-        
-        Then try opening the app again.
-        EOF
+        codesign --deep --force --sign - dist/LoopStation.app
 
     # UPLOAD RESULT
     - name: Upload Artifacts
