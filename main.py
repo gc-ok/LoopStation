@@ -39,7 +39,10 @@ if False:
 
 # Must be done BEFORE importing pygame (which happens in backend imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
-
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import customtkinter
 import logging
 import argparse
 import time
@@ -381,4 +384,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
