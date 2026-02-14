@@ -172,13 +172,13 @@ class CueSheetPanel(ctk.CTkFrame):
         
         PERFORMANCE FIX: Instead of destroying and recreating ALL widgets
         (which causes missed clicks because buttons get destroyed mid-click),
-        we only update the visual styling of the current/previous highlight.
+        we only update the visual styling when the highlighted set changes.
         """
         self._current_position = position
         new_current = self._get_current_item_index()
-        if not hasattr(self, '_last_current_item') or self._last_current_item != new_current:
-            old_current = getattr(self, '_last_current_item', (None, None))
-            self._last_current_item = new_current
+        if not hasattr(self, '_last_current_items') or self._last_current_items != new_current:
+            old_current = getattr(self, '_last_current_items', set())
+            self._last_current_items = new_current
             
             # Update highlight in-place instead of full rebuild
             self._update_highlight(old_current, new_current)
@@ -248,22 +248,58 @@ class CueSheetPanel(ctk.CTkFrame):
         return row
 
     def _get_current_item_index(self):
-        """Extended hit testing for skips."""
+        """
+        Get the set of item indices that should be highlighted.
+        
+        Rules:
+        - Cue (marker): highlighted from its time until the next cue or vamp starts
+        - Vamp: highlighted while position is within vamp range (start <= pos <= end)
+        - Skip: highlighted while position is within skip range
+        - Multiple items can be highlighted simultaneously (e.g., cue inside vamp)
+        
+        Returns a set of indices into the unified sorted items list.
+        """
         items = []
         for marker in self._markers: items.append((marker.time, 'marker', marker, None))
         for i, loop in enumerate(self._loops): items.append((loop.start, 'vamp', loop, i))
         for skip in self._skips: items.append((skip.start, 'skip', skip, skip.id))
         items.sort(key=lambda x: x[0])
 
+        highlighted = set()
+        
         for idx, (sort_time, item_type, data, ref_id) in enumerate(items):
             if item_type == 'marker':
-                if abs(self._current_position - data.time) < 0.5: return ('marker', idx)
+                # Cue is highlighted from its time until the next cue or vamp start
+                if self._current_position < data.time:
+                    continue  # Haven't reached this cue yet
+                
+                # Find the next cue or vamp start time after this marker
+                next_boundary = None
+                for next_idx in range(idx + 1, len(items)):
+                    next_item_type = items[next_idx][1]
+                    if next_item_type in ('marker', 'vamp'):
+                        next_boundary = items[next_idx][0]
+                        break
+                
+                if next_boundary is not None:
+                    if data.time <= self._current_position < next_boundary:
+                        highlighted.add(idx)
+                else:
+                    # Last cue/vamp in the list - highlight from this cue onward
+                    if self._current_position >= data.time:
+                        highlighted.add(idx)
+                        
             elif item_type == 'vamp':
-                if data.start <= self._current_position <= data.end: return ('vamp', idx)
+                # Vamp: highlight while position is within range
+                if data.start <= self._current_position <= data.end:
+                    highlighted.add(idx)
+                    
             elif item_type == 'skip':
-                if data.start <= self._current_position <= data.end: return ('skip', idx)
+                # Skip: highlight while position is within range
+                if data.start <= self._current_position <= data.end:
+                    highlighted.add(idx)
         
-        return (None, None)
+        return highlighted
 
     def _rebuild_list(self):
         """Rebuild the item list, sorted by time."""
@@ -302,12 +338,12 @@ class CueSheetPanel(ctk.CTkFrame):
             self._item_widgets.append(lbl)
             return
 
-        # Get current item for highlighting
-        current_type, current_idx = self._get_current_item_index()
+        # Get current items for highlighting (set of indices)
+        current_items = self._get_current_item_index()
 
         for idx, (sort_time, item_type, data, ref_id) in enumerate(items):
-            # Check if this is the current item
-            is_current = (current_type is not None and current_idx == idx)
+            # Check if this item should be highlighted
+            is_current = idx in current_items
             
             if item_type == 'marker':
                 row = self._create_marker_row(data, is_current)
