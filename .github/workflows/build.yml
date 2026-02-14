@@ -5,7 +5,6 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# REQUIRED: Gives the action permission to update Releases
 permissions:
   contents: write
 
@@ -18,101 +17,128 @@ jobs:
         os: [windows-latest, macos-latest]
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    # Install ffmpeg
-    - name: Install FFmpeg (Mac)
-      if: runner.os == 'macOS'
-      run: brew install ffmpeg
+      # Install FFmpeg
+      - name: Install FFmpeg (Mac)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
 
-    - name: Install FFmpeg (Windows)
-      if: runner.os == 'Windows'
-      run: choco install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg
 
-    - name: Install Dependencies
-      run: |
-        pip install pygame numpy matplotlib customtkinter librosa pyinstaller Pillow
+      - name: Install Dependencies
+        run: |
+          pip install pygame numpy matplotlib customtkinter librosa pyinstaller Pillow
 
-    # BUILD WINDOWS
-    - name: Build Windows .exe
-      if: runner.os == 'Windows'
-      run: |
-        $ffmpegPath = (Get-Command ffmpeg).Source
-        $ffprobePath = (Get-Command ffprobe).Source
-        
-        pyinstaller --noconsole --name "LoopStation" --icon=logo.ico `
-          --paths . `
-          --collect-all customtkinter `
-          --collect-all matplotlib `
-          --hidden-import pygame `
-          --hidden-import PIL `
-          --add-data "frontend;frontend" `
-          --add-data "backend;backend" `
-          --add-data "utils;utils" `
-          --add-data "logo.png;." `
-          --add-data "logo.ico;." `
-          --add-binary "$ffmpegPath;." `
-          --add-binary "$ffprobePath;." `
-          main.py
+      # ---------------- WINDOWS BUILD ----------------
+      - name: Build Windows .exe
+        if: runner.os == 'Windows'
+        run: |
+          $ffmpegPath = (Get-Command ffmpeg).Source
+          $ffprobePath = (Get-Command ffprobe).Source
 
-    # BUILD MAC
-    - name: Build Mac .app
-      if: runner.os == 'macOS'
-      run: |
-        FFMPEG_PATH=$(which ffmpeg)
-        FFPROBE_PATH=$(which ffprobe)
-        
-        pyinstaller --noconsole --name "LoopStation" --icon=logo.png \
-          --paths . \
-          --collect-all customtkinter \
-          --collect-all matplotlib \
-          --hidden-import pygame \
-          --hidden-import PIL \
-          --add-data "frontend:frontend" \
-          --add-data "backend:backend" \
-          --add-data "utils:utils" \
-          --add-data "logo.png:." \
-          --add-data "logo.ico:." \
-          --add-binary "$FFMPEG_PATH:." \
-          --add-binary "$FFPROBE_PATH:." \
-          main.py
+          pyinstaller --noconsole --name "LoopStation" --icon=logo.ico `
+            --paths . `
+            --collect-all customtkinter `
+            --collect-all matplotlib `
+            --hidden-import pygame `
+            --hidden-import PIL `
+            --add-data "frontend;frontend" `
+            --add-data "backend;backend" `
+            --add-data "utils;utils" `
+            --add-data "logo.png;." `
+            --add-data "logo.ico;." `
+            --add-binary "$ffmpegPath;." `
+            --add-binary "$ffprobePath;." `
+            main.py
 
-    - name: Ad-hoc Code Sign (Mac)
-      if: runner.os == 'macOS'
-      run: |
-        codesign --deep --force --sign - dist/LoopStation.app
+      - name: Zip Windows Build
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path dist/LoopStation -DestinationPath LoopStation-Windows.zip
 
-    # --- NEW STEPS BELOW ---
+      - name: Upload Windows Artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: LoopStation-Windows.zip
 
-    # 1. Zip the build output (because Releases can't accept folders)
-    
-    - name: Zip Build (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        # Compress the 'dist/LoopStation' folder into a zip
-        Compress-Archive -Path dist/LoopStation -DestinationPath dist/LoopStation-Windows.zip
+      # ---------------- MAC BUILD ----------------
+      - name: Build Mac .app
+        if: runner.os == 'macOS'
+        run: |
+          FFMPEG_PATH=$(which ffmpeg)
+          FFPROBE_PATH=$(which ffprobe)
 
-    - name: Zip Build (Mac)
-      if: runner.os == 'macOS'
-      run: |
-        # Zip the .app bundle. We use -r to recurse into the directory
-        cd dist
-        zip -r LoopStation-Mac.zip LoopStation.app
+          # --windowed is the same as --noconsole
+          pyinstaller --windowed --name "LoopStation" --icon=logo.png \
+            --paths . \
+            --collect-all customtkinter \
+            --collect-all matplotlib \
+            --hidden-import pygame \
+            --hidden-import PIL \
+            --add-data "frontend:frontend" \
+            --add-data "backend:backend" \
+            --add-data "utils:utils" \
+            --add-data "logo.png:." \
+            --add-data "logo.ico:." \
+            --add-binary "$FFMPEG_PATH:." \
+            --add-binary "$FFPROBE_PATH:." \
+            --argv-emulation \
+            main.py
 
-    # 2. Upload to GitHub Releases (Public Download)
-    
-    - name: Update Nightly Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: nightly      # All builds go to this specific tag
-        name: Nightly Build    # Title of the release
-        files: dist/*.zip      # Upload the zip files we just created
-        draft: false
-        prerelease: true       # Marks it as a pre-release/beta
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # FIX: Removed --deep. This prevents corrupting the internal libraries.
+      - name: Ad-hoc Code Sign (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - dist/LoopStation.app
+
+      - name: Zip Mac Build
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r LoopStation-Mac.zip LoopStation.app
+
+      - name: Upload Mac Artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: dist/LoopStation-Mac.zip
+
+  # ---------------- RELEASE JOB ----------------
+  release:
+    name: Publish Nightly Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # We need to find the zip files because download-artifact puts them in subfolders
+      - name: Create or Update Nightly Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          draft: false
+          overwrite: true
+          files: |
+            artifacts/windows-build/LoopStation-Windows.zip
+            artifacts/mac-build/LoopStation-Mac.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
