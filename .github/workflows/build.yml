@@ -1,10 +1,9 @@
 name: Build Loop Station
 
-# This triggers the build every time you make a change to the code
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # Allows you to click a button to run it manually
+  workflow_dispatch:
 
 jobs:
   build:
@@ -12,15 +11,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            python-version: '3.12'
+          - os: macos-26           # macOS Tahoe — matches your target OS
+            python-version: '3.12' # Ships with newer Tcl/Tk (fixes autorelease pool crash)
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: ${{ matrix.python-version }}
 
     # Install ffmpeg
     - name: Install FFmpeg (Mac)
@@ -33,6 +36,7 @@ jobs:
 
     - name: Install Dependencies
       run: |
+        pip install --upgrade pip
         pip install pygame numpy matplotlib customtkinter librosa pyinstaller Pillow
 
     # BUILD WINDOWS (bundles ffmpeg + ffprobe)
@@ -42,13 +46,15 @@ jobs:
         $ffmpegPath = (Get-Command ffmpeg).Source
         $ffprobePath = (Get-Command ffprobe).Source
         
-        # FIXED COMMAND: Added --paths and --add-data for local packages
         pyinstaller --noconsole --name "LoopStation" --icon=logo.ico `
+          --osx-bundle-identifier "com.loopstation.app" `
           --paths . `
           --collect-all customtkinter `
           --collect-all matplotlib `
           --hidden-import pygame `
           --hidden-import PIL `
+          --hidden-import tkinter `
+          --hidden-import _tkinter `
           --add-data "frontend;frontend" `
           --add-data "backend;backend" `
           --add-data "utils;utils" `
@@ -58,20 +64,25 @@ jobs:
           --add-binary "$ffprobePath;." `
           main.py
 
-    # BUILD MAC (bundles ffmpeg + ffprobe so users never need to download)
+    # BUILD MAC (bundles ffmpeg + ffprobe)
     - name: Build Mac .app
       if: runner.os == 'macOS'
+      env:
+        # Prevent Tk autorelease pool issues during build
+        OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
       run: |
         FFMPEG_PATH=$(which ffmpeg)
         FFPROBE_PATH=$(which ffprobe)
         
-        # FIXED COMMAND: Added --paths and --add-data for local packages
         pyinstaller --noconsole --name "LoopStation" --icon=logo.png \
+          --osx-bundle-identifier "com.loopstation.app" \
           --paths . \
           --collect-all customtkinter \
           --collect-all matplotlib \
           --hidden-import pygame \
           --hidden-import PIL \
+          --hidden-import tkinter \
+          --hidden-import _tkinter \
           --add-data "frontend:frontend" \
           --add-data "backend:backend" \
           --add-data "utils:utils" \
@@ -81,10 +92,32 @@ jobs:
           --add-binary "$FFPROBE_PATH:." \
           main.py
 
-    - name: Ad-hoc Code Sign (Mac)
+    # Codesign: --deep is deprecated; sign the app properly
+    - name: Code Sign (Mac)
       if: runner.os == 'macOS'
       run: |
-        codesign --deep --force --sign - dist/LoopStation.app
+        # Remove any existing signatures first
+        codesign --remove-signature dist/LoopStation.app 2>/dev/null || true
+        
+        # Sign all embedded frameworks/dylibs first, then the app
+        find dist/LoopStation.app -name "*.dylib" -o -name "*.so" -o -name "*.framework" | while read f; do
+          codesign --force --sign - "$f" 2>/dev/null || true
+        done
+        
+        # Sign the main executable
+        codesign --force --options runtime --sign - dist/LoopStation.app
+
+    # Remove quarantine attribute info file so users don't have to
+    - name: Create README for Mac users
+      if: runner.os == 'macOS'
+      run: |
+        cat > dist/READ_ME_FIRST.txt << 'EOF'
+        If LoopStation won't open, run this command in Terminal:
+        
+          xattr -cr ~/Downloads/LoopStation.app
+        
+        Then try opening the app again.
+        EOF
 
     # UPLOAD RESULT
     - name: Upload Artifacts
