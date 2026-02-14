@@ -36,8 +36,14 @@ def get_asset_path(relative_path):
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative_path)
 
-# Data directory for saved loop points (uses BASE_DIR so it works in frozen builds)
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Data directory for saved loop points
+# On macOS frozen builds, the .app bundle is read-only (especially under App Translocation),
+# so we use ~/Library/Application Support/LoopStation/ instead.
+if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+    DATA_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "LoopStation")
+else:
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
