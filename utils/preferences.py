@@ -1,9 +1,17 @@
 import os
+import sys
 import json
 import logging
 
+def _get_prefs_dir():
+    """Get the writable data directory for preferences."""
+    if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "LoopStation")
+    else:
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
 # Path to the preferences file
-PREFS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "user_preferences.json")
+PREFS_FILE = os.path.join(_get_prefs_dir(), "user_preferences.json")
 
 def load_preferences():
     """Load user preferences from JSON."""
