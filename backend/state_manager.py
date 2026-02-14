@@ -272,6 +272,8 @@ class StateManager:
             'markers_changed': [],      # (markers_list)
             'skips_changed': [],          # (skips_list)
             'cut_detection_complete': [], # (candidates_list)
+            'loop_skip_queued': [],       # (loop_name) - vamp skip from transport
+            'loop_skip_cleared': [],      # () - skip flag cleared, loop re-armed
         }
         self.skips: List[SkipRegion] = []
         self._last_skip_time = 0.0
@@ -597,14 +599,15 @@ class StateManager:
 
     def queue_exit(self, fade_mode=False, fade_ms=None):
         """
-        Exit the current loop at the next boundary.
+        Exit the current loop at the next boundary, or skip the upcoming loop
+        if still in transport mode.
         
         Args:
             fade_mode: If True, fade out instead of cutting to transport
             fade_ms: Fade duration in ms (only used if fade_mode=True)
         """
         if self.audio.mode == "loop":
-            # Find the loop matching current engine points
+            # Already in loop mode - queue exit at next boundary
             current_engine_in = self.audio.loop_in
             
             for loop in self.loops:
@@ -620,6 +623,27 @@ class StateManager:
             logger.info(f"UI: EXIT LOOP queued ({mode_str}) - Skipping loop {self.temp_skip_loop_id}")
             self.exit_queue_active = True
             self._prev_cycle_pos = self.audio.get_loop_cycle_position()
+        elif self.state == PlaybackState.PLAYING:
+            # In transport mode - skip the next upcoming (or current) active loop
+            pos = self.audio.get_position()
+            target_loop = None
+            
+            # Find the nearest active loop we're inside or approaching
+            # (loops may not be sorted, so check all and pick closest)
+            for loop in self.loops:
+                if not loop.active:
+                    continue
+                if loop.id == self.temp_skip_loop_id:
+                    continue
+                # Must be a loop we haven't passed yet
+                if pos < loop.end:
+                    if target_loop is None or loop.start < target_loop.start:
+                        target_loop = loop
+            
+            if target_loop:
+                self.temp_skip_loop_id = target_loop.id
+                logger.info(f"UI: SKIP VAMP queued - Skipping loop '{target_loop.name}' (id={target_loop.id})")
+                self._emit('loop_skip_queued', target_loop.name)
     
     def is_loop_ready(self) -> bool:
         """Check if seamless loop sound is ready."""
@@ -898,6 +922,7 @@ class StateManager:
                             if pos > skipped_loop.end + 2.0 or pos < skipped_loop.start:
                                 self.temp_skip_loop_id = None
                                 logger.debug("Cleared skip loop flag - loop re-armed")
+                                self._emit('loop_skip_cleared')
                     
                     # --- SCAN FOR LOOPS ---
                     target_loop = None
