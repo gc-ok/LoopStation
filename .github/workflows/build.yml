@@ -24,7 +24,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      # Install FFmpeg
       - name: Install FFmpeg (Mac)
         if: runner.os == 'macOS'
         run: brew install ffmpeg
@@ -59,16 +58,15 @@ jobs:
             --add-binary "$ffprobePath;." `
             main.py
 
-      - name: Zip Windows Build
+      - name: Zip Windows
         if: runner.os == 'Windows'
-        run: |
-          Compress-Archive -Path dist/LoopStation -DestinationPath LoopStation-Windows.zip
+        run: Compress-Archive -Path dist/LoopStation -DestinationPath LoopStation-Windows.zip
 
-      - name: Upload Windows Artifact
+      - name: Upload Windows
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: windows-build
+          name: windows-zip
           path: LoopStation-Windows.zip
 
       # ---------------- MAC BUILD ----------------
@@ -78,7 +76,7 @@ jobs:
           FFMPEG_PATH=$(which ffmpeg)
           FFPROBE_PATH=$(which ffprobe)
 
-          # --windowed is the same as --noconsole
+          # NOTE: Removed --argv-emulation to fix SIGABRT/badPop crash
           pyinstaller --windowed --name "LoopStation" --icon=logo.png \
             --paths . \
             --collect-all customtkinter \
@@ -92,27 +90,26 @@ jobs:
             --add-data "logo.ico:." \
             --add-binary "$FFMPEG_PATH:." \
             --add-binary "$FFPROBE_PATH:." \
-            --argv-emulation \
             main.py
 
-      # FIX: Removed --deep. This prevents corrupting the internal libraries.
+      # FIX: Use simple signing (no --deep)
       - name: Ad-hoc Code Sign (Mac)
         if: runner.os == 'macOS'
         run: |
           codesign --force --sign - dist/LoopStation.app
 
-      - name: Zip Mac Build
+      - name: Zip Mac
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -r LoopStation-Mac.zip LoopStation.app
+          zip -r ../LoopStation-Mac.zip LoopStation.app
 
-      - name: Upload Mac Artifact
+      - name: Upload Mac
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: mac-build
-          path: dist/LoopStation-Mac.zip
+          name: mac-zip
+          path: LoopStation-Mac.zip
 
   # ---------------- RELEASE JOB ----------------
   release:
@@ -121,24 +118,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
+    
     steps:
-      - name: Download All Artifacts
+      - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      # We need to find the zip files because download-artifact puts them in subfolders
-      - name: Create or Update Nightly Release
+      - name: Update Nightly Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: nightly
           name: Nightly Build
           prerelease: true
-          draft: false
           overwrite: true
           files: |
-            artifacts/windows-build/LoopStation-Windows.zip
-            artifacts/mac-build/LoopStation-Mac.zip
+            artifacts/windows-zip/LoopStation-Windows.zip
+            artifacts/mac-zip/LoopStation-Mac.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
