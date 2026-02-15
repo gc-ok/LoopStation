@@ -114,6 +114,10 @@ class LoopRegion:
         
         # 4. "Fade Exit" (Duration when fading out)
         self.exit_fade_ms = FADE_EXIT_DURATION_MS
+        
+        # --- Cue Notes & Tags ---
+        self.notes = ""                # Free-text notes for this vamp
+        self.tags = []                 # e.g. ["director", "tech", "lighting"]
 
     def to_dict(self):
         """Serialize for JSON storage."""
@@ -127,6 +131,8 @@ class LoopRegion:
             'crossfade_ms': self.crossfade_ms,
             'early_switch_ms': self.early_switch_ms,
             'exit_fade_ms': self.exit_fade_ms,
+            'notes': self.notes,
+            'tags': self.tags,
         }
     
     @classmethod
@@ -140,6 +146,8 @@ class LoopRegion:
         loop.crossfade_ms = data.get('crossfade_ms', LOOP_CROSSFADE_MS)
         loop.early_switch_ms = data.get('early_switch_ms', LOOP_SWITCH_EARLY_MS)
         loop.exit_fade_ms = data.get('exit_fade_ms', FADE_EXIT_DURATION_MS)
+        loop.notes = data.get('notes', '')
+        loop.tags = data.get('tags', [])
         return loop
 
 
@@ -153,12 +161,16 @@ class Marker:
         name: Human-readable name (e.g., "Verse 2", "Dialogue starts")
         time: Position in seconds
         color: Optional color for display (hex string)
+        notes: Free-text notes for this cue point
+        tags: List of tag strings (e.g., ["director", "tech"])
     """
     def __init__(self, time_pos, name=None, color=None):
         self.id = str(uuid.uuid4())
         self.name = name or DEFAULT_MARKER_NAME
         self.time = time_pos
         self.color = color  # None = use default COLOR_MARKER
+        self.notes = ""     # Free-text notes
+        self.tags = []      # e.g. ["director", "tech", "lighting"]
     
     def to_dict(self):
         """Serialize for JSON storage."""
@@ -167,6 +179,8 @@ class Marker:
             'name': self.name,
             'time': self.time,
             'color': self.color,
+            'notes': self.notes,
+            'tags': self.tags,
         }
     
     @classmethod
@@ -174,6 +188,8 @@ class Marker:
         """Deserialize from JSON storage."""
         marker = cls(data['time'], name=data.get('name', DEFAULT_MARKER_NAME), color=data.get('color'))
         marker.id = data.get('id', str(uuid.uuid4()))
+        marker.notes = data.get('notes', '')
+        marker.tags = data.get('tags', [])
         return marker
 
 
@@ -732,6 +748,72 @@ class StateManager:
             self.play_from(prev_marker.time)
             return True
         return False
+    
+    # =========================================================================
+    # CUE NOTES & TAGS
+    # =========================================================================
+    
+    def update_item_notes(self, item_id, notes_text):
+        """
+        Update notes for a marker or loop region by ID.
+        
+        Args:
+            item_id: UUID string of the marker or loop
+            notes_text: New notes content
+        """
+        for marker in self.markers:
+            if marker.id == item_id:
+                marker.notes = notes_text
+                self._emit('markers_changed', self.markers)
+                self.save_loop()
+                return True
+        
+        for loop in self.loops:
+            if loop.id == item_id:
+                loop.notes = notes_text
+                self._emit_loops_update()
+                self.save_loop()
+                return True
+        
+        return False
+    
+    def update_item_tags(self, item_id, tags):
+        """
+        Update tags for a marker or loop region by ID.
+        
+        Args:
+            item_id: UUID string of the marker or loop
+            tags: List of tag strings
+        """
+        for marker in self.markers:
+            if marker.id == item_id:
+                marker.tags = tags
+                self._emit('markers_changed', self.markers)
+                self.save_loop()
+                return True
+        
+        for loop in self.loops:
+            if loop.id == item_id:
+                loop.tags = tags
+                self._emit_loops_update()
+                self.save_loop()
+                return True
+        
+        return False
+    
+    def get_timeline_items(self):
+        """
+        Get all markers and vamps as a unified, time-sorted list.
+        Returns list of tuples: (time, type_str, object)
+        where type_str is 'marker' or 'vamp'.
+        """
+        items = []
+        for marker in self.markers:
+            items.append((marker.time, 'marker', marker))
+        for loop in self.loops:
+            items.append((loop.start, 'vamp', loop))
+        items.sort(key=lambda x: x[0])
+        return items
     
     # =========================================================================
     # POSITION AND STATE QUERIES
