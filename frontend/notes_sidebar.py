@@ -240,7 +240,8 @@ class NotesSidebar(ctk.CTkFrame):
         self._tag_buttons = {}
         self._tag_states = {}
         
-        # Create tag toggle buttons in a wrapping grid
+        # Create tag toggle buttons in a wrapping grid (3 columns for readability)
+        cols = 3
         for i, tag in enumerate(AVAILABLE_TAGS):
             color = TAG_COLORS.get(tag, "#555555")
             self._tag_states[tag] = False
@@ -248,22 +249,22 @@ class NotesSidebar(ctk.CTkFrame):
             btn = ctk.CTkButton(
                 self.tags_button_frame,
                 text=tag,
-                width=70,
-                height=24,
-                font=("Segoe UI", 9),
+                width=0,
+                height=26,
+                font=("Segoe UI", 10),
                 fg_color="#333333",
                 hover_color=color,
                 text_color=COLOR_TEXT_DIM,
                 corner_radius=12,
                 command=lambda t=tag: self._toggle_tag(t)
             )
-            row = i // 4
-            col = i % 4
+            row = i // cols
+            col = i % cols
             btn.grid(row=row, column=col, padx=2, pady=2, sticky="ew")
             self._tag_buttons[tag] = btn
         
         # Make columns expand evenly
-        for c in range(4):
+        for c in range(cols):
             self.tags_button_frame.grid_columnconfigure(c, weight=1)
         
         # Notes text area
@@ -557,12 +558,12 @@ class NotesSidebar(ctk.CTkFrame):
         for tag in tags:
             color = TAG_COLORS.get(tag, "#555555")
             badge = ctk.CTkLabel(
-                frame, text=tag,
+                frame, text=f" {tag} ",
                 font=("Segoe UI", 9, "bold"),
                 fg_color=color,
                 corner_radius=10,
                 text_color="#ffffff",
-                width=60, height=20
+                height=20
             )
             badge.pack(side="left", padx=2, pady=2)
     
@@ -610,13 +611,13 @@ class NotesSidebar(ctk.CTkFrame):
             btn.configure(
                 fg_color=color,
                 text_color="#ffffff",
-                font=("Segoe UI", 9, "bold")
+                font=("Segoe UI", 10, "bold")
             )
         else:
             btn.configure(
                 fg_color="#333333",
                 text_color=COLOR_TEXT_DIM,
-                font=("Segoe UI", 9)
+                font=("Segoe UI", 10)
             )
     
     # =========================================================================
