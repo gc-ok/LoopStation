@@ -45,6 +45,14 @@ from .vamp_settings import VampSettingsPanel
 from .vamp_modal import VampModal
 from .notes_sidebar import NotesSidebar
 
+# Web server (Phase 2) - lazy import, dependencies optional
+try:
+    from backend.web_server import CueWebServer, SharedCueState, get_local_ip, HAS_FLASK
+except ImportError:
+    HAS_FLASK = False
+    CueWebServer = None
+    SharedCueState = None
+
 logger = logging.getLogger("LoopStation.App")
 
 
@@ -151,6 +159,10 @@ class LoopStationApp(ctk.CTk):
         self.sel_start = 0.0
         self.sel_end = 0.0
         self.ffmpeg_path = ffmpeg_path
+        
+        # Web server (Phase 2)
+        self._shared_cue_state = SharedCueState() if SharedCueState else None
+        self._web_server = None
 
         # 1. Start with NO audio engine (Instant load)
         self.app_state = None 
@@ -474,6 +486,16 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._toggle_right_sidebar
         )
         self.btn_toggle_right.pack(side="right", padx=(15, 0))
+        
+        # Share button (Phase 2 - local network)
+        self.btn_share = ctk.CTkButton(
+            header_frame, text="📡 Share", width=80, height=30,
+            font=("Segoe UI", 11),
+            fg_color="transparent", border_width=1,
+            border_color=COLOR_TEXT_DIM, text_color=COLOR_TEXT,
+            hover_color=COLOR_BG_LIGHT, command=self._toggle_web_share
+        )
+        self.btn_share.pack(side="right", padx=(10, 0))
 
     # Add these methods to LoopStationApp class
 
@@ -635,6 +657,153 @@ class LoopStationApp(ctk.CTk):
         """Handle tag removal from the sidebar."""
         if self.app_state:
             self.app_state.remove_item_tag(item_id, tag)
+    
+    # =========================================================================
+    # WEB SHARING (Phase 2)
+    # =========================================================================
+    
+    def _toggle_web_share(self):
+        """Start or stop the local network cue monitor."""
+        if not HAS_FLASK or CueWebServer is None:
+            self._show_share_deps_error()
+            return
+        
+        if self._web_server and self._web_server.running:
+            # Stop sharing
+            self._web_server.stop()
+            self._web_server = None
+            self.btn_share.configure(
+                text="📡 Share",
+                fg_color="transparent",
+                text_color=COLOR_TEXT
+            )
+            self.status_label.configure(text="Sharing stopped")
+        else:
+            # Start sharing
+            try:
+                self._web_server = CueWebServer(self._shared_cue_state, port=8080)
+                url = self._web_server.start()
+                self.btn_share.configure(
+                    text="📡 LIVE",
+                    fg_color=COLOR_BTN_SUCCESS,
+                    text_color="#ffffff"
+                )
+                self.status_label.configure(text=f"Sharing at {url}")
+                self._show_share_popup(url)
+            except Exception as e:
+                logger.error(f"Failed to start web server: {e}")
+                self.status_label.configure(text=f"Share failed: {e}")
+    
+    def _show_share_popup(self, url):
+        """Show a popup with the URL and QR code."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Cue Monitor - Share")
+        popup.geometry("400x520")
+        popup.resizable(False, False)
+        popup.configure(fg_color=COLOR_BG_DARK)
+        popup.attributes("-topmost", True)
+        popup.after(200, lambda: popup.attributes("-topmost", False))
+        
+        ctk.CTkLabel(
+            popup, text="📡  CUE MONITOR LIVE",
+            font=("Segoe UI", 18, "bold"), text_color=COLOR_TEXT
+        ).pack(pady=(20, 10))
+        
+        ctk.CTkLabel(
+            popup, text="Open this URL on any device on the same network:",
+            font=("Segoe UI", 12), text_color=COLOR_TEXT_DIM,
+            wraplength=350
+        ).pack(pady=(0, 10))
+        
+        # URL (copyable)
+        url_frame = ctk.CTkFrame(popup, fg_color=COLOR_BG_MEDIUM, corner_radius=8)
+        url_frame.pack(padx=20, pady=5, fill="x")
+        
+        url_label = ctk.CTkLabel(
+            url_frame, text=url,
+            font=("Consolas", 16, "bold"), text_color="#58a6ff",
+            cursor="hand2"
+        )
+        url_label.pack(padx=15, pady=12)
+        
+        def copy_url():
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            copy_btn.configure(text="Copied!")
+            popup.after(2000, lambda: copy_btn.configure(text="Copy URL"))
+        
+        copy_btn = ctk.CTkButton(
+            popup, text="Copy URL", width=120, height=32,
+            fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
+            command=copy_url
+        )
+        copy_btn.pack(pady=8)
+        
+        # QR Code
+        try:
+            import qrcode
+            from PIL import Image, ImageTk
+            
+            qr = qrcode.QRCode(version=1, box_size=6, border=2)
+            qr.add_data(url)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="white", back_color="#0d1117")
+            qr_img = qr_img.resize((200, 200), Image.NEAREST)
+            
+            # Convert to PhotoImage for Tkinter
+            photo = ImageTk.PhotoImage(qr_img)
+            
+            qr_label = tk.Label(popup, image=photo, bg=COLOR_BG_DARK)
+            qr_label.image = photo  # Keep reference
+            qr_label.pack(pady=10)
+            
+            ctk.CTkLabel(
+                popup, text="Scan with phone camera",
+                font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM
+            ).pack()
+        except ImportError:
+            ctk.CTkLabel(
+                popup, text="(Install 'qrcode' and 'pillow' for QR code)",
+                font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM
+            ).pack(pady=20)
+        
+        # Close button
+        ctk.CTkButton(
+            popup, text="Close", width=100, height=30,
+            fg_color=COLOR_BG_LIGHT, text_color=COLOR_TEXT,
+            command=popup.destroy
+        ).pack(pady=(15, 20))
+    
+    def _show_share_deps_error(self):
+        """Show error when Flask is not installed."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Missing Dependencies")
+        popup.geometry("420x200")
+        popup.resizable(False, False)
+        popup.configure(fg_color=COLOR_BG_DARK)
+        popup.attributes("-topmost", True)
+        
+        ctk.CTkLabel(
+            popup, text="Web sharing requires additional packages:",
+            font=("Segoe UI", 13), text_color=COLOR_TEXT
+        ).pack(pady=(20, 10))
+        
+        ctk.CTkLabel(
+            popup, text="pip install flask qrcode pillow",
+            font=("Consolas", 14, "bold"), text_color="#58a6ff"
+        ).pack(pady=5)
+        
+        ctk.CTkLabel(
+            popup, text="Run this in your terminal, then restart Loop Station.",
+            font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM,
+            wraplength=380
+        ).pack(pady=10)
+        
+        ctk.CTkButton(
+            popup, text="OK", width=80,
+            fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
+            command=popup.destroy
+        ).pack(pady=10)
 
     def _wire_callbacks(self):
         """
@@ -984,6 +1153,16 @@ class LoopStationApp(ctk.CTk):
         
         # Update notes sidebar countdown and current cue
         self.notes_sidebar.update_position(actual_pos, is_playing=True)
+        
+        # Push to web server shared state (if sharing)
+        if self._shared_cue_state and self._web_server and self._web_server.running:
+            self._shared_cue_state.update_from_app(
+                self.app_state, actual_pos,
+                self.notes_sidebar._current_item,
+                self.notes_sidebar._current_item_type,
+                self.notes_sidebar._next_item,
+                self.notes_sidebar._next_item_type,
+            )
     
     def _on_state_change(self, state):
         self._update_state(state)
@@ -1028,15 +1207,18 @@ class LoopStationApp(ctk.CTk):
         """Handle application shutdown."""
         logger.info("Application closing")
         
-        # 1. Stop playback
+        # 1. Stop web server if running
+        if self._web_server and self._web_server.running:
+            self._web_server.stop()
+        
+        # 2. Stop playback
         if self.app_state:
             self.app_state.stop()
             
-            # 2. TRIGGER THE CLEANUP
-            # This deletes the temporary files on disk
+            # 3. TRIGGER THE CLEANUP
             self.app_state.cleanup()
         
-        # 3. Destroy window
+        # 4. Destroy window
         self.destroy()
         sys.exit(0)
     
