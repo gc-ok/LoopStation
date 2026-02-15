@@ -520,6 +520,16 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._toggle_web_share
         )
         self.btn_share.pack(side="right", padx=(10, 0))
+        
+        # Keyboard shortcuts reference button
+        btn_hotkeys = ctk.CTkButton(
+            header_frame, text="⌨", width=34, height=30,
+            font=("Segoe UI", 14),
+            fg_color="transparent", border_width=1,
+            border_color=COLOR_TEXT_DIM, text_color=COLOR_TEXT,
+            hover_color=COLOR_BG_LIGHT, command=self._show_hotkeys_modal
+        )
+        btn_hotkeys.pack(side="right", padx=(10, 0))
 
     # Add these methods to LoopStationApp class
 
@@ -686,6 +696,88 @@ class LoopStationApp(ctk.CTk):
     # WEB SHARING (Phase 2)
     # =========================================================================
     
+    def _show_hotkeys_modal(self):
+        """Show a modal with all keyboard shortcuts."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Keyboard Shortcuts")
+        popup.geometry("360x520")
+        popup.resizable(False, False)
+        popup.configure(fg_color=COLOR_BG_DARK)
+        popup.attributes("-topmost", True)
+        popup.after(200, lambda: popup.attributes("-topmost", False))
+        
+        ctk.CTkLabel(
+            popup, text="⌨  Keyboard Shortcuts",
+            font=("Segoe UI", 16, "bold"), text_color=COLOR_TEXT
+        ).pack(pady=(16, 12))
+        
+        # Scrollable frame for the shortcuts
+        scroll = ctk.CTkScrollableFrame(
+            popup, fg_color=COLOR_BG_MEDIUM, corner_radius=8,
+            width=320, height=400
+        )
+        scroll.pack(padx=16, fill="both", expand=True)
+        
+        shortcuts = [
+            ("Playback", [
+                ("Space", "Play / Pause"),
+                ("Escape", "Stop"),
+                ("← / →", "Nudge ±0.1s"),
+                ("Ctrl+← / →", "Nudge ±1.0s"),
+                ("[ / ]", "Prev / Next marker"),
+            ]),
+            ("Looping", [
+                ("I", "Set loop IN"),
+                ("O", "Set loop OUT"),
+                ("E", "Exit loop at boundary"),
+                ("F", "Fade exit from loop"),
+            ]),
+            ("Cue Management", [
+                ("M", "Add cue marker at playhead"),
+                ("N", "Toggle cue details sidebar"),
+                ("S", "Save all data"),
+            ]),
+        ]
+        
+        for section_title, keys in shortcuts:
+            ctk.CTkLabel(
+                scroll, text=section_title,
+                font=("Segoe UI", 12, "bold"), text_color=COLOR_TEXT,
+                anchor="w"
+            ).pack(fill="x", padx=10, pady=(12, 4))
+            
+            for key, action in keys:
+                row = ctk.CTkFrame(scroll, fg_color="transparent", height=28)
+                row.pack(fill="x", padx=10, pady=1)
+                row.pack_propagate(False)
+                
+                key_badge = ctk.CTkLabel(
+                    row, text=key, width=100,
+                    font=("Consolas", 11, "bold"), text_color="#58a6ff",
+                    anchor="w"
+                )
+                key_badge.pack(side="left", padx=(0, 8))
+                
+                ctk.CTkLabel(
+                    row, text=action,
+                    font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM,
+                    anchor="w"
+                ).pack(side="left", fill="x", expand=True)
+        
+        # Note about text fields
+        ctk.CTkLabel(
+            scroll, text="Shortcuts are paused while typing in text fields.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM,
+            wraplength=290
+        ).pack(padx=10, pady=(16, 10))
+        
+        # Close button
+        ctk.CTkButton(
+            popup, text="Close", width=80, height=28,
+            fg_color=COLOR_BG_LIGHT, text_color=COLOR_TEXT,
+            command=popup.destroy
+        ).pack(pady=(8, 12))
+
     def _toggle_web_share(self):
         """Start or stop the local network cue monitor."""
         if self._web_server and self._web_server.running:
