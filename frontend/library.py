@@ -227,6 +227,7 @@ class LibrarySidebar(ctk.CTkFrame):
         for btn in self.song_buttons:
             btn.destroy()
         self.song_buttons.clear()
+        self._song_labels = []
         
         # Find audio files
         self.songs = []
@@ -238,25 +239,39 @@ class LibrarySidebar(ctk.CTkFrame):
             logger.error(f"Error reading folder: {e}")
             return
         
-        # Create buttons for each song
+        # Create rows for each song
         for song in self.songs:
             display_name = os.path.splitext(song)[0]
-            btn = ctk.CTkButton(
-                self.song_list_frame,
-                text=display_name,
-                anchor="w",
-                height=32,
-                font=("Segoe UI", 11),
-                fg_color="transparent",
-                hover_color=COLOR_BG_LIGHT,
-                text_color=COLOR_TEXT,
-                command=lambda s=song: self._on_song_click(s)
+            
+            row = ctk.CTkFrame(
+                self.song_list_frame, fg_color="transparent",
+                height=32, corner_radius=4, cursor="hand2"
             )
-            btn.pack(fill="x", pady=1)
-            self.song_buttons.append(btn)
+            row.pack(fill="x", pady=1)
+            row.pack_propagate(False)
+            
+            lbl = ctk.CTkLabel(
+                row, text=display_name,
+                anchor="w",
+                font=("Segoe UI", 11),
+                text_color=COLOR_TEXT,
+            )
+            lbl.pack(side="left", fill="x", expand=True, padx=(10, 5))
+            
+            # Click handlers on both frame and label
+            row.bind("<Button-1>", lambda e, s=song: self._on_song_click(s))
+            lbl.bind("<Button-1>", lambda e, s=song: self._on_song_click(s))
+            
+            # Hover effects
+            row.bind("<Enter>", lambda e, r=row: r.configure(fg_color=COLOR_BG_LIGHT))
+            row.bind("<Leave>", lambda e, r=row: r.configure(fg_color="transparent"))
+            
+            self.song_buttons.append(row)
+            self._song_labels = getattr(self, '_song_labels', [])
+            self._song_labels.append(lbl)
             
             # Tooltip on hover for long names
-            self._add_tooltip(btn, display_name)
+            self._add_tooltip(row, display_name)
         
         self.count_label.configure(text=f"{len(self.songs)} songs")
         logger.info(f"Loaded {len(self.songs)} songs from {folder_path}")
@@ -319,16 +334,21 @@ class LibrarySidebar(ctk.CTkFrame):
     def set_current_song(self, filename: str):
         """Highlight the currently loaded song."""
         self.current_song = filename
+        labels = getattr(self, '_song_labels', [])
         
         for i, song in enumerate(self.songs):
+            if i >= len(self.song_buttons) or i >= len(labels):
+                break
             if song == filename:
-                self.song_buttons[i].configure(
-                    fg_color=COLOR_BTN_PRIMARY,
-                    text_color="#ffffff"
-                )
+                self.song_buttons[i].configure(fg_color=COLOR_BTN_PRIMARY)
+                labels[i].configure(text_color="#ffffff")
+                # Disable hover color change for selected item
+                self.song_buttons[i].bind("<Enter>", lambda e: None)
+                self.song_buttons[i].bind("<Leave>", lambda e: None)
             else:
-                self.song_buttons[i].configure(
-                    fg_color="transparent",
-                    text_color=COLOR_TEXT
-
-                )
+                self.song_buttons[i].configure(fg_color="transparent")
+                labels[i].configure(text_color=COLOR_TEXT)
+                # Re-enable hover
+                row = self.song_buttons[i]
+                row.bind("<Enter>", lambda e, r=row: r.configure(fg_color=COLOR_BG_LIGHT))
+                row.bind("<Leave>", lambda e, r=row: r.configure(fg_color="transparent"))
