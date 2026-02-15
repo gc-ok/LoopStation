@@ -257,21 +257,30 @@ class NotesSidebar(ctk.CTkFrame):
         next_item = None
         next_type = None
         
+        # Pass 1: Find CURRENT item (last item we're inside/past)
         for i, (t, item_type, obj) in enumerate(self._timeline_items):
             item_time = obj.time if item_type == 'marker' else obj.start
             
             if item_time <= position:
                 if item_type == 'vamp' and position > obj.end:
-                    continue
+                    continue  # We've passed this vamp entirely
                 current = obj
                 current_type = item_type
-                if i + 1 < len(self._timeline_items):
-                    next_item = self._timeline_items[i + 1][2]
-                    next_type = self._timeline_items[i + 1][1]
-                else:
-                    next_item = None
-                    next_type = None
-            elif current is None and item_time > position:
+        
+        # Pass 2: Find NEXT item (first item whose start is after current position)
+        for i, (t, item_type, obj) in enumerate(self._timeline_items):
+            if item_type == 'marker':
+                item_time = obj.time
+            else:
+                item_time = obj.start
+            
+            if item_time > position:
+                next_item = obj
+                next_type = item_type
+                break
+            
+            # Also catch vamps we're before the end of but already past start
+            if item_type == 'vamp' and position <= obj.end and obj is not current:
                 next_item = obj
                 next_type = item_type
                 break
