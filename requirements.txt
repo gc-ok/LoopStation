@@ -1,0 +1,14 @@
+# Core
+pygame>=2.5
+customtkinter>=5.2
+matplotlib>=3.7
+numpy>=1.24
+soundfile>=0.12
+
+# Loop detection
+librosa>=0.10
+
+# Web sharing (local network cue monitor)
+flask>=3.0
+qrcode>=7.4
+Pillow>=10.0
