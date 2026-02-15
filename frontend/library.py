@@ -201,11 +201,14 @@ class LibrarySidebar(ctk.CTkFrame):
         self.btn_browse.configure(state="normal")
         
         if result == "RUN_ON_MAIN":
-            # Fallback for Windows/Linux: Run standard dialog on main thread
+            # Fallback for Windows/Linux: Run standard dialog on main thread.
+            # parent= is REQUIRED on Windows — without it, tkinter creates a
+            # transient root window that flashes visibly on screen.
             from tkinter import filedialog
             folder = filedialog.askdirectory(
                 title="Select Music Folder",
-                initialdir=self.current_folder or os.path.expanduser("~")
+                initialdir=self.current_folder or os.path.expanduser("~"),
+                parent=self.winfo_toplevel()
             )
             if folder:
                 self.load_folder(folder)
@@ -229,10 +232,15 @@ class LibrarySidebar(ctk.CTkFrame):
         self.song_buttons.clear()
         self._song_labels = []
         
-        # Find audio files
+        # Find audio files (skip hidden/metadata files)
         self.songs = []
         try:
             for filename in sorted(os.listdir(folder_path)):
+                # Skip hidden files (Unix-style dot files, macOS resource forks)
+                # macOS creates "._SongName.mp3" AppleDouble metadata files that
+                # match audio extensions but aren't playable audio.
+                if filename.startswith('.'):
+                    continue
                 if filename.lower().endswith(SUPPORTED_FORMATS):
                     self.songs.append(filename)
         except Exception as e:
