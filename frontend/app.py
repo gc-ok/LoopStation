@@ -283,11 +283,40 @@ class LoopStationApp(ctk.CTk):
         # =========================================================
         # SIDEBAR
         # =========================================================
-        self.lbl_footer = ctk.CTkLabel(
-            self.sidebar_frame, text="Made by GC Education Analytics",
-            font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM, cursor="hand2"
+        # =========================================================
+        # SIDEBAR FOOTER: Website, Support, Feedback
+        # =========================================================
+        footer_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        footer_frame.pack(side="bottom", fill="x", padx=PADDING_SMALL, pady=PADDING_MEDIUM)
+        
+        # Row 1: Support + Feedback buttons
+        btn_row = ctk.CTkFrame(footer_frame, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(0, 6))
+        
+        btn_support = ctk.CTkButton(
+            btn_row, text="❤️ Support", width=0, height=26,
+            font=("Segoe UI", 10, "bold"),
+            fg_color="#6b3fa0", hover_color="#8255b8",
+            text_color="#ffffff", corner_radius=6,
+            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/support")
         )
-        self.lbl_footer.pack(side="bottom", pady=PADDING_MEDIUM)
+        btn_support.pack(side="left", expand=True, fill="x", padx=(0, 3))
+        
+        btn_feedback = ctk.CTkButton(
+            btn_row, text="💬 Feedback", width=0, height=26,
+            font=("Segoe UI", 10, "bold"),
+            fg_color=COLOR_BG_LIGHT, hover_color="#555555",
+            text_color=COLOR_TEXT, corner_radius=6,
+            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/feedback")
+        )
+        btn_feedback.pack(side="left", expand=True, fill="x", padx=(3, 0))
+        
+        # Row 2: Brand link
+        self.lbl_footer = ctk.CTkLabel(
+            footer_frame, text="© GC Education Analytics",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM, cursor="hand2"
+        )
+        self.lbl_footer.pack()
         self.lbl_footer.bind("<Button-1>", lambda e: webbrowser.open("https://www.gceducationanalytics.com"))
         
         self.library = LibrarySidebar(
