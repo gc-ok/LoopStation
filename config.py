@@ -254,6 +254,10 @@ load_theme()
 SIDEBAR_WIDTH = 280
 SIDEBAR_MIN_WIDTH = 250
 
+# Right sidebar (Notes / Cue Details)
+RIGHT_SIDEBAR_WIDTH = 320
+RIGHT_SIDEBAR_MIN_WIDTH = 280
+
 # Button sizes
 BTN_HEIGHT = 36
 BTN_FONT_SIZE = 13
@@ -276,3 +280,22 @@ SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac')
 
 DEFAULT_VAMP_NAME = "Vamp"
 DEFAULT_MARKER_NAME = "Cue"
+
+# =============================================================================
+# CUE NOTES / TAGS
+# =============================================================================
+
+# Available tag categories for cues and vamps
+AVAILABLE_TAGS = ["Director", "Tech", "Lighting", "Sound", "Stage", "Costumes", "Props", "Other"]
+
+# Tag colors for display
+TAG_COLORS = {
+    "Director":  "#e74c3c",  # Red
+    "Tech":      "#3498db",  # Blue
+    "Lighting":  "#f1c40f",  # Yellow
+    "Sound":     "#2ecc71",  # Green
+    "Stage":     "#9b59b6",  # Purple
+    "Costumes":  "#e67e22",  # Orange
+    "Props":     "#1abc9c",  # Teal
+    "Other":     "#95a5a6",  # Gray
+}
