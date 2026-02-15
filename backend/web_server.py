@@ -369,8 +369,14 @@ MONITOR_HTML = """<!DOCTYPE html>
 
 <script>
 const API_URL = '/api/state';
-let pollInterval = null;
 let failCount = 0;
+
+// Interpolation state — smoothly tick between server polls
+let serverCountdown = null;   // Last countdown value from server
+let serverPosition = null;    // Last position value from server
+let serverIsPlaying = false;
+let lastPollTime = 0;         // performance.now() when we last got data
+let lastNextName = '';
 
 function formatTime(s) {
   if (s == null) return '--';
@@ -393,8 +399,6 @@ function renderTagNotes(tagNotes) {
   let html = '<div class="tag-list">';
   for (const [tag, notes] of Object.entries(tagNotes)) {
     const cls = 'tag-' + tag.toLowerCase();
-    const borderColor = getComputedStyle(document.documentElement)
-      .getPropertyValue('--tag-color') || '';
     html += `<div class="tag-card" style="border-left-color: var(--${cls}-color, #555)">
       <span class="tag-badge ${cls}">${tag}</span>
       <div class="tag-notes ${notes ? '' : 'empty'}">${notes || '(no notes)'}</div>
@@ -426,6 +430,27 @@ function renderCueCard(item, label, cssClass) {
   </div>`;
 }
 
+// Smooth animation loop (runs at 60fps via requestAnimationFrame)
+function animateCountdown() {
+  const cdEl = document.getElementById('countdown');
+  const posEl = document.getElementById('positionBar');
+  
+  if (serverCountdown != null && serverIsPlaying) {
+    // Calculate elapsed time since last server update
+    const elapsed = (performance.now() - lastPollTime) / 1000;
+    
+    // Interpolate countdown (ticks down) and position (ticks up)
+    const smoothCd = Math.max(0, serverCountdown - elapsed);
+    const smoothPos = serverPosition + elapsed;
+    
+    cdEl.textContent = formatCountdown(smoothCd);
+    cdEl.className = 'countdown-value' + (smoothCd <= 0.5 ? ' now' : smoothCd < 5 ? ' urgent' : smoothCd < 15 ? ' warn' : '');
+    posEl.textContent = formatTime(smoothPos);
+  }
+  
+  requestAnimationFrame(animateCountdown);
+}
+
 async function poll() {
   try {
     const res = await fetch(API_URL);
@@ -440,6 +465,7 @@ async function poll() {
     // Status
     const dot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
+    serverIsPlaying = data.is_playing || data.is_looping;
     if (data.is_looping) {
       dot.className = 'status-dot looping';
       statusText.textContent = 'Looping';
@@ -451,19 +477,30 @@ async function poll() {
       statusText.textContent = 'Stopped';
     }
     
-    // Position
-    document.getElementById('positionBar').textContent = formatTime(data.position);
+    // Store server values for interpolation
+    serverPosition = data.position;
+    lastPollTime = performance.now();
     
-    // Countdown
+    // Position (will be overridden by animation loop when playing)
+    if (!serverIsPlaying) {
+      document.getElementById('positionBar').textContent = formatTime(data.position);
+    }
+    
+    // Countdown — store for interpolation
     const cdEl = document.getElementById('countdown');
     const nextPreview = document.getElementById('nextPreview');
     if (data.next) {
-      const cd = data.next.countdown;
-      cdEl.textContent = formatCountdown(cd);
-      cdEl.className = 'countdown-value' + (cd < 5 ? ' urgent' : cd < 15 ? ' warn' : '');
-      if (cd <= 0.5) cdEl.className = 'countdown-value now';
+      serverCountdown = data.next.countdown;
+      // Update display immediately (animation loop takes over between polls)
+      if (!serverIsPlaying) {
+        cdEl.textContent = formatCountdown(serverCountdown);
+        const cd = serverCountdown;
+        cdEl.className = 'countdown-value' + (cd <= 0.5 ? ' now' : cd < 5 ? ' urgent' : cd < 15 ? ' warn' : '');
+      }
       nextPreview.textContent = data.next.name;
+      lastNextName = data.next.name;
     } else {
+      serverCountdown = null;
       cdEl.textContent = '--:--';
       cdEl.className = 'countdown-value';
       nextPreview.textContent = 'End of song';
@@ -489,9 +526,12 @@ async function poll() {
   }
 }
 
-// Start polling at 500ms
-pollInterval = setInterval(poll, 500);
+// Poll server every 500ms for data updates
+setInterval(poll, 500);
 poll();
+
+// Start smooth animation loop (60fps countdown/position)
+requestAnimationFrame(animateCountdown);
 
 // Keep screen awake (for mobile)
 if ('wakeLock' in navigator) {
