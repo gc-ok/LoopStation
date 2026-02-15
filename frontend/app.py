@@ -31,7 +31,7 @@ from config import (
     COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, COLOR_BTN_DANGER,
     COLOR_BTN_WARNING, COLOR_BTN_DISABLED, COLOR_BTN_TEXT,
-    SIDEBAR_WIDTH, PADDING_SMALL, PADDING_MEDIUM, PADDING_LARGE,
+    SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH, PADDING_SMALL, PADDING_MEDIUM, PADDING_LARGE,
     FADE_EXIT_DURATION_MS, COLOR_BTN_SKIP, COLOR_BTN_WARNING, get_asset_path
 )
 from backend import StateManager, PlaybackState
@@ -43,6 +43,7 @@ from .detector_panel import DetectorPanel
 from .cue_sheet import CueSheetPanel
 from .vamp_settings import VampSettingsPanel
 from .vamp_modal import VampModal
+from .notes_sidebar import NotesSidebar
 
 logger = logging.getLogger("LoopStation.App")
 
@@ -256,9 +257,18 @@ class LoopStationApp(ctk.CTk):
             fg_color=COLOR_BG_MEDIUM, corner_radius=0
         )
         self.content_frame = ctk.CTkFrame(self.paned_window, fg_color="transparent")
+        
+        # Right sidebar for cue notes/details
+        self.right_sidebar_frame = ctk.CTkFrame(
+            self.paned_window, width=RIGHT_SIDEBAR_WIDTH,
+            fg_color=COLOR_BG_MEDIUM, corner_radius=0
+        )
 
         self.paned_window.add(self.sidebar_frame, minsize=200, stretch="never")
         self.paned_window.add(self.content_frame, minsize=500, stretch="always")
+        self.paned_window.add(self.right_sidebar_frame, minsize=250, stretch="never")
+        
+        self.right_sidebar_visible = True
     
     def _create_widgets(self):
         """Create all UI widgets with new redesigned layout."""
@@ -445,6 +455,25 @@ class LoopStationApp(ctk.CTk):
             on_set_in=self._on_set_in,
             on_set_out=self._on_set_out
         ) 
+        
+        # =========================================================
+        # RIGHT SIDEBAR: Cue Notes & Details
+        # =========================================================
+        self.notes_sidebar = NotesSidebar(
+            self.right_sidebar_frame,
+            on_notes_change=self._on_item_notes_change,
+            on_tags_change=self._on_item_tags_change,
+        )
+        self.notes_sidebar.pack(fill="both", expand=True)
+        
+        # Toggle button for right sidebar (add to header)
+        self.btn_toggle_right = ctk.CTkButton(
+            header_frame, text="📝", width=40, height=30,
+            fg_color="transparent", border_width=1,
+            border_color=COLOR_TEXT_DIM, text_color=COLOR_TEXT,
+            hover_color=COLOR_BG_LIGHT, command=self._toggle_right_sidebar
+        )
+        self.btn_toggle_right.pack(side="right", padx=(15, 0))
 
     # Add these methods to LoopStationApp class
 
@@ -584,8 +613,28 @@ class LoopStationApp(ctk.CTk):
             self.paned_window.forget(self.sidebar_frame)
             self.sidebar_visible = False
         else:
+            # Re-add before content_frame (first pane)
             self.paned_window.add(self.sidebar_frame, before=self.content_frame, minsize=200, width=SIDEBAR_WIDTH)
             self.sidebar_visible = True
+    
+    def _toggle_right_sidebar(self):
+        """Toggle the right notes/details sidebar."""
+        if self.right_sidebar_visible:
+            self.paned_window.forget(self.right_sidebar_frame)
+            self.right_sidebar_visible = False
+        else:
+            self.paned_window.add(self.right_sidebar_frame, minsize=250, width=RIGHT_SIDEBAR_WIDTH)
+            self.right_sidebar_visible = True
+    
+    def _on_item_notes_change(self, item_id, notes_text):
+        """Handle notes change from the sidebar."""
+        if self.app_state:
+            self.app_state.update_item_notes(item_id, notes_text)
+    
+    def _on_item_tags_change(self, item_id, tags):
+        """Handle tags change from the sidebar."""
+        if self.app_state:
+            self.app_state.update_item_tags(item_id, tags)
 
     def _wire_callbacks(self):
         """
@@ -636,6 +685,7 @@ class LoopStationApp(ctk.CTk):
         self.bind("m", lambda e: self._on_add_marker() if self.app_state else None)
         self.bind("<bracketright>", _safe(lambda: self.app_state.jump_to_next_marker()))
         self.bind("<bracketleft>", _safe(lambda: self.app_state.jump_to_prev_marker()))
+        self.bind("n", lambda e: self._toggle_right_sidebar())
         # Only steal focus when clicking empty background areas, not buttons/widgets
         # This prevents the root binding from interfering with CTkButton clicks
 
@@ -867,8 +917,12 @@ class LoopStationApp(ctk.CTk):
         """Update UI when loops change."""
         if self.waveform:
             self.waveform.update_loops_display(loops, selected_index)
-        # REMOVED: self.loop_controls.update_loop_status(loops, selected_index)
         self._refresh_cue_sheet()
+        # Update notes sidebar timeline
+        self.notes_sidebar.update_timeline(
+            self.app_state.markers if self.app_state else [],
+            loops
+        )
 
     def _on_markers_changed(self, markers):
         self._handle_markers_changed(markers)
@@ -877,6 +931,11 @@ class LoopStationApp(ctk.CTk):
         if self.waveform:
             self.waveform.update_markers_display(markers)
         self._refresh_cue_sheet()
+        # Update notes sidebar timeline
+        self.notes_sidebar.update_timeline(
+            markers,
+            self.app_state.loops if self.app_state else []
+        )
     
     # =========================================================================
     # State -> UI
@@ -899,6 +958,9 @@ class LoopStationApp(ctk.CTk):
         
         # Update cue sheet highlighting
         self.cue_sheet.update_position(actual_pos)
+        
+        # Update notes sidebar countdown and current cue
+        self.notes_sidebar.update_position(actual_pos, is_playing=True)
     
     def _on_state_change(self, state):
         self._update_state(state)
@@ -921,6 +983,11 @@ class LoopStationApp(ctk.CTk):
         if raw_audio is not None and self.waveform:
             self.waveform.load_waveform(raw_audio, duration)
         self._refresh_cue_sheet()
+        # Refresh notes sidebar with new song's timeline
+        self.notes_sidebar.update_timeline(
+            self.app_state.markers,
+            self.app_state.loops
+        )
         self.status_label.configure(text=f"Loaded: {duration:.1f}s")
         self.hide_loading()
 
