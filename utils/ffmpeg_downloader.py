@@ -17,11 +17,15 @@ if hasattr(ssl, '_create_unverified_context'):
     ssl._create_default_https_context = ssl._create_unverified_context
 
 # --- CONFIGURATION ---
-# Windows: BtbN builds contain BOTH ffmpeg and ffprobe in one zip
-WIN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+# IMPORTANT: We MUST use LGPL builds for commercial distribution.
+# Loop Station only needs decoding (no x264/x265), so LGPL is fully sufficient.
 
-# Mac: Use ONE archive that contains BOTH ffmpeg and ffprobe
-# osxexperts bundles both in a single zip (~80MB)
+# Windows: BtbN LGPL build (no GPL codecs like x264/x265)
+WIN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip"
+
+# Mac: evermeet.cx builds are GPL (include x264/x265) — but this fallback
+# downloader only runs if the bundled FFmpeg is missing (e.g. dev/source installs).
+# For distributed .app builds, LGPL FFmpeg is compiled from source in CI.
 MAC_FFMPEG_URL = "https://evermeet.cx/ffmpeg/getrelease/zip"
 MAC_FFPROBE_URL = "https://evermeet.cx/ffprobe/getrelease/zip"
 
