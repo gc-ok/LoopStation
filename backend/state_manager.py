@@ -116,8 +116,14 @@ class LoopRegion:
         self.exit_fade_ms = FADE_EXIT_DURATION_MS
         
         # --- Cue Notes & Tags ---
-        self.notes = ""                # Free-text notes for this vamp
-        self.tags = []                 # e.g. ["director", "tech", "lighting"]
+        # Maps tag name -> notes text for that tag
+        # e.g. {"Director": "Cross SL after dialogue", "Lighting": "Fade to blue"}
+        self.tag_notes = {}
+
+    @property
+    def tags(self):
+        """Convenience: list of active tags."""
+        return list(self.tag_notes.keys())
 
     def to_dict(self):
         """Serialize for JSON storage."""
@@ -131,8 +137,7 @@ class LoopRegion:
             'crossfade_ms': self.crossfade_ms,
             'early_switch_ms': self.early_switch_ms,
             'exit_fade_ms': self.exit_fade_ms,
-            'notes': self.notes,
-            'tags': self.tags,
+            'tag_notes': self.tag_notes,
         }
     
     @classmethod
@@ -146,8 +151,20 @@ class LoopRegion:
         loop.crossfade_ms = data.get('crossfade_ms', LOOP_CROSSFADE_MS)
         loop.early_switch_ms = data.get('early_switch_ms', LOOP_SWITCH_EARLY_MS)
         loop.exit_fade_ms = data.get('exit_fade_ms', FADE_EXIT_DURATION_MS)
-        loop.notes = data.get('notes', '')
-        loop.tags = data.get('tags', [])
+        # Tag notes: new format or migrate from old
+        if 'tag_notes' in data:
+            loop.tag_notes = data['tag_notes']
+        else:
+            # Migrate from old separate notes + tags fields
+            old_tags = data.get('tags', [])
+            old_notes = data.get('notes', '')
+            loop.tag_notes = {}
+            for tag in old_tags:
+                loop.tag_notes[tag] = ''
+            if old_notes and old_tags:
+                loop.tag_notes[old_tags[0]] = old_notes
+            elif old_notes:
+                loop.tag_notes['Other'] = old_notes
         return loop
 
 
@@ -161,17 +178,20 @@ class Marker:
         name: Human-readable name (e.g., "Verse 2", "Dialogue starts")
         time: Position in seconds
         color: Optional color for display (hex string)
-        notes: Free-text notes for this cue point
-        tags: List of tag strings (e.g., ["director", "tech"])
+        tag_notes: Dict mapping tag names to their notes text
     """
     def __init__(self, time_pos, name=None, color=None):
         self.id = str(uuid.uuid4())
         self.name = name or DEFAULT_MARKER_NAME
         self.time = time_pos
         self.color = color  # None = use default COLOR_MARKER
-        self.notes = ""     # Free-text notes
-        self.tags = []      # e.g. ["director", "tech", "lighting"]
+        self.tag_notes = {}  # {"Director": "notes...", "Tech": "notes..."}
     
+    @property
+    def tags(self):
+        """Convenience: list of active tags."""
+        return list(self.tag_notes.keys())
+
     def to_dict(self):
         """Serialize for JSON storage."""
         return {
@@ -179,8 +199,7 @@ class Marker:
             'name': self.name,
             'time': self.time,
             'color': self.color,
-            'notes': self.notes,
-            'tags': self.tags,
+            'tag_notes': self.tag_notes,
         }
     
     @classmethod
@@ -188,8 +207,19 @@ class Marker:
         """Deserialize from JSON storage."""
         marker = cls(data['time'], name=data.get('name', DEFAULT_MARKER_NAME), color=data.get('color'))
         marker.id = data.get('id', str(uuid.uuid4()))
-        marker.notes = data.get('notes', '')
-        marker.tags = data.get('tags', [])
+        # Tag notes: new format or migrate from old
+        if 'tag_notes' in data:
+            marker.tag_notes = data['tag_notes']
+        else:
+            old_tags = data.get('tags', [])
+            old_notes = data.get('notes', '')
+            marker.tag_notes = {}
+            for tag in old_tags:
+                marker.tag_notes[tag] = ''
+            if old_notes and old_tags:
+                marker.tag_notes[old_tags[0]] = old_notes
+            elif old_notes:
+                marker.tag_notes['Other'] = old_notes
         return marker
 
 
@@ -753,48 +783,49 @@ class StateManager:
     # CUE NOTES & TAGS
     # =========================================================================
     
-    def update_item_notes(self, item_id, notes_text):
+    def set_item_tag_note(self, item_id, tag, note_text):
         """
-        Update notes for a marker or loop region by ID.
+        Set (or create) a tag with its notes on a marker or loop region.
         
         Args:
             item_id: UUID string of the marker or loop
-            notes_text: New notes content
+            tag: Tag name (e.g. "Director")
+            note_text: Notes content for this tag
         """
         for marker in self.markers:
             if marker.id == item_id:
-                marker.notes = notes_text
+                marker.tag_notes[tag] = note_text
                 self._emit('markers_changed', self.markers)
                 self.save_loop()
                 return True
         
         for loop in self.loops:
             if loop.id == item_id:
-                loop.notes = notes_text
+                loop.tag_notes[tag] = note_text
                 self._emit_loops_update()
                 self.save_loop()
                 return True
         
         return False
     
-    def update_item_tags(self, item_id, tags):
+    def remove_item_tag(self, item_id, tag):
         """
-        Update tags for a marker or loop region by ID.
+        Remove a tag (and its notes) from a marker or loop region.
         
         Args:
             item_id: UUID string of the marker or loop
-            tags: List of tag strings
+            tag: Tag name to remove
         """
         for marker in self.markers:
             if marker.id == item_id:
-                marker.tags = tags
+                marker.tag_notes.pop(tag, None)
                 self._emit('markers_changed', self.markers)
                 self.save_loop()
                 return True
         
         for loop in self.loops:
             if loop.id == item_id:
-                loop.tags = tags
+                loop.tag_notes.pop(tag, None)
                 self._emit_loops_update()
                 self.save_loop()
                 return True
