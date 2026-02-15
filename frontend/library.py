@@ -240,9 +240,10 @@ class LibrarySidebar(ctk.CTkFrame):
         
         # Create buttons for each song
         for song in self.songs:
+            display_name = os.path.splitext(song)[0]
             btn = ctk.CTkButton(
                 self.song_list_frame,
-                text=self._truncate_name(song),
+                text=display_name,
                 anchor="w",
                 height=32,
                 font=("Segoe UI", 11),
@@ -253,6 +254,9 @@ class LibrarySidebar(ctk.CTkFrame):
             )
             btn.pack(fill="x", pady=1)
             self.song_buttons.append(btn)
+            
+            # Tooltip on hover for long names
+            self._add_tooltip(btn, display_name)
         
         self.count_label.configure(text=f"{len(self.songs)} songs")
         logger.info(f"Loaded {len(self.songs)} songs from {folder_path}")
@@ -263,6 +267,48 @@ class LibrarySidebar(ctk.CTkFrame):
         if len(name_no_ext) > max_length:
             return name_no_ext[:max_length-3] + "..."
         return name_no_ext
+    
+    def _add_tooltip(self, widget, text):
+        """Add a hover tooltip to a widget. Shows full text after a short delay."""
+        tip_window = [None]  # Use list for mutability in closures
+        after_id = [None]
+        
+        def show(event):
+            def _create():
+                if tip_window[0]:
+                    return
+                x = widget.winfo_rootx() + widget.winfo_width() + 5
+                y = widget.winfo_rooty()
+                tw = tk.Toplevel(widget)
+                tw.wm_overrideredirect(True)
+                tw.wm_geometry(f"+{x}+{y}")
+                # Platform-safe: skip attributes that may not work everywhere
+                try:
+                    tw.attributes("-topmost", True)
+                except Exception:
+                    pass
+                label = tk.Label(
+                    tw, text=text, justify="left",
+                    background="#333333", foreground="#ffffff",
+                    relief="solid", borderwidth=1,
+                    font=("Segoe UI", 10),
+                    padx=6, pady=3
+                )
+                label.pack()
+                tip_window[0] = tw
+            after_id[0] = widget.after(500, _create)
+        
+        def hide(event):
+            if after_id[0]:
+                widget.after_cancel(after_id[0])
+                after_id[0] = None
+            tw = tip_window[0]
+            if tw:
+                tw.destroy()
+                tip_window[0] = None
+        
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
     
     def _on_song_click(self, filename: str):
         """Handle song button click."""
