@@ -461,8 +461,8 @@ class LoopStationApp(ctk.CTk):
         # =========================================================
         self.notes_sidebar = NotesSidebar(
             self.right_sidebar_frame,
-            on_notes_change=self._on_item_notes_change,
-            on_tags_change=self._on_item_tags_change,
+            on_tag_note_save=self._on_item_tag_note_change,
+            on_tag_remove=self._on_item_tag_remove,
         )
         self.notes_sidebar.pack(fill="both", expand=True)
         
@@ -626,15 +626,15 @@ class LoopStationApp(ctk.CTk):
             self.paned_window.add(self.right_sidebar_frame, minsize=250, width=RIGHT_SIDEBAR_WIDTH)
             self.right_sidebar_visible = True
     
-    def _on_item_notes_change(self, item_id, notes_text):
-        """Handle notes change from the sidebar."""
+    def _on_item_tag_note_change(self, item_id, tag, note_text):
+        """Handle tag note save from the sidebar."""
         if self.app_state:
-            self.app_state.update_item_notes(item_id, notes_text)
+            self.app_state.set_item_tag_note(item_id, tag, note_text)
     
-    def _on_item_tags_change(self, item_id, tags):
-        """Handle tags change from the sidebar."""
+    def _on_item_tag_remove(self, item_id, tag):
+        """Handle tag removal from the sidebar."""
         if self.app_state:
-            self.app_state.update_item_tags(item_id, tags)
+            self.app_state.remove_item_tag(item_id, tag)
 
     def _wire_callbacks(self):
         """
@@ -661,31 +661,54 @@ class LoopStationApp(ctk.CTk):
         self.app_state.on('loop_skip_cleared', q('loop_skip_cleared'))
     
     def _bind_shortcuts(self):
+        def _is_typing():
+            """Check if focus is in a text input widget."""
+            focused = self.focus_get()
+            if focused is None:
+                return False
+            # Check Tk widget class names
+            widget_class = focused.winfo_class()
+            if widget_class in ('Text', 'Entry', 'TEntry', 'Spinbox'):
+                return True
+            # Check CTk widget types
+            if isinstance(focused, (ctk.CTkTextbox, ctk.CTkEntry)):
+                return True
+            return False
+        
         def _safe(fn):
-            """Wrap callback so it's a no-op if app_state isn't ready."""
+            """Wrap callback so it's a no-op if app_state isn't ready or user is typing."""
             def wrapper(e):
+                if _is_typing():
+                    return
                 if self.app_state is not None:
                     fn()
             return wrapper
         
-        # FIXED: Added 'self.bind("' to the start of each line
+        def _safe_key(fn):
+            """Like _safe but for letter-key bindings (i, o, e, f, s, m, n)."""
+            def wrapper(e):
+                if _is_typing():
+                    return
+                if self.app_state is not None:
+                    fn()
+            return wrapper
+        
         self.bind("<space>", _safe(lambda: self.app_state.toggle_play_pause()))
         self.bind("<Escape>", _safe(lambda: self.app_state.stop()))
-        self.bind("i", lambda e: self._on_set_in() if self.app_state else None)
-        self.bind("o", lambda e: self._on_set_out() if self.app_state else None)
+        self.bind("i", _safe_key(lambda: self._on_set_in()))
+        self.bind("o", _safe_key(lambda: self._on_set_out()))
         self.bind("e", _safe(lambda: self.app_state.queue_exit()))
         self.bind("f", _safe(lambda: self.app_state.queue_exit(fade_mode=True)))
         self.bind("s", _safe(lambda: self.app_state.save_loop()))
         self.bind("<Left>", _safe(lambda: self.app_state.nudge(-0.1)))
         
-        # The lines below this were already correct in your file
         self.bind("<Right>", _safe(lambda: self.app_state.nudge(0.1)))
         self.bind("<Control-Left>", _safe(lambda: self.app_state.nudge(-1.0)))
         self.bind("<Control-Right>", _safe(lambda: self.app_state.nudge(1.0)))
-        self.bind("m", lambda e: self._on_add_marker() if self.app_state else None)
+        self.bind("m", _safe_key(lambda: self._on_add_marker()))
         self.bind("<bracketright>", _safe(lambda: self.app_state.jump_to_next_marker()))
         self.bind("<bracketleft>", _safe(lambda: self.app_state.jump_to_prev_marker()))
-        self.bind("n", lambda e: self._toggle_right_sidebar())
+        self.bind("n", lambda e: None if _is_typing() else self._toggle_right_sidebar())
         # Only steal focus when clicking empty background areas, not buttons/widgets
         # This prevents the root binding from interfering with CTkButton clicks
 
