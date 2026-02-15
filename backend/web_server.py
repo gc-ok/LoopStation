@@ -26,12 +26,7 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger("LoopStation.WebServer")
 
-# Try importing optional dependencies
-try:
-    from flask import Flask, jsonify, Response
-    HAS_FLASK = True
-except ImportError:
-    HAS_FLASK = False
+from flask import Flask, jsonify, Response
 
 try:
     import qrcode
@@ -513,9 +508,6 @@ if ('wakeLock' in navigator) {
 
 def create_flask_app(shared_state: SharedCueState):
     """Create and configure the Flask app."""
-    if not HAS_FLASK:
-        raise ImportError("Flask is required for web sharing. Install with: pip install flask")
-    
     app = Flask(__name__)
     app.logger.setLevel(logging.WARNING)  # Suppress request logs
     
@@ -579,12 +571,6 @@ class CueWebServer:
     
     def start(self) -> str:
         """Start the web server. Returns the URL."""
-        if not HAS_FLASK:
-            raise ImportError(
-                "Flask is required for web sharing.\n"
-                "Install with: pip install flask qrcode pillow"
-            )
-        
         if self.running:
             return self.url
         
@@ -625,21 +611,3 @@ class CueWebServer:
     
     def get_url(self) -> str:
         return self.url if self.running else ""
-    
-    @staticmethod
-    def check_dependencies() -> tuple:
-        """
-        Check if required dependencies are installed.
-        Returns (all_ok: bool, missing: list[str])
-        """
-        missing = []
-        if not HAS_FLASK:
-            missing.append("flask")
-        if not HAS_QRCODE:
-            missing.append("qrcode")
-        # Check pillow (needed by qrcode)
-        try:
-            from PIL import Image
-        except ImportError:
-            missing.append("pillow")
-        return (len(missing) == 0, missing)
