@@ -2,9 +2,9 @@
 Notes Sidebar for Loop Station.
 
 A right-side panel that shows:
-- Current cue/vamp details (name, type, tags, notes)
+- Current cue/vamp details with per-tag notes
 - Next cue/vamp preview with countdown timer
-- Editable notes and tags for the current item
+- Editable tag cards: each tag has its own notes with Save/Edit toggle
 
 This gives rehearsal directors at-a-glance information about
 where they are in the show and what's coming up next.
@@ -13,7 +13,7 @@ where they are in the show and what's coming up next.
 import logging
 import time
 import tkinter as tk
-from typing import Callable, Optional, List, Tuple
+from typing import Callable, Optional, List
 
 import customtkinter as ctk
 
@@ -35,36 +35,32 @@ logger = logging.getLogger("LoopStation.NotesSidebar")
 
 class NotesSidebar(ctk.CTkFrame):
     """
-    Right sidebar displaying current/next cue details, notes, and tags.
-    
-    Receives position updates to compute which cue is current and
-    what the countdown to the next cue is.
+    Right sidebar displaying current/next cue details with per-tag notes.
     """
     
     def __init__(
         self,
         parent: tk.Widget,
-        on_notes_change: Optional[Callable[[str, str], None]] = None,  # (item_id, notes_text)
-        on_tags_change: Optional[Callable[[str, list], None]] = None,  # (item_id, tags_list)
+        on_tag_note_save: Optional[Callable[[str, str, str], None]] = None,  # (item_id, tag, text)
+        on_tag_remove: Optional[Callable[[str, str], None]] = None,          # (item_id, tag)
         **kwargs
     ):
         super().__init__(parent, fg_color=COLOR_BG_MEDIUM, corner_radius=0, **kwargs)
         
-        self.on_notes_change = on_notes_change
-        self.on_tags_change = on_tags_change
+        self.on_tag_note_save = on_tag_note_save
+        self.on_tag_remove = on_tag_remove
         
         # State
-        self._timeline_items = []       # Sorted list of (time, type, object)
+        self._timeline_items = []
         self._current_position = 0.0
-        self._current_item = None       # Currently active item object
-        self._next_item = None          # Next upcoming item object
-        self._current_item_type = None  # 'marker' or 'vamp'
+        self._current_item = None
+        self._next_item = None
+        self._current_item_type = None
         self._next_item_type = None
-        self._is_playing = False
         self._last_countdown_update = 0
         
-        # Debounce for notes saving
-        self._notes_save_timer = None
+        # Tag card widgets (managed dynamically)
+        self._tag_cards = []
         
         self._create_widgets()
     
@@ -89,228 +85,146 @@ class NotesSidebar(ctk.CTkFrame):
         )
         self.scroll.pack(fill="both", expand=True, padx=0, pady=0)
         
-        # =====================================================
-        # SECTION 1: CURRENT CUE
-        # =====================================================
-        self._create_section_header(self.scroll, "NOW")
+        # ==========================================================
+        # SECTION 1: NOW
+        # ==========================================================
+        self._section_header(self.scroll, "NOW")
         
         self.current_frame = ctk.CTkFrame(
             self.scroll, fg_color="#1e2a1e", corner_radius=8
         )
         self.current_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
-        # Current cue icon + name
         self.current_header = ctk.CTkFrame(self.current_frame, fg_color="transparent")
         self.current_header.pack(fill="x", padx=PADDING_SMALL, pady=(PADDING_SMALL, 0))
         
         self.current_icon = ctk.CTkLabel(
-            self.current_header, text="--",
-            font=("Segoe UI", 16), width=30
+            self.current_header, text="--", font=("Segoe UI", 16), width=30
         )
         self.current_icon.pack(side="left")
         
         self.current_name = ctk.CTkLabel(
             self.current_header, text="No active cue",
-            font=("Segoe UI", 15, "bold"),
-            text_color=COLOR_TEXT,
+            font=("Segoe UI", 15, "bold"), text_color=COLOR_TEXT,
             wraplength=RIGHT_SIDEBAR_WIDTH - 80
         )
         self.current_name.pack(side="left", padx=5, fill="x", expand=True)
         
-        # Current cue time
         self.current_time = ctk.CTkLabel(
             self.current_frame, text="",
-            font=("Consolas", 11),
-            text_color=COLOR_TEXT_DIM
+            font=("Consolas", 11), text_color=COLOR_TEXT_DIM
         )
         self.current_time.pack(anchor="w", padx=PADDING_MEDIUM, pady=(2, 0))
         
-        # Current tags display
-        self.current_tags_frame = ctk.CTkFrame(self.current_frame, fg_color="transparent")
-        self.current_tags_frame.pack(fill="x", padx=PADDING_SMALL, pady=(4, 0))
+        # Container for per-tag note summaries in NOW section
+        self.current_tags_notes = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        self.current_tags_notes.pack(fill="x", padx=PADDING_SMALL, pady=(4, PADDING_SMALL))
         
-        # Current notes display (read-only view)
-        self.current_notes_label = ctk.CTkLabel(
-            self.current_frame, text="",
-            font=("Segoe UI", 11),
-            text_color="#bbddbb",
-            wraplength=RIGHT_SIDEBAR_WIDTH - 40,
-            justify="left",
-            anchor="w"
-        )
-        self.current_notes_label.pack(
-            fill="x", padx=PADDING_MEDIUM, pady=(4, PADDING_SMALL)
-        )
-        
-        # =====================================================
-        # SECTION 2: NEXT CUE (with countdown)
-        # =====================================================
-        self._create_section_header(self.scroll, "UP NEXT")
+        # ==========================================================
+        # SECTION 2: UP NEXT (with countdown)
+        # ==========================================================
+        self._section_header(self.scroll, "UP NEXT")
         
         self.next_frame = ctk.CTkFrame(
             self.scroll, fg_color="#2a2a1e", corner_radius=8
         )
         self.next_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
-        # Countdown timer (big, prominent)
+        # Big countdown
         self.countdown_label = ctk.CTkLabel(
             self.next_frame, text="--:--",
-            font=("Consolas", 36, "bold"),
-            text_color="#ffcc00"
+            font=("Consolas", 36, "bold"), text_color="#ffcc00"
         )
         self.countdown_label.pack(pady=(PADDING_SMALL, 2))
         
         ctk.CTkLabel(
             self.next_frame, text="until next cue",
-            font=("Segoe UI", 9),
-            text_color=COLOR_TEXT_DIM
+            font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM
         ).pack(pady=(0, 4))
         
-        # Next cue name + icon
         self.next_header = ctk.CTkFrame(self.next_frame, fg_color="transparent")
         self.next_header.pack(fill="x", padx=PADDING_SMALL, pady=(0, 2))
         
         self.next_icon = ctk.CTkLabel(
-            self.next_header, text="",
-            font=("Segoe UI", 14), width=30
+            self.next_header, text="", font=("Segoe UI", 14), width=30
         )
         self.next_icon.pack(side="left")
         
         self.next_name = ctk.CTkLabel(
             self.next_header, text="--",
-            font=("Segoe UI", 13, "bold"),
-            text_color=COLOR_TEXT,
+            font=("Segoe UI", 13, "bold"), text_color=COLOR_TEXT,
             wraplength=RIGHT_SIDEBAR_WIDTH - 80
         )
         self.next_name.pack(side="left", padx=5, fill="x", expand=True)
         
-        # Next cue time
         self.next_time = ctk.CTkLabel(
             self.next_frame, text="",
-            font=("Consolas", 10),
-            text_color=COLOR_TEXT_DIM
+            font=("Consolas", 10), text_color=COLOR_TEXT_DIM
         )
         self.next_time.pack(anchor="w", padx=PADDING_MEDIUM, pady=(0, 2))
         
-        # Next tags
-        self.next_tags_frame = ctk.CTkFrame(self.next_frame, fg_color="transparent")
-        self.next_tags_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, 2))
+        # Container for per-tag note summaries in NEXT section
+        self.next_tags_notes = ctk.CTkFrame(self.next_frame, fg_color="transparent")
+        self.next_tags_notes.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
         
-        # Next notes preview
-        self.next_notes_label = ctk.CTkLabel(
-            self.next_frame, text="",
-            font=("Segoe UI", 10),
-            text_color="#bbbb88",
-            wraplength=RIGHT_SIDEBAR_WIDTH - 40,
-            justify="left",
-            anchor="w"
-        )
-        self.next_notes_label.pack(
-            fill="x", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL)
-        )
-        
-        # =====================================================
-        # SECTION 3: EDIT NOTES & TAGS (for current item)
-        # =====================================================
-        self._create_section_header(self.scroll, "EDIT NOTES & TAGS")
+        # ==========================================================
+        # SECTION 3: EDIT TAGS & NOTES
+        # ==========================================================
+        self._section_header(self.scroll, "EDIT TAGS & NOTES")
         
         self.edit_frame = ctk.CTkFrame(
             self.scroll, fg_color=COLOR_BG_DARK, corner_radius=8
         )
         self.edit_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
-        # Editing target label
+        # Editing target
         self.edit_target_label = ctk.CTkLabel(
             self.edit_frame, text="Select a cue to edit",
-            font=("Segoe UI", 11, "bold"),
-            text_color=COLOR_TEXT_DIM
+            font=("Segoe UI", 11, "bold"), text_color=COLOR_TEXT_DIM
         )
         self.edit_target_label.pack(anchor="w", padx=PADDING_MEDIUM, pady=(PADDING_SMALL, 4))
         
-        # Tags toggle buttons
-        ctk.CTkLabel(
-            self.edit_frame, text="Tags:",
-            font=("Segoe UI", 10, "bold"),
-            text_color=COLOR_TEXT_DIM
-        ).pack(anchor="w", padx=PADDING_MEDIUM, pady=(4, 2))
+        # "Add Tag" dropdown
+        add_tag_frame = ctk.CTkFrame(self.edit_frame, fg_color="transparent")
+        add_tag_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
         
-        self.tags_button_frame = ctk.CTkFrame(self.edit_frame, fg_color="transparent")
-        self.tags_button_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, 6))
-        
-        self._tag_buttons = {}
-        self._tag_states = {}
-        
-        # Create tag toggle buttons in a wrapping grid (3 columns for readability)
-        cols = 3
-        for i, tag in enumerate(AVAILABLE_TAGS):
-            color = TAG_COLORS.get(tag, "#555555")
-            self._tag_states[tag] = False
-            
-            btn = ctk.CTkButton(
-                self.tags_button_frame,
-                text=tag,
-                width=0,
-                height=26,
-                font=("Segoe UI", 10),
-                fg_color="#333333",
-                hover_color=color,
-                text_color=COLOR_TEXT_DIM,
-                corner_radius=12,
-                command=lambda t=tag: self._toggle_tag(t)
-            )
-            row = i // cols
-            col = i % cols
-            btn.grid(row=row, column=col, padx=2, pady=2, sticky="ew")
-            self._tag_buttons[tag] = btn
-        
-        # Make columns expand evenly
-        for c in range(cols):
-            self.tags_button_frame.grid_columnconfigure(c, weight=1)
-        
-        # Notes text area
-        ctk.CTkLabel(
-            self.edit_frame, text="Notes:",
-            font=("Segoe UI", 10, "bold"),
-            text_color=COLOR_TEXT_DIM
-        ).pack(anchor="w", padx=PADDING_MEDIUM, pady=(6, 2))
-        
-        self.notes_textbox = ctk.CTkTextbox(
-            self.edit_frame,
-            height=100,
-            font=("Segoe UI", 11),
-            fg_color=COLOR_BG_MEDIUM,
-            text_color=COLOR_TEXT,
-            corner_radius=6,
-            wrap="word"
+        self.add_tag_var = tk.StringVar(value="+ Add Tag")
+        self.add_tag_menu = ctk.CTkOptionMenu(
+            add_tag_frame,
+            values=AVAILABLE_TAGS,
+            width=140, height=28,
+            font=("Segoe UI", 11, "bold"),
+            command=self._on_add_tag,
+            fg_color="#336633",
+            button_color="#336633",
+            text_color="#ffffff",
+            dropdown_fg_color="#336633",
+            dropdown_text_color="#ffffff",
+            dropdown_hover_color="#448844",
+            variable=self.add_tag_var
         )
-        self.notes_textbox.pack(
-            fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL)
-        )
+        self.add_tag_menu.pack(side="left")
         
-        # Bind text changes (with debounce)
-        self.notes_textbox.bind("<KeyRelease>", self._on_notes_key)
+        # Container for tag cards
+        self.cards_frame = ctk.CTkFrame(self.edit_frame, fg_color="transparent")
+        self.cards_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
     
     # =========================================================================
-    # SECTION HEADER HELPER
+    # HELPERS
     # =========================================================================
     
-    def _create_section_header(self, parent, text):
-        """Create a small section header label."""
+    def _section_header(self, parent, text):
         ctk.CTkLabel(
             parent, text=text,
-            font=("Segoe UI", 10, "bold"),
-            text_color=COLOR_TEXT_DIM
+            font=("Segoe UI", 10, "bold"), text_color=COLOR_TEXT_DIM
         ).pack(anchor="w", padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 4))
     
     # =========================================================================
-    # DATA UPDATES
+    # TIMELINE / POSITION UPDATES
     # =========================================================================
     
     def update_timeline(self, markers, loops):
-        """
-        Rebuild the internal timeline from current markers and loops.
-        Called when markers_changed or loops_changed fires.
-        """
+        """Rebuild internal timeline from current markers and loops."""
         items = []
         for marker in (markers or []):
             items.append((marker.time, 'marker', marker))
@@ -318,22 +232,14 @@ class NotesSidebar(ctk.CTkFrame):
             items.append((loop.start, 'vamp', loop))
         items.sort(key=lambda x: x[0])
         self._timeline_items = items
-        
-        # Re-evaluate current/next based on stored position
         self._evaluate_cues(self._current_position)
     
     def update_position(self, position, is_playing=True):
-        """
-        Update current playback position.
-        Called from the position_update event (throttled in app.py).
-        """
+        """Update current playback position."""
         self._current_position = position
-        self._is_playing = is_playing
         
-        # Throttle full re-evaluation to ~4fps for the countdown
         now = time.time()
         if now - self._last_countdown_update < 0.25:
-            # Just update countdown number without full rebuild
             self._update_countdown_only(position)
             return
         
@@ -341,12 +247,9 @@ class NotesSidebar(ctk.CTkFrame):
         self._evaluate_cues(position)
     
     def _evaluate_cues(self, position):
-        """
-        Determine which cue is current and which is next.
-        Updates both display sections.
-        """
+        """Determine current and next cue, update displays."""
         if not self._timeline_items:
-            self._set_no_cue()
+            self._set_empty()
             return
         
         current = None
@@ -355,20 +258,13 @@ class NotesSidebar(ctk.CTkFrame):
         next_type = None
         
         for i, (t, item_type, obj) in enumerate(self._timeline_items):
-            if item_type == 'marker':
-                item_time = obj.time
-            else:
-                item_time = obj.start
+            item_time = obj.time if item_type == 'marker' else obj.start
             
             if item_time <= position:
-                # This is a candidate for "current"
-                # For vamps, also check if we're still within the range
                 if item_type == 'vamp' and position > obj.end:
-                    continue  # We've passed this vamp entirely
+                    continue
                 current = obj
                 current_type = item_type
-                
-                # Next is the item after this one (if any)
                 if i + 1 < len(self._timeline_items):
                     next_item = self._timeline_items[i + 1][2]
                     next_type = self._timeline_items[i + 1][1]
@@ -376,39 +272,29 @@ class NotesSidebar(ctk.CTkFrame):
                     next_item = None
                     next_type = None
             elif current is None and item_time > position:
-                # We're before the first cue — show first cue as "next"
                 next_item = obj
                 next_type = item_type
                 break
         
-        # Update displays
         old_id = self._current_item.id if self._current_item else None
-        
         self._current_item = current
         self._current_item_type = current_type
         self._next_item = next_item
         self._next_item_type = next_type
         
-        self._refresh_current_display()
-        self._refresh_next_display(position)
+        self._refresh_current(position)
+        self._refresh_next(position)
         
-        # If current item changed, update the edit section
         new_id = current.id if current else None
         if new_id != old_id:
-            self._refresh_edit_section()
+            self._rebuild_tag_cards()
     
     def _update_countdown_only(self, position):
-        """Fast path: just update the countdown number."""
+        """Fast path: just update countdown number."""
         if self._next_item:
-            if self._next_item_type == 'marker':
-                next_time = self._next_item.time
-            else:
-                next_time = self._next_item.start
-            
+            next_time = self._next_item.time if self._next_item_type == 'marker' else self._next_item.start
             remaining = max(0, next_time - position)
-            self.countdown_label.configure(text=self._format_countdown(remaining))
-            
-            # Color based on urgency
+            self.countdown_label.configure(text=self._fmt_countdown(remaining))
             if remaining < 5:
                 self.countdown_label.configure(text_color="#ff4444")
             elif remaining < 15:
@@ -417,99 +303,81 @@ class NotesSidebar(ctk.CTkFrame):
                 self.countdown_label.configure(text_color="#88cc88")
     
     # =========================================================================
-    # DISPLAY REFRESH
+    # DISPLAY: NOW SECTION
     # =========================================================================
     
-    def _set_no_cue(self):
-        """Reset to empty state."""
+    def _set_empty(self):
         self.current_icon.configure(text="--")
         self.current_name.configure(text="No active cue")
         self.current_time.configure(text="")
-        self.current_notes_label.configure(text="")
-        self._clear_tags_display(self.current_tags_frame)
-        
-        self.countdown_label.configure(text="--:--")
+        self._clear_children(self.current_tags_notes)
+        self.countdown_label.configure(text="--:--", text_color="#555555")
         self.next_icon.configure(text="")
         self.next_name.configure(text="--")
         self.next_time.configure(text="")
-        self.next_notes_label.configure(text="")
-        self._clear_tags_display(self.next_tags_frame)
+        self._clear_children(self.next_tags_notes)
     
-    def _refresh_current_display(self):
-        """Update the 'NOW' section with current item details."""
+    def _refresh_current(self, position):
         item = self._current_item
-        item_type = self._current_item_type
+        itype = self._current_item_type
         
         if item is None:
             self.current_icon.configure(text="--")
             self.current_name.configure(text="No active cue")
             self.current_time.configure(text="")
-            self.current_notes_label.configure(text="")
             self.current_frame.configure(fg_color="#1a1a1a")
-            self._clear_tags_display(self.current_tags_frame)
+            self._clear_children(self.current_tags_notes)
             return
         
-        if item_type == 'marker':
+        if itype == 'marker':
             self.current_icon.configure(text="📍")
             self.current_time.configure(
-                text=f"at {self._format_time(item.time)}",
-                text_color=COLOR_MARKER
+                text=f"at {self._fmt(item.time)}", text_color=COLOR_MARKER
             )
             self.current_frame.configure(fg_color="#2a2a1e")
         else:
             self.current_icon.configure(text="🔁")
             self.current_time.configure(
-                text=f"{self._format_time(item.start)} → {self._format_time(item.end)}",
-                text_color="#66bb6a"
+                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color="#66bb6a"
             )
             self.current_frame.configure(fg_color="#1e2a1e")
         
         self.current_name.configure(text=item.name)
-        self.current_notes_label.configure(
-            text=item.notes if item.notes else "(no notes)"
-        )
-        
-        # Show tags
-        self._render_tags(self.current_tags_frame, getattr(item, 'tags', []))
+        self._render_tag_notes_summary(self.current_tags_notes, item.tag_notes)
     
-    def _refresh_next_display(self, position):
-        """Update the 'UP NEXT' section."""
+    # =========================================================================
+    # DISPLAY: NEXT SECTION
+    # =========================================================================
+    
+    def _refresh_next(self, position):
         item = self._next_item
-        item_type = self._next_item_type
+        itype = self._next_item_type
         
         if item is None:
             self.countdown_label.configure(text="--:--", text_color="#555555")
             self.next_icon.configure(text="")
             self.next_name.configure(text="End of song")
             self.next_time.configure(text="")
-            self.next_notes_label.configure(text="")
-            self._clear_tags_display(self.next_tags_frame)
+            self._clear_children(self.next_tags_notes)
             return
         
-        if item_type == 'marker':
+        if itype == 'marker':
             self.next_icon.configure(text="📍")
             next_time = item.time
             self.next_time.configure(
-                text=f"at {self._format_time(next_time)}",
-                text_color=COLOR_MARKER
+                text=f"at {self._fmt(next_time)}", text_color=COLOR_MARKER
             )
         else:
             self.next_icon.configure(text="🔁")
             next_time = item.start
             self.next_time.configure(
-                text=f"{self._format_time(item.start)} → {self._format_time(item.end)}",
-                text_color="#558855"
+                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color="#558855"
             )
         
         self.next_name.configure(text=item.name)
-        self.next_notes_label.configure(
-            text=item.notes if item.notes else ""
-        )
         
-        # Countdown
         remaining = max(0, next_time - position)
-        self.countdown_label.configure(text=self._format_countdown(remaining))
-        
+        self.countdown_label.configure(text=self._fmt_countdown(remaining))
         if remaining < 5:
             self.countdown_label.configure(text_color="#ff4444")
         elif remaining < 15:
@@ -517,163 +385,239 @@ class NotesSidebar(ctk.CTkFrame):
         else:
             self.countdown_label.configure(text_color="#88cc88")
         
-        # Tags
-        self._render_tags(self.next_tags_frame, getattr(item, 'tags', []))
+        self._render_tag_notes_summary(self.next_tags_notes, item.tag_notes)
     
-    def _refresh_edit_section(self):
-        """Update the edit section to reflect the current item."""
+    def _render_tag_notes_summary(self, parent, tag_notes):
+        """Render read-only tag+notes summary in NOW or NEXT section."""
+        self._clear_children(parent)
+        
+        if not tag_notes:
+            ctk.CTkLabel(
+                parent, text="(no tags)", font=("Segoe UI", 10),
+                text_color=COLOR_TEXT_DIM
+            ).pack(anchor="w", padx=4, pady=2)
+            return
+        
+        for tag, notes in tag_notes.items():
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            
+            color = TAG_COLORS.get(tag, "#555555")
+            ctk.CTkLabel(
+                row, text=f" {tag} ",
+                font=("Segoe UI", 9, "bold"),
+                fg_color=color, corner_radius=8,
+                text_color="#ffffff", height=18
+            ).pack(side="left", padx=(4, 6), pady=1)
+            
+            display = notes.strip().replace('\n', ' ')
+            if len(display) > 60:
+                display = display[:57] + "..."
+            
+            ctk.CTkLabel(
+                row, text=display if display else "(empty)",
+                font=("Segoe UI", 10),
+                text_color=COLOR_TEXT if display else COLOR_TEXT_DIM,
+                anchor="w"
+            ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+    
+    # =========================================================================
+    # EDIT SECTION: TAG CARDS
+    # =========================================================================
+    
+    def _on_add_tag(self, tag_name):
+        """Handle tag selection from the Add Tag dropdown."""
+        if self._current_item is None or tag_name == "(all tags added)":
+            self.add_tag_var.set("+ Add Tag")
+            return
+        
+        # Don't add duplicate
+        if tag_name in self._current_item.tag_notes:
+            self.add_tag_var.set("+ Add Tag")
+            return
+        
+        # Add tag with empty notes
+        self._current_item.tag_notes[tag_name] = ""
+        
+        # Save to backend
+        if self.on_tag_note_save:
+            self.on_tag_note_save(self._current_item.id, tag_name, "")
+        
+        # Reset dropdown and rebuild
+        self.add_tag_var.set("+ Add Tag")
+        self._rebuild_tag_cards()
+        self._refresh_current(self._current_position)
+    
+    def _rebuild_tag_cards(self):
+        """Rebuild all tag editing cards for the current item."""
+        # Destroy old cards
+        for card in self._tag_cards:
+            card.destroy()
+        self._tag_cards.clear()
+        
         item = self._current_item
         
         if item is None:
             self.edit_target_label.configure(text="Select a cue to edit")
-            self.notes_textbox.delete("0.0", "end")
-            for tag in AVAILABLE_TAGS:
-                self._set_tag_button_state(tag, False)
             return
         
         type_str = "Cue" if self._current_item_type == 'marker' else "Vamp"
         self.edit_target_label.configure(text=f"Editing: {type_str} — {item.name}")
         
-        # Update notes textbox (without triggering save)
-        self.notes_textbox.delete("0.0", "end")
-        if item.notes:
-            self.notes_textbox.insert("0.0", item.notes)
+        # Update dropdown to only show tags not yet added
+        existing = set(item.tag_notes.keys())
+        available = [t for t in AVAILABLE_TAGS if t not in existing]
+        self.add_tag_menu.configure(values=available if available else ["(all tags added)"])
+        self.add_tag_var.set("+ Add Tag")
         
-        # Update tag buttons
-        item_tags = getattr(item, 'tags', [])
-        for tag in AVAILABLE_TAGS:
-            self._set_tag_button_state(tag, tag in item_tags)
+        # Build a card for each tag
+        for tag, notes in item.tag_notes.items():
+            card = self._create_tag_card(tag, notes)
+            self._tag_cards.append(card)
     
-    # =========================================================================
-    # TAG RENDERING
-    # =========================================================================
-    
-    def _render_tags(self, frame, tags):
-        """Render tag badges in a frame."""
-        self._clear_tags_display(frame)
+    def _create_tag_card(self, tag, notes):
+        """
+        Create an editable card for a single tag.
+        Starts in VIEW mode (label). Edit button toggles to EDIT mode (textbox).
+        Save button persists and returns to VIEW mode.
+        """
+        color = TAG_COLORS.get(tag, "#555555")
         
-        if not tags:
+        card = ctk.CTkFrame(self.cards_frame, fg_color="#1a1a1a", corner_radius=6)
+        card.pack(fill="x", pady=3)
+        
+        # ---- Header row: colored tag badge + Edit/Save + Delete ----
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=4, pady=(4, 2))
+        
+        ctk.CTkLabel(
+            header, text=f" {tag} ",
+            font=("Segoe UI", 10, "bold"),
+            fg_color=color, corner_radius=8,
+            text_color="#ffffff", height=22
+        ).pack(side="left", padx=(2, 6))
+        
+        # Delete tag button
+        btn_delete = ctk.CTkButton(
+            header, text="✕", width=26, height=22,
+            fg_color="transparent", hover_color="#442222",
+            text_color="#aa4444", font=("Segoe UI", 11),
+            command=lambda: self._remove_tag(tag, card)
+        )
+        btn_delete.pack(side="right", padx=2)
+        
+        # Edit / Save toggle button
+        btn_edit = ctk.CTkButton(
+            header, text="Edit", width=50, height=22,
+            fg_color=COLOR_BG_LIGHT, hover_color="#555555",
+            text_color=COLOR_TEXT, font=("Segoe UI", 10),
+            command=None  # Set below
+        )
+        btn_edit.pack(side="right", padx=2)
+        
+        # ---- VIEW mode: label showing saved notes ----
+        view_label = ctk.CTkLabel(
+            card, text=notes if notes else "(click Edit to add notes)",
+            font=("Segoe UI", 11),
+            text_color=COLOR_TEXT if notes else COLOR_TEXT_DIM,
+            wraplength=RIGHT_SIDEBAR_WIDTH - 60,
+            justify="left", anchor="w"
+        )
+        view_label.pack(fill="x", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+        
+        # ---- EDIT mode: textbox container (hidden initially) ----
+        edit_container = ctk.CTkFrame(card, fg_color="transparent")
+        
+        textbox = ctk.CTkTextbox(
+            edit_container, height=70,
+            font=("Segoe UI", 11),
+            fg_color=COLOR_BG_MEDIUM, text_color=COLOR_TEXT,
+            corner_radius=4, wrap="word"
+        )
+        textbox.pack(fill="x", padx=2, pady=(0, 4))
+        textbox.insert("0.0", notes)
+        
+        # ---- Toggle logic ----
+        card._editing = False
+        
+        def toggle_edit():
+            if card._editing:
+                # === SAVE ===
+                new_text = textbox.get("0.0", "end").strip()
+                if self._current_item:
+                    self._current_item.tag_notes[tag] = new_text
+                    if self.on_tag_note_save:
+                        self.on_tag_note_save(self._current_item.id, tag, new_text)
+                
+                view_label.configure(
+                    text=new_text if new_text else "(click Edit to add notes)",
+                    text_color=COLOR_TEXT if new_text else COLOR_TEXT_DIM
+                )
+                edit_container.pack_forget()
+                view_label.pack(fill="x", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+                btn_edit.configure(text="Edit", fg_color=COLOR_BG_LIGHT, text_color=COLOR_TEXT)
+                card._editing = False
+                
+                # Refresh NOW display to show updated notes
+                self._refresh_current(self._current_position)
+            else:
+                # === EDIT ===
+                textbox.delete("0.0", "end")
+                current_notes = ""
+                if self._current_item:
+                    current_notes = self._current_item.tag_notes.get(tag, "")
+                textbox.insert("0.0", current_notes)
+                
+                view_label.pack_forget()
+                edit_container.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
+                btn_edit.configure(text="Save", fg_color=COLOR_BTN_SUCCESS, text_color="#ffffff")
+                card._editing = True
+                textbox.focus_set()
+        
+        btn_edit.configure(command=toggle_edit)
+        
+        return card
+    
+    def _remove_tag(self, tag, card_widget):
+        """Remove a tag from the current item."""
+        if self._current_item is None:
             return
         
-        for tag in tags:
-            color = TAG_COLORS.get(tag, "#555555")
-            badge = ctk.CTkLabel(
-                frame, text=f" {tag} ",
-                font=("Segoe UI", 9, "bold"),
-                fg_color=color,
-                corner_radius=10,
-                text_color="#ffffff",
-                height=20
-            )
-            badge.pack(side="left", padx=2, pady=2)
+        self._current_item.tag_notes.pop(tag, None)
+        
+        if self.on_tag_remove:
+            self.on_tag_remove(self._current_item.id, tag)
+        
+        card_widget.destroy()
+        if card_widget in self._tag_cards:
+            self._tag_cards.remove(card_widget)
+        
+        # Update dropdown and NOW display
+        existing = set(self._current_item.tag_notes.keys())
+        available = [t for t in AVAILABLE_TAGS if t not in existing]
+        self.add_tag_menu.configure(values=available if available else ["(all tags added)"])
+        self.add_tag_var.set("+ Add Tag")
+        
+        self._refresh_current(self._current_position)
     
-    def _clear_tags_display(self, frame):
-        """Remove all tag badges from a frame."""
+    # =========================================================================
+    # UTILITIES
+    # =========================================================================
+    
+    def _clear_children(self, frame):
         for w in frame.winfo_children():
             w.destroy()
     
-    # =========================================================================
-    # TAG EDITING
-    # =========================================================================
-    
-    def _toggle_tag(self, tag):
-        """Toggle a tag on/off for the current item."""
-        if self._current_item is None:
-            return
-        
-        current_tags = list(getattr(self._current_item, 'tags', []))
-        
-        if tag in current_tags:
-            current_tags.remove(tag)
-            self._set_tag_button_state(tag, False)
-        else:
-            current_tags.append(tag)
-            self._set_tag_button_state(tag, True)
-        
-        self._current_item.tags = current_tags
-        
-        # Update displays immediately
-        self._render_tags(self.current_tags_frame, current_tags)
-        
-        # Notify backend
-        if self.on_tags_change:
-            self.on_tags_change(self._current_item.id, current_tags)
-    
-    def _set_tag_button_state(self, tag, active):
-        """Update a tag button's visual state."""
-        self._tag_states[tag] = active
-        btn = self._tag_buttons.get(tag)
-        if not btn:
-            return
-        
-        color = TAG_COLORS.get(tag, "#555555")
-        if active:
-            btn.configure(
-                fg_color=color,
-                text_color="#ffffff",
-                font=("Segoe UI", 10, "bold")
-            )
-        else:
-            btn.configure(
-                fg_color="#333333",
-                text_color=COLOR_TEXT_DIM,
-                font=("Segoe UI", 10)
-            )
-    
-    # =========================================================================
-    # NOTES EDITING
-    # =========================================================================
-    
-    def _on_notes_key(self, event=None):
-        """Handle keypress in notes textbox with debounce."""
-        if self._current_item is None:
-            return
-        
-        # Cancel previous timer
-        if self._notes_save_timer is not None:
-            try:
-                self.after_cancel(self._notes_save_timer)
-            except Exception:
-                pass
-        
-        # Set new timer (save after 800ms of no typing)
-        self._notes_save_timer = self.after(800, self._save_notes)
-    
-    def _save_notes(self):
-        """Actually save the notes content."""
-        if self._current_item is None:
-            return
-        
-        text = self.notes_textbox.get("0.0", "end").strip()
-        self._current_item.notes = text
-        
-        # Update the read-only display
-        self.current_notes_label.configure(
-            text=text if text else "(no notes)"
-        )
-        
-        # Notify backend
-        if self.on_notes_change:
-            self.on_notes_change(self._current_item.id, text)
-    
-    # =========================================================================
-    # FORMATTING
-    # =========================================================================
-    
-    def _format_time(self, seconds):
-        """Format seconds as M:SS.ss"""
+    def _fmt(self, seconds):
         minutes = int(seconds // 60)
         secs = seconds % 60
         return f"{minutes}:{secs:05.2f}"
     
-    def _format_countdown(self, seconds):
-        """Format countdown as M:SS or SS.s depending on size."""
+    def _fmt_countdown(self, seconds):
         if seconds <= 0:
             return "NOW"
-        
         if seconds < 60:
             return f"{seconds:.1f}s"
-        
         minutes = int(seconds // 60)
         secs = int(seconds % 60)
         return f"{minutes}:{secs:02d}"
