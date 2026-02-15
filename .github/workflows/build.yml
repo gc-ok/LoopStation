@@ -25,27 +25,88 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    # Install ffmpeg
-    - name: Install FFmpeg (Mac)
-      if: runner.os == 'macOS'
-      run: brew install ffmpeg
+    # ================================================================
+    # FFMPEG — LGPL BUILDS ONLY
+    # Loop Station only uses ffmpeg for decoding (no x264/x265 needed).
+    # We MUST use LGPL builds to legally distribute as proprietary software.
+    # ================================================================
 
-    - name: Install FFmpeg (Windows)
+    # WINDOWS: Download pre-built LGPL static binary from BtbN
+    - name: Download FFmpeg LGPL (Windows)
       if: runner.os == 'Windows'
-      run: choco install ffmpeg
+      run: |
+        # Download LGPL build (no x264, no x265, no GPL codecs)
+        Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip" -OutFile ffmpeg-lgpl.zip
+        Expand-Archive ffmpeg-lgpl.zip -DestinationPath ffmpeg-lgpl
+        
+        # Find the extracted folder (name varies by build date)
+        $ffDir = Get-ChildItem ffmpeg-lgpl -Directory | Select-Object -First 1
+        $binDir = Join-Path $ffDir.FullName "bin"
+        
+        # Verify it's actually LGPL
+        & "$binDir\ffmpeg.exe" -version
+        & "$binDir\ffmpeg.exe" -L
+        
+        # Make available for PyInstaller
+        echo "FFMPEG_PATH=$binDir\ffmpeg.exe" >> $env:GITHUB_ENV
+        echo "FFPROBE_PATH=$binDir\ffprobe.exe" >> $env:GITHUB_ENV
 
-    - name: Install Dependencies
+    # MACOS: Build from source with --disable-gpl (brew's default enables GPL)
+    - name: Build FFmpeg LGPL from source (Mac)
+      if: runner.os == 'macOS'
+      run: |
+        # Install build dependencies
+        brew install nasm pkg-config
+        
+        # Clone FFmpeg release branch
+        git clone --depth 1 --branch release/7.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+        cd ffmpeg-src
+        
+        # Configure as LGPL — explicitly disable GPL and unneeded features
+        # This gives us all built-in decoders (mp3, aac, flac, pcm, vorbis, etc.)
+        # without any GPL-licensed codecs (x264, x265, xvid, etc.)
+        ./configure \
+          --prefix=$GITHUB_WORKSPACE/ffmpeg-lgpl \
+          --disable-gpl \
+          --disable-doc \
+          --disable-debug \
+          --enable-small \
+          --disable-encoders \
+          --enable-encoder=pcm_s16le \
+          --disable-muxers \
+          --enable-muxer=s16le,pcm_s16le,null,wav \
+          --disable-devices \
+          --disable-filters \
+          --enable-filter=aresample,anull \
+          --disable-bsfs \
+          --disable-protocols \
+          --enable-protocol=file,pipe \
+          --disable-network
+        
+        # Build (use all cores)
+        make -j$(sysctl -n hw.ncpu)
+        make install
+        
+        # Verify LGPL license
+        echo "=== Verifying LGPL license ==="
+        $GITHUB_WORKSPACE/ffmpeg-lgpl/bin/ffmpeg -version
+        $GITHUB_WORKSPACE/ffmpeg-lgpl/bin/ffmpeg -L
+        
+        # Verify the binary can decode audio (quick sanity check)
+        echo "=== Build complete ==="
+        
+        echo "FFMPEG_PATH=$GITHUB_WORKSPACE/ffmpeg-lgpl/bin/ffmpeg" >> $GITHUB_ENV
+        echo "FFPROBE_PATH=$GITHUB_WORKSPACE/ffmpeg-lgpl/bin/ffprobe" >> $GITHUB_ENV
+
+    - name: Install Python Dependencies
       run: |
         pip install --upgrade pip
         pip install pygame numpy matplotlib customtkinter librosa pyinstaller Pillow soundfile flask qrcode
 
-    # BUILD WINDOWS (bundles ffmpeg + ffprobe)
+    # BUILD WINDOWS (bundles LGPL ffmpeg + ffprobe)
     - name: Build Windows .exe
       if: runner.os == 'Windows'
       run: |
-        $ffmpegPath = (Get-Command ffmpeg).Source
-        $ffprobePath = (Get-Command ffprobe).Source
-        
         pyinstaller --noconsole --name "LoopStation" --icon=logo.ico `
           --osx-bundle-identifier "com.loopstation.app" `
           --paths . `
@@ -63,20 +124,17 @@ jobs:
           --add-data "utils;utils" `
           --add-data "logo.png;." `
           --add-data "logo.ico;." `
-          --add-binary "$ffmpegPath;." `
-          --add-binary "$ffprobePath;." `
+          --add-data "THIRD_PARTY_LICENSES.txt;." `
+          --add-binary "$env:FFMPEG_PATH;." `
+          --add-binary "$env:FFPROBE_PATH;." `
           main.py
 
-    # BUILD MAC (bundles ffmpeg + ffprobe)
+    # BUILD MAC (bundles LGPL ffmpeg + ffprobe)
     - name: Build Mac .app
       if: runner.os == 'macOS'
       env:
-        # Prevent Tk autorelease pool issues during build
         OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
       run: |
-        FFMPEG_PATH=$(which ffmpeg)
-        FFPROBE_PATH=$(which ffprobe)
-        
         pyinstaller --noconsole --name "LoopStation" --icon=logo.png \
           --osx-bundle-identifier "com.loopstation.app" \
           --paths . \
@@ -94,6 +152,7 @@ jobs:
           --add-data "utils:utils" \
           --add-data "logo.png:." \
           --add-data "logo.ico:." \
+          --add-data "THIRD_PARTY_LICENSES.txt:." \
           --add-binary "$FFMPEG_PATH:." \
           --add-binary "$FFPROBE_PATH:." \
           main.py
