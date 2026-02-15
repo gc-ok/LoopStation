@@ -45,13 +45,8 @@ from .vamp_settings import VampSettingsPanel
 from .vamp_modal import VampModal
 from .notes_sidebar import NotesSidebar
 
-# Web server (Phase 2) - lazy import, dependencies optional
-try:
-    from backend.web_server import CueWebServer, SharedCueState, get_local_ip, HAS_FLASK
-except ImportError:
-    HAS_FLASK = False
-    CueWebServer = None
-    SharedCueState = None
+# Web server (Phase 2)
+from backend.web_server import CueWebServer, SharedCueState, get_local_ip
 
 logger = logging.getLogger("LoopStation.App")
 
@@ -161,7 +156,7 @@ class LoopStationApp(ctk.CTk):
         self.ffmpeg_path = ffmpeg_path
         
         # Web server (Phase 2)
-        self._shared_cue_state = SharedCueState() if SharedCueState else None
+        self._shared_cue_state = SharedCueState()
         self._web_server = None
 
         # 1. Start with NO audio engine (Instant load)
@@ -664,10 +659,6 @@ class LoopStationApp(ctk.CTk):
     
     def _toggle_web_share(self):
         """Start or stop the local network cue monitor."""
-        if not HAS_FLASK or CueWebServer is None:
-            self._show_share_deps_error()
-            return
-        
         if self._web_server and self._web_server.running:
             # Stop sharing
             self._web_server.stop()
@@ -774,37 +765,6 @@ class LoopStationApp(ctk.CTk):
             command=popup.destroy
         ).pack(pady=(15, 20))
     
-    def _show_share_deps_error(self):
-        """Show error when Flask is not installed."""
-        popup = ctk.CTkToplevel(self)
-        popup.title("Missing Dependencies")
-        popup.geometry("420x200")
-        popup.resizable(False, False)
-        popup.configure(fg_color=COLOR_BG_DARK)
-        popup.attributes("-topmost", True)
-        
-        ctk.CTkLabel(
-            popup, text="Web sharing requires additional packages:",
-            font=("Segoe UI", 13), text_color=COLOR_TEXT
-        ).pack(pady=(20, 10))
-        
-        ctk.CTkLabel(
-            popup, text="pip install flask qrcode pillow",
-            font=("Consolas", 14, "bold"), text_color="#58a6ff"
-        ).pack(pady=5)
-        
-        ctk.CTkLabel(
-            popup, text="Run this in your terminal, then restart Loop Station.",
-            font=("Segoe UI", 11), text_color=COLOR_TEXT_DIM,
-            wraplength=380
-        ).pack(pady=10)
-        
-        ctk.CTkButton(
-            popup, text="OK", width=80,
-            fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
-            command=popup.destroy
-        ).pack(pady=10)
-
     def _wire_callbacks(self):
         """
         Wire up StateManager events to push to the thread-safe queue.
@@ -1155,7 +1115,7 @@ class LoopStationApp(ctk.CTk):
         self.notes_sidebar.update_position(actual_pos, is_playing=True)
         
         # Push to web server shared state (if sharing)
-        if self._shared_cue_state and self._web_server and self._web_server.running:
+        if self._web_server and self._web_server.running:
             self._shared_cue_state.update_from_app(
                 self.app_state, actual_pos,
                 self.notes_sidebar._current_item,
