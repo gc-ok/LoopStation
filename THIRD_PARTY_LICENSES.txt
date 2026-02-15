@@ -1,0 +1,112 @@
+THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
+
+Loop Station incorporates third-party software components. The following
+notices are provided in compliance with the respective license requirements.
+
+===========================================================================
+1. FFmpeg
+===========================================================================
+
+This software uses code of FFmpeg (http://ffmpeg.org) licensed under the
+GNU Lesser General Public License version 2.1 or later (LGPLv2.1+).
+
+FFmpeg is NOT modified by this application. Loop Station calls the ffmpeg
+and ffprobe binaries as external processes (subprocess) for audio format
+conversion and duration detection. The FFmpeg binaries are bundled unmodified.
+
+FFmpeg source code can be obtained from: https://ffmpeg.org/download.html
+
+A copy of the LGPLv2.1 is included below and is also available at:
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+
+===========================================================================
+2. pygame
+===========================================================================
+
+pygame is licensed under the GNU Lesser General Public License version 2.1.
+https://www.pygame.org/wiki/about
+Source: https://github.com/pygame/pygame
+
+===========================================================================
+3. CustomTkinter
+===========================================================================
+
+CustomTkinter is licensed under the MIT License.
+Copyright (c) 2023 Tom Schimansky
+https://github.com/TomSchimansky/CustomTkinter
+
+===========================================================================
+4. matplotlib
+===========================================================================
+
+matplotlib is licensed under the matplotlib License (BSD-compatible).
+Copyright (c) 2012-2024 Matplotlib Development Team
+https://matplotlib.org/stable/users/project/license.html
+
+===========================================================================
+5. NumPy
+===========================================================================
+
+NumPy is licensed under the BSD 3-Clause License.
+Copyright (c) 2005-2024 NumPy Developers
+https://numpy.org/doc/stable/license.html
+
+===========================================================================
+6. librosa
+===========================================================================
+
+librosa is licensed under the ISC License.
+Copyright (c) 2013-2024 Brian McFee
+https://github.com/librosa/librosa
+
+===========================================================================
+7. SoundFile
+===========================================================================
+
+SoundFile is licensed under the BSD 3-Clause License.
+https://github.com/bastibe/python-soundfile
+
+===========================================================================
+8. Flask
+===========================================================================
+
+Flask is licensed under the BSD 3-Clause License.
+Copyright (c) 2010 Pallets
+https://github.com/pallets/flask
+
+===========================================================================
+9. Pillow
+===========================================================================
+
+Pillow is licensed under the HPND License.
+Copyright (c) 1997-2011 Secret Labs AB
+Copyright (c) 1995-2024 Fredrik Lundh and contributors
+https://github.com/python-pillow/Pillow
+
+===========================================================================
+10. qrcode
+===========================================================================
+
+qrcode is licensed under the BSD License.
+https://github.com/lincolnloop/python-qrcode
+
+===========================================================================
+
+
+GNU LESSER GENERAL PUBLIC LICENSE
+Version 2.1, February 1999
+
+Copyright (C) 1991, 1999 Free Software Foundation, Inc.
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+[This is the first released version of the Lesser GPL. It also counts
+ as the successor of the GNU Library Public License, version 2, hence
+ the version number 2.1.]
+
+The full text of the LGPLv2.1 can be viewed at:
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
