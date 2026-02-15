@@ -30,9 +30,11 @@ if False:
     import frontend.splash
     import frontend.vamp_settings
     import frontend.vamp_modal
+    import frontend.notes_sidebar
     import backend.audio_engine
     import backend.state_manager
     import backend.loop_detector
+    import backend.web_server
     import utils.ffmpeg_downloader
     import utils.formatting
     import utils.preferences
