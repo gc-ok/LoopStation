@@ -23,6 +23,7 @@ from config import (
     COLOR_BTN_PRIMARY, SIDEBAR_WIDTH, SUPPORTED_FORMATS,
     PADDING_SMALL, PADDING_MEDIUM, COLOR_BTN_TEXT,
 )
+from utils.tooltip import ToolTip
 
 logger = logging.getLogger("LoopStation.Library")
 
@@ -78,6 +79,7 @@ class LibrarySidebar(ctk.CTkFrame):
             command=self._browse_folder
         )
         self.btn_browse.pack(side="right")
+        ToolTip(self.btn_browse, "Browse for a folder of music files")
 
         # --- NEW: Theme Selector ---
         from themes import THEMES
@@ -110,6 +112,7 @@ class LibrarySidebar(ctk.CTkFrame):
         )
         self.theme_menu.set("Select Theme")
         self.theme_menu.pack(side="right")
+        ToolTip(self.theme_menu, "Change color theme (restarts app)")
         
         # Folder path label
         self.folder_label = ctk.CTkLabel(
