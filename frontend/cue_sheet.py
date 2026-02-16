@@ -29,6 +29,7 @@ from config import (
     PADDING_SMALL, PADDING_MEDIUM, COLOR_BTN_TEXT,
     COLOR_SKIP_REGION, COLOR_SKIP_CANDIDATE
 )
+from utils.tooltip import ToolTip
 
 logger = logging.getLogger("LoopStation.CueSheet")
 
@@ -104,6 +105,7 @@ class CueSheetPanel(ctk.CTkFrame):
             command=self._on_prev
         )
         self.btn_prev.pack(side="left", padx=(0, 3))
+        ToolTip(self.btn_prev, "Jump to previous cue or vamp  ( [ )")
         
         self.btn_next = ctk.CTkButton(
             toolbar, text="⏭", width=30, height=24,
@@ -112,6 +114,7 @@ class CueSheetPanel(ctk.CTkFrame):
             command=self._on_next
         )
         self.btn_next.pack(side="left", padx=(0, 10))
+        ToolTip(self.btn_next, "Jump to next cue or vamp  ( ] )")
         
         # Add Cue button
         self.btn_add_cue = ctk.CTkButton(
@@ -123,6 +126,7 @@ class CueSheetPanel(ctk.CTkFrame):
             command=self._on_add_cue
         )
         self.btn_add_cue.pack(side="left", padx=(0, 5))
+        ToolTip(self.btn_add_cue, "Add a cue marker at the current playhead position  (M)")
         
         # Add Vamp dropdown menu
         self.vamp_menu_var = tk.StringVar(value="+ 🔁 Vamp")
@@ -142,6 +146,7 @@ class CueSheetPanel(ctk.CTkFrame):
             variable=self.vamp_menu_var
         )
         self.btn_add_vamp.pack(side="left")
+        ToolTip(self.btn_add_vamp, "Add a vamp (loop region) — choose manual or auto-detect")
         
         # Hint text
         ctk.CTkLabel(
@@ -264,12 +269,15 @@ class CueSheetPanel(ctk.CTkFrame):
         if skip.active: switch.select()
         else: switch.deselect()
         switch.pack(side="right", padx=5)
+        ToolTip(switch, "Enable or disable this cut region")
         
         # Delete
-        ctk.CTkButton(row, text="✕", width=25, height=20, fg_color="transparent", 
+        btn_del_s = ctk.CTkButton(row, text="✕", width=25, height=20, fg_color="transparent", 
                       hover_color="#441111", text_color=COLOR_BTN_DANGER,
                       command=lambda s=skip.id: self.on_delete_skip(s) if self.on_delete_skip else None
-                      ).pack(side="right", padx=2)
+                      )
+        btn_del_s.pack(side="right", padx=2)
+        ToolTip(btn_del_s, "Delete this cut region")
                       
         return row
 
@@ -446,20 +454,24 @@ class CueSheetPanel(ctk.CTkFrame):
         name_btn.pack(side="left", fill="x", expand=True, padx=2)
         
         # Rename
-        ctk.CTkButton(
+        btn_ren_m = ctk.CTkButton(
             row, text="✏", width=24, height=20,
             fg_color="transparent", hover_color=COLOR_BG_LIGHT,
             text_color=COLOR_TEXT_DIM,
             command=lambda mid=marker.id, mn=marker.name: self._on_rename_marker(mid, mn)
-        ).pack(side="right", padx=1)
+        )
+        btn_ren_m.pack(side="right", padx=1)
+        ToolTip(btn_ren_m, "Rename this cue")
         
         # Delete
-        ctk.CTkButton(
+        btn_del_m = ctk.CTkButton(
             row, text="✕", width=24, height=20,
             fg_color="transparent", hover_color="#442222",
             text_color="#aa4444",
             command=lambda mid=marker.id: self._on_delete_marker(mid)
-        ).pack(side="right", padx=1)
+        )
+        btn_del_m.pack(side="right", padx=1)
+        ToolTip(btn_del_m, "Delete this cue")
         
         return row
 
@@ -561,40 +573,48 @@ class CueSheetPanel(ctk.CTkFrame):
         # ACTION BUTTONS (right side)
         
         # Delete button
-        ctk.CTkButton(
+        btn_del = ctk.CTkButton(
             row, text="✕", width=28, height=22,
             fg_color="transparent",
             hover_color="#442222",
             text_color="#aa4444",
             command=lambda idx=loop_idx: self._on_delete_vamp_row(idx)
-        ).pack(side="right", padx=2)
+        )
+        btn_del.pack(side="right", padx=2)
+        ToolTip(btn_del, "Delete this vamp")
         
         # Rename button
-        ctk.CTkButton(
+        btn_ren = ctk.CTkButton(
             row, text="✏", width=28, height=22,
             fg_color="transparent",
             hover_color=COLOR_BG_LIGHT,
             text_color=COLOR_TEXT_DIM,
             command=lambda idx=loop_idx, ln=loop.name: self._on_rename_vamp_row(idx, ln)
-        ).pack(side="right", padx=2)
+        )
+        btn_ren.pack(side="right", padx=2)
+        ToolTip(btn_ren, "Rename this vamp")
         
         # Settings button (⚙️)
-        ctk.CTkButton(
+        btn_set = ctk.CTkButton(
             row, text="⚙️", width=28, height=22,
             fg_color=COLOR_BG_LIGHT,
             hover_color="#555555",
             text_color=COLOR_TEXT,
             command=lambda idx=loop_idx: self._on_open_settings_row(idx)
-        ).pack(side="right", padx=2)
+        )
+        btn_set.pack(side="right", padx=2)
+        ToolTip(btn_set, "Open vamp settings (crossfade, boundaries)")
         
         # Play/Jump button
-        ctk.CTkButton(
+        btn_play = ctk.CTkButton(
             row, text="▶", width=28, height=22,
             fg_color=COLOR_BTN_SUCCESS if is_selected else COLOR_BG_LIGHT,
             hover_color=COLOR_BTN_SUCCESS,
             text_color="#ffffff" if is_selected else COLOR_TEXT,
             command=lambda idx=loop_idx: self._on_jump_to_vamp_row(idx)
-        ).pack(side="right", padx=2)
+        )
+        btn_play.pack(side="right", padx=2)
+        ToolTip(btn_play, "Jump to this vamp and start playing")
         
         return row
     
