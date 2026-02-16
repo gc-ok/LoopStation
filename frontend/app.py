@@ -1145,6 +1145,13 @@ class LoopStationApp(ctk.CTk):
         else:
             self.btn_play.configure(text="▶  PLAY")
         
+        # Push play/pause/stop to web server so remote clients update immediately
+        if self._web_server and self._web_server.running:
+            self._shared_cue_state.update(
+                is_playing=is_playing,
+                is_looping=self.app_state.is_in_loop_mode() if self.app_state else False,
+            )
+        
         if state == PlaybackState.STOPPED:
             self.status_label.configure(text="Stopped")
             self.btn_exit_loop.configure(
@@ -1436,4 +1443,3 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
-
