@@ -294,11 +294,11 @@ class LoopStationApp(ctk.CTk):
         btn_row.pack(fill="x", pady=(0, 6))
         
         btn_support = ctk.CTkButton(
-            btn_row, text="❤️ Support", width=0, height=26,
+            btn_row, text="🙏🏼 Support", width=0, height=26,
             font=("Segoe UI", 10, "bold"),
             fg_color="#6b3fa0", hover_color="#8255b8",
             text_color="#ffffff", corner_radius=6,
-            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/support")
+            command=lambda: webbrowser.open("https://ko-fi.com/gceducationanalytics")
         )
         btn_support.pack(side="left", expand=True, fill="x", padx=(0, 3))
         
