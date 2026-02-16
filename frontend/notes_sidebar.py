@@ -29,6 +29,7 @@ from config import (
     AVAILABLE_TAGS, TAG_COLORS, COLOR_BTN_TEXT,
     RIGHT_SIDEBAR_WIDTH,
 )
+from utils.tooltip import ToolTip
 
 logger = logging.getLogger("LoopStation.NotesSidebar")
 
@@ -204,6 +205,7 @@ class NotesSidebar(ctk.CTkFrame):
             variable=self.add_tag_var
         )
         self.add_tag_menu.pack(side="left")
+        ToolTip(self.add_tag_menu, "Add a tag category (Lighting, Sound, etc.) to the current cue")
         
         # Container for tag cards
         self.cards_frame = ctk.CTkFrame(self.edit_frame, fg_color="transparent")
