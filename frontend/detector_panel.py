@@ -17,6 +17,7 @@ from config import (
     COLOR_BTN_PRIMARY, COLOR_BTN_WARNING, COLOR_BTN_SUCCESS,
     COLOR_BTN_DANGER, COLOR_BG_MEDIUM,
 )
+from utils.tooltip import ToolTip
 
 
 class DetectorPanel(ctk.CTkFrame):
@@ -45,6 +46,7 @@ class DetectorPanel(ctk.CTkFrame):
         )
         self.btn_mode.set("Find Loops")
         self.btn_mode.pack(side="left", padx=(0, 10))
+        ToolTip(self.btn_mode, "Switch between finding loop points and finding sections to cut")
         
         # Selection Button
         self.btn_select = ctk.CTkButton(
@@ -52,6 +54,7 @@ class DetectorPanel(ctk.CTkFrame):
             command=self._toggle_select, fg_color=COLOR_BTN_PRIMARY
         )
         self.btn_select.pack(side="left", padx=5)
+        ToolTip(self.btn_select, "Click then drag on the waveform to select a range to analyze")
         
         # Find/Analyze Button
         self.btn_find = ctk.CTkButton(
@@ -59,6 +62,7 @@ class DetectorPanel(ctk.CTkFrame):
             command=self.on_find, state="disabled", fg_color=COLOR_BTN_WARNING
         )
         self.btn_find.pack(side="left", padx=5)
+        ToolTip(self.btn_find, "Analyze the selected range for loop points or cut candidates")
         
         # Status Label
         self.status_lbl = ctk.CTkLabel(head, text="", text_color="gray")
@@ -89,6 +93,21 @@ class DetectorPanel(ctk.CTkFrame):
         self.status_lbl.configure(text="Analyzing audio...")
         self.btn_find.configure(state="disabled")
 
+    def reset(self):
+        """Fully reset the detector panel to its initial state.
+        
+        Called after 'Use' to clean up the workflow so the user
+        returns to normal mode without any stale UI.
+        """
+        # Reset button text
+        self.btn_select.configure(text="① Select Range", fg_color=COLOR_BTN_PRIMARY)
+        self.btn_find.configure(state="disabled")
+        self.status_lbl.configure(text="")
+        
+        # Clear results
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+
     def show_results(self, candidates):
         self.status_lbl.configure(text=f"Found {len(candidates)} loops")
         self.btn_find.configure(state="normal")
@@ -108,12 +127,16 @@ class DetectorPanel(ctk.CTkFrame):
             txt = f"{c.confidence}% | {c.duration:.2f}s"
             ctk.CTkLabel(row, text=txt, font=("Consolas", 11)).pack(side="left", padx=5)
             
-            ctk.CTkButton(
+            btn_use = ctk.CTkButton(
                 row, text="Use", width=40, height=20, fg_color=COLOR_BTN_SUCCESS,
                 command=lambda x=c: self.on_use(x)
-            ).pack(side="right", padx=2)
+            )
+            btn_use.pack(side="right", padx=2)
+            ToolTip(btn_use, "Create a vamp/cut from this candidate and return to cue sheet")
             
-            ctk.CTkButton(
+            btn_preview = ctk.CTkButton(
                 row, text="▶", width=30, height=20, fg_color=COLOR_BTN_PRIMARY,
                 command=lambda x=c: self.on_preview(x)
-            ).pack(side="right", padx=2)
+            )
+            btn_preview.pack(side="right", padx=2)
+            ToolTip(btn_preview, "Preview this loop candidate")
