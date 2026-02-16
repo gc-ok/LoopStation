@@ -96,12 +96,24 @@ def center_window(window, width, height):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 # =============================================================================
-# BOOTSTRAP SPLASH SCREEN (Fixed Spacing & Sizes)
+# BOOTSTRAP SPLASH SCREEN
 # =============================================================================
 class BootstrapSplash(tk.Toplevel):
+    """Splash screen with determinate progress bar and step descriptions."""
+    
+    STEPS = [
+        ("Initializing Audio Engine...", 40),
+        ("Loading User Interface...", 70),
+        ("Loading User Library...", 90),
+        ("Ready!", 100),
+    ]
+    
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
+        self._current_progress = 0
+        self._target_progress = 0
+        self._step_index = 0
         
         # 1. BORDERLESS
         self.overrideredirect(True)
@@ -118,19 +130,16 @@ class BootstrapSplash(tk.Toplevel):
         # Defaults (if no logo found)
         text_y_start = 0.40
         
-        # A. LOGO (Moved Up & Allowed to be Bigger)
+        # A. LOGO
         try:
             logo_path = get_asset_path("logo.png")
             
             if os.path.exists(logo_path):
-                # Load Image
                 original = Image.open(logo_path)
                 
-                # --- SMART RESIZE (Keep your preferred size) ---
                 target_width = 500   
                 target_height = 250  
                 
-                # Calculate ratio
                 ratio = min(target_width / original.width, target_height / original.height)
                 new_width = int(original.width * ratio)
                 new_height = int(original.height * ratio)
@@ -138,51 +147,92 @@ class BootstrapSplash(tk.Toplevel):
                 resized = original.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(resized)
                 
-                # Display Logo HIGHER (0.25)
                 logo_lbl = tk.Label(self, image=self.logo_img, bg=bg_color)
                 logo_lbl.place(relx=0.5, rely=0.25, anchor="center")
                 
-                # Push text DOWN significantly to avoid overlap
                 text_y_start = 0.55
                 
         except Exception as e:
             print(f"Could not load logo: {e}")
 
-        # B. TEXT (Fixed Overlap)
-        # Title
+        # B. TEXT
         tk.Label(self, text="LOOP STATION", font=("Segoe UI", 36, "bold"),
                  bg=bg_color, fg="#ffffff").place(relx=0.5, rely=text_y_start, anchor="center")
         
-        # Subtitle - Increased spacing from 0.06 to 0.10 to prevent overlap
         tk.Label(self, text="Professional Audio Looper", font=("Segoe UI", 12),
                  bg=bg_color, fg="#3b8ed0").place(relx=0.5, rely=text_y_start + 0.10, anchor="center")
         
-        # C. LOADING BAR (Pushed down slightly)
+        # C. PROGRESS BAR (Determinate)
         style = ttk.Style()
         style.theme_use('default')
         style.configure("Horizontal.TProgressbar", background="#3b8ed0", 
-                        troughcolor="#111111", bordercolor="#111111", thickness=6)
+                        troughcolor="#222222", bordercolor="#111111", thickness=6)
         
         self.progress = ttk.Progressbar(self, style="Horizontal.TProgressbar", 
-                                        mode='indeterminate', length=400)
-        self.progress.place(relx=0.5, rely=0.82, anchor="center")
-        self.progress.start(15)
+                                        mode='determinate', maximum=100, 
+                                        value=0, length=400)
+        self.progress.place(relx=0.5, rely=0.79, anchor="center")
         
-        # D. STATUS (Added width to fix ghosting text artifact)
-        self.status = tk.Label(self, text="Initializing...", font=("Consolas", 10),
-                               bg=bg_color, fg="#666666", width=60)
-        self.status.place(relx=0.5, rely=0.88, anchor="center")
+        # D. STEP STATUS
+        self.status = tk.Label(self, text="Starting up...", font=("Segoe UI", 11),
+                               bg=bg_color, fg="#888888", width=50)
+        self.status.place(relx=0.5, rely=0.85, anchor="center")
         
-        # E. FOOTER
+        # E. PERCENT LABEL
+        self.percent_label = tk.Label(self, text="0%", font=("Consolas", 9),
+                                      bg=bg_color, fg="#555555")
+        self.percent_label.place(relx=0.5, rely=0.91, anchor="center")
+        
+        # F. FIRST-RUN HINT
+        self.hint = tk.Label(self, text="This may take a moment on first launch",
+                             font=("Segoe UI", 9), bg=bg_color, fg="#333333")
+        self.hint.place(relx=0.5, rely=0.95, anchor="center")
+        
+        # G. FOOTER
         tk.Label(self, text="v1.0.0", font=("Segoe UI", 8),
                  bg=bg_color, fg="#333333").place(relx=0.98, rely=0.98, anchor="se")
 
-    def update_status(self, text):
+    def update_status(self, text, step=None):
+        """Update status text and advance progress to the next step target."""
         self.status.config(text=text)
-        self.update()
+        
+        if step is not None and step < len(self.STEPS):
+            self._step_index = step
+            _, target = self.STEPS[step]
+            self._target_progress = target
+        else:
+            # Auto-advance to next step
+            if self._step_index < len(self.STEPS):
+                _, target = self.STEPS[self._step_index]
+                self._target_progress = target
+                self._step_index += 1
+        
+        # Animate progress to target
+        self._animate_to_target()
+
+    def _animate_to_target(self):
+        """Smoothly animate the progress bar to the target value."""
+        if self._current_progress < self._target_progress:
+            # Move in increments for smooth animation
+            step_size = max(1, (self._target_progress - self._current_progress) // 8)
+            self._current_progress = min(self._current_progress + step_size, self._target_progress)
+            
+            self.progress['value'] = self._current_progress
+            self.percent_label.config(text=f"{self._current_progress}%")
+            self.update()
+            
+            if self._current_progress < self._target_progress:
+                self.after(30, self._animate_to_target)
 
     def finish(self):
-        self.progress.stop()
+        """Complete the progress bar and close."""
+        # Fill to 100%
+        self._target_progress = 100
+        self._current_progress = 100
+        self.progress['value'] = 100
+        self.percent_label.config(text="100%")
+        self.status.config(text="Ready!")
+        self.update()
         self.destroy()
 
 # =============================================================================
@@ -357,11 +407,14 @@ def main():
                 smart_sleep(app, 0.1)
                 app.initialize_audio_system()
                 
+                splash.update_status("Loading User Interface...")
+                smart_sleep(app, 0.3)
+                
                 splash.update_status("Loading User Library...")
-                smart_sleep(app, 0.4)
+                smart_sleep(app, 0.3)
                 
                 splash.update_status("Ready!")
-                smart_sleep(app, 0.4)
+                smart_sleep(app, 0.3)
 
                 splash.finish()
                 app.deiconify()
