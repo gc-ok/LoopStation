@@ -294,7 +294,7 @@ class LoopStationApp(ctk.CTk):
         btn_row.pack(fill="x", pady=(0, 6))
         
         btn_support = ctk.CTkButton(
-            btn_row, text="🙏🏼 Support", width=0, height=26,
+            btn_row, text="Consider Supporting", width=0, height=26,
             font=("Segoe UI", 10, "bold"),
             fg_color="#6b3fa0", hover_color="#8255b8",
             text_color="#ffffff", corner_radius=6,
@@ -1436,3 +1436,4 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
