@@ -25,6 +25,11 @@ import threading
 import subprocess
 import numpy as np
 
+# Suppress console window on Windows for subprocess calls
+_SUBPROCESS_FLAGS = {}
+if os.name == 'nt':
+    _SUBPROCESS_FLAGS['creationflags'] = subprocess.CREATE_NO_WINDOW
+
 # Add parent directory to path for config import
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -185,7 +190,8 @@ class AudioEngine:
                 cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE, 
-                timeout=10
+                timeout=10,
+               **_SUBPROCESS_FLAGS
             )
             
             if proc.returncode == 0 and proc.stdout.strip():
@@ -236,7 +242,7 @@ class AudioEngine:
             ]
             
             # Use stdout=self._temp_audio_file to write directly to disk
-            proc = subprocess.run(cmd, stdout=self._temp_audio_file, stderr=subprocess.PIPE, timeout=120)
+            proc = subprocess.run(cmd, stdout=self._temp_audio_file, stderr=subprocess.PIPE, timeout=120, **_SUBPROCESS_FLAGS)
             
             # Flush and close the file handle so memmap can safely take over
             self._temp_audio_file.flush()
@@ -832,3 +838,4 @@ class AudioEngine:
             # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
             # which is too heavy for random skips.
             self.seek_transport(target_pos)
+
