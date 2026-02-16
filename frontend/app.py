@@ -307,7 +307,7 @@ class LoopStationApp(ctk.CTk):
             font=("Segoe UI", 10, "bold"),
             fg_color=COLOR_BG_LIGHT, hover_color="#555555",
             text_color=COLOR_TEXT, corner_radius=6,
-            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/feedback")
+            command=lambda: webbrowser.open("https://forms.gle/9KjBi84wPXjhHMMt6")
         )
         btn_feedback.pack(side="left", expand=True, fill="x", padx=(3, 0))
         
@@ -1443,3 +1443,4 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
