@@ -46,9 +46,20 @@ class ToolTip:
         self._after_id = None
 
         # Bind hover events — use add="+" so we don't clobber existing bindings
-        widget.bind("<Enter>", self._on_enter, add="+")
-        widget.bind("<Leave>", self._on_leave, add="+")
-        widget.bind("<ButtonPress>", self._on_leave, add="+")
+        # FIX: Wrap in try/except because some CTk widgets (like SegmentedButton) 
+        # raise NotImplementedError for bind().
+        try:
+            widget.bind("<Enter>", self._on_enter, add="+")
+            widget.bind("<Leave>", self._on_leave, add="+")
+            widget.bind("<ButtonPress>", self._on_leave, add="+")
+        except NotImplementedError:
+            # Widget doesn't support binding. Fail gracefully so app doesn't crash.
+            # (The tooltip just won't show for this specific widget)
+            print(f"Warning: Tooltip not supported on {widget.__class__.__name__}")
+            return
+        except AttributeError:
+             # Some widgets might not even have a bind method
+            return
 
     def update_text(self, new_text):
         """Update the tooltip text dynamically."""
