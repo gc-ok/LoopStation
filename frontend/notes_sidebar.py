@@ -285,17 +285,29 @@ class NotesSidebar(ctk.CTkFrame):
                 next_type = item_type
                 break
         
-        old_id = self._current_item.id if self._current_item else None
+        old_current_id = self._current_item.id if self._current_item else None
+        old_next_id = self._next_item.id if self._next_item else None
+        
         self._current_item = current
         self._current_item_type = current_type
         self._next_item = next_item
         self._next_item_type = next_type
         
-        self._refresh_current(position)
-        self._refresh_next(position)
+        new_current_id = current.id if current else None
+        new_next_id = next_item.id if next_item else None
         
-        new_id = current.id if current else None
-        if new_id != old_id:
+        # Only rebuild the tag summary widgets when the item identity changes,
+        # NOT on every position tick — this prevents the visible flash/flicker.
+        if new_current_id != old_current_id:
+            self._refresh_current(position)
+        
+        if new_next_id != old_next_id:
+            self._refresh_next(position)
+        
+        # Update countdown (lightweight, no widget destruction)
+        self._update_countdown_only(position)
+        
+        if new_current_id != old_current_id:
             self._rebuild_tag_cards()
     
     def _update_countdown_only(self, position):
