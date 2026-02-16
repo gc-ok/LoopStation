@@ -82,6 +82,7 @@ class CueSheetPanel(ctk.CTkFrame):
         self._loops = []
         self._selected_loop_index = -1
         self._item_widgets = []
+        self._item_metadata = []  # (item_type, data, ref_id) per row
         self._current_position = 0.0
         
         self.on_toggle_skip = on_toggle_skip
@@ -184,25 +185,50 @@ class CueSheetPanel(ctk.CTkFrame):
             self._update_highlight(old_current, new_current)
     
     def _update_highlight(self, old_idx, new_idx):
-        """Update just the highlight styling without rebuilding widgets.
+        """Update just the highlight styling in-place without rebuilding widgets.
         
-        If the widget structure makes in-place updates too complex,
-        falls back to a full rebuild but with a rate limit.
+        Only touches rows whose highlight state actually changed,
+        preventing the flash/flicker caused by destroy-and-recreate.
         """
-        # For now, use a rate-limited rebuild. The key insight is that
-        # we skip rebuilds that come too fast (< 500ms apart) to prevent
-        # the widget destruction from eating clicks.
-        import time
-        now = time.time()
-        if not hasattr(self, '_last_rebuild_time'):
-            self._last_rebuild_time = 0
+        changed = old_idx.symmetric_difference(new_idx)
         
-        # Only rebuild at most twice per second
-        if now - self._last_rebuild_time < 0.5:
-            return
-        
-        self._last_rebuild_time = now
-        self._rebuild_list()
+        for idx in changed:
+            if idx >= len(self._item_widgets) or idx >= len(self._item_metadata):
+                # Safety: if indices are out of range, do a full rebuild once
+                self._rebuild_list()
+                return
+            
+            row = self._item_widgets[idx]
+            item_type, data, ref_id = self._item_metadata[idx]
+            is_current = idx in new_idx
+            
+            try:
+                if item_type == 'marker':
+                    if is_current:
+                        row.configure(fg_color="#3a3a1a", border_width=2, border_color=COLOR_MARKER)
+                    else:
+                        row.configure(fg_color="transparent", border_width=0)
+                        
+                elif item_type == 'vamp':
+                    is_selected = (ref_id == self._selected_loop_index)
+                    if is_selected and is_current:
+                        row.configure(fg_color="#2a4a2a", border_width=2, border_color="#66ff66")
+                    elif is_selected:
+                        row.configure(fg_color="#1a331a", border_width=1, border_color=COLOR_LOOP_REGION)
+                    elif is_current:
+                        row.configure(fg_color="#2a2a1a", border_width=2, border_color="#ffff00")
+                    else:
+                        row.configure(fg_color="transparent", border_width=0)
+                        
+                elif item_type == 'skip':
+                    if is_current:
+                        row.configure(border_width=1, border_color=COLOR_SKIP_REGION)
+                    else:
+                        row.configure(border_width=0)
+            except Exception:
+                # Widget was destroyed or invalid — fall back to full rebuild
+                self._rebuild_list()
+                return
 
     def _create_skip_row(self, skip, is_current=False):
         """Create a row for a Skip Region (Cut)."""
@@ -307,6 +333,7 @@ class CueSheetPanel(ctk.CTkFrame):
         for w in self._item_widgets:
             w.destroy()
         self._item_widgets.clear()
+        self._item_metadata = []  # Track (item_type, data, ref_id) per row
 
         # Build unified list of (sort_time, type, data, ref_id)
         # ref_id is loop_index for vamps, or object.id for skips
@@ -354,6 +381,7 @@ class CueSheetPanel(ctk.CTkFrame):
                 row = self._create_skip_row(data, is_current) # NEW
             
             self._item_widgets.append(row)
+            self._item_metadata.append((item_type, data, ref_id))
 
     def _format_time(self, seconds):
         """Format seconds as M:SS.ss"""
