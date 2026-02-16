@@ -45,6 +45,9 @@ from .vamp_settings import VampSettingsPanel
 from .vamp_modal import VampModal
 from .notes_sidebar import NotesSidebar
 
+# Tooltip utility
+from utils.tooltip import ToolTip
+
 # Web server (Phase 2)
 from backend.web_server import CueWebServer, SharedCueState, get_local_ip
 
@@ -301,15 +304,17 @@ class LoopStationApp(ctk.CTk):
             command=lambda: webbrowser.open("https://ko-fi.com/gceducationanalytics")
         )
         btn_support.pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ToolTip(btn_support, "Opens ko-fi.com in your browser to support the developer")
         
         btn_feedback = ctk.CTkButton(
             btn_row, text="💬 Feedback", width=0, height=26,
             font=("Segoe UI", 10, "bold"),
             fg_color=COLOR_BG_LIGHT, hover_color="#555555",
             text_color=COLOR_TEXT, corner_radius=6,
-            command=lambda: webbrowser.open("https://forms.gle/9KjBi84wPXjhHMMt6")
+            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/feedback")
         )
         btn_feedback.pack(side="left", expand=True, fill="x", padx=(3, 0))
+        ToolTip(btn_feedback, "Opens feedback form in your browser — share bugs, ideas, or requests")
         
         # Row 2: Brand link
         self.lbl_footer = ctk.CTkLabel(
@@ -318,6 +323,7 @@ class LoopStationApp(ctk.CTk):
         )
         self.lbl_footer.pack()
         self.lbl_footer.bind("<Button-1>", lambda e: webbrowser.open("https://www.gceducationanalytics.com"))
+        ToolTip(self.lbl_footer, "Opens gceducationanalytics.com in your browser")
         
         self.library = LibrarySidebar(
             self.sidebar_frame, on_song_select=self._on_song_select
@@ -339,6 +345,7 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._toggle_sidebar
         )
         self.btn_toggle.pack(side="left", padx=(0, 15))
+        ToolTip(self.btn_toggle, "Toggle song library sidebar")
 
         self.title_label = ctk.CTkLabel(
             header_frame, text="No song loaded",
@@ -374,6 +381,7 @@ class LoopStationApp(ctk.CTk):
             command=self._on_play_pause_toggle
         )
         self.btn_play.pack(side="left", padx=(15, 8), pady=10)
+        ToolTip(self.btn_play, "Play / Pause  (Space)")
         
         # Stop button
         self.btn_stop = ctk.CTkButton(
@@ -384,6 +392,7 @@ class LoopStationApp(ctk.CTk):
             command=self._on_stop
         )
         self.btn_stop.pack(side="left", padx=8, pady=10)
+        ToolTip(self.btn_stop, "Stop playback  (Esc)")
         
         # EXIT LOOP button (BIG, prominent, only enabled in loop mode)
         self.btn_exit_loop = ctk.CTkButton(
@@ -395,6 +404,7 @@ class LoopStationApp(ctk.CTk):
             command=self._on_exit_loop
         )
         self.btn_exit_loop.pack(side="left", padx=8, pady=10)
+        ToolTip(self.btn_exit_loop, "Exit the current loop at the next boundary  (E)")
         
         # Fade Exit button (smaller, next to EXIT)
         self.btn_fade_exit = ctk.CTkButton(
@@ -406,6 +416,7 @@ class LoopStationApp(ctk.CTk):
             command=lambda: self._on_fade_exit(FADE_EXIT_DURATION_MS)
         )
         self.btn_fade_exit.pack(side="left", padx=8, pady=10)
+        ToolTip(self.btn_fade_exit, "Fade out and exit the current loop  (F)")
         
         # Time display (right side)
         self.time_label = ctk.CTkLabel(
@@ -510,6 +521,7 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._toggle_right_sidebar
         )
         self.btn_toggle_right.pack(side="right", padx=(15, 0))
+        ToolTip(self.btn_toggle_right, "Toggle cue details sidebar  (N)")
         
         # Share button (Phase 2 - local network)
         self.btn_share = ctk.CTkButton(
@@ -520,6 +532,7 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._toggle_web_share
         )
         self.btn_share.pack(side="right", padx=(10, 0))
+        ToolTip(self.btn_share, "Share cue monitor over local network for backstage devices")
         
         # Keyboard shortcuts reference button
         btn_hotkeys = ctk.CTkButton(
@@ -530,6 +543,7 @@ class LoopStationApp(ctk.CTk):
             hover_color=COLOR_BG_LIGHT, command=self._show_hotkeys_modal
         )
         btn_hotkeys.pack(side="right", padx=(10, 0))
+        ToolTip(btn_hotkeys, "View keyboard shortcuts")
 
     # Add these methods to LoopStationApp class
 
@@ -1324,6 +1338,15 @@ class LoopStationApp(ctk.CTk):
         current = self.waveform.selection_mode_active
         new_state = not current
         self.waveform.set_selection_mode(new_state)
+        
+        # Keep detector panel button in sync
+        if new_state:
+            self.detector.btn_select.configure(text="Cancel Selection", fg_color=COLOR_BTN_DANGER)
+            self.status_label.configure(text="Drag on waveform to select a range for analysis")
+        else:
+            self.detector.btn_select.configure(text="① Select Range", fg_color=COLOR_BTN_PRIMARY)
+            self.status_label.configure(text="Ready")
+        
         return new_state
 
     def _on_selection_change(self, start_frac, end_frac):
@@ -1360,9 +1383,21 @@ class LoopStationApp(ctk.CTk):
         else:
             # Add as a LOOP region (Existing logic)
             self.app_state.set_loop_points(candidate.start, candidate.end)
+            self.status_label.configure(text=f"Vamp created: {candidate.duration:.2f}s loop")
             
+        # --- Full cleanup of the auto-detect workflow ---
+        # 1. Exit selection mode on waveform
         if self.waveform and self.waveform.selection_mode_active:
-            self._toggle_selection_mode()
+            self.waveform.set_selection_mode(False)
+
+        # 2. Reset the detector panel (button text + clear results)
+        self.detector.reset()
+
+        # 3. Collapse finder section, re-open cue section
+        if self.finder_section._is_open:
+            self.finder_section.toggle()
+        if not self.cue_section._is_open:
+            self.cue_section.toggle()
 
     def _preview_candidate(self, candidate):
         """Previewing a CUT is different - we play pre-roll then jump."""
@@ -1443,4 +1478,3 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
-
