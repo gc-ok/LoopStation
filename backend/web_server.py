@@ -65,7 +65,9 @@ class SharedCueState:
         self._state: Dict[str, Any] = {
             "song_name": "",
             "position": 0.0,
+            "song_duration": 0.0,
             "is_playing": False,
+            "is_paused": False,
             "is_looping": False,
             "current": None,   # {name, type, time, tag_notes}
             "next": None,      # {name, type, time, tag_notes, countdown}
@@ -128,7 +130,9 @@ class SharedCueState:
         self.update(
             song_name=app_state.current_song_name if app_state else "",
             position=position,
+            song_duration=app_state.song_length if app_state else 0.0,
             is_playing=app_state.is_playing() if app_state else False,
+            is_paused=(app_state.state.name == 'PAUSED') if app_state else False,
             is_looping=app_state.is_in_loop_mode() if app_state else False,
             current=current_dict,
             next=next_dict,
@@ -199,6 +203,7 @@ MONITOR_HTML = """<!DOCTYPE html>
   }
   .status-dot.playing { background: var(--green); animation: pulse 1.5s infinite; }
   .status-dot.looping { background: var(--blue); animation: pulse 0.8s infinite; }
+  .status-dot.paused { background: var(--yellow); }
   
   @keyframes pulse {
     0%, 100% { opacity: 1; }
@@ -350,7 +355,7 @@ MONITOR_HTML = """<!DOCTYPE html>
 <div class="content">
   <!-- BIG COUNTDOWN -->
   <div class="countdown-section">
-    <div class="countdown-label">NEXT CUE IN</div>
+    <div class="countdown-label" id="countdownLabel">NEXT CUE IN</div>
     <div class="countdown-value" id="countdown">--:--</div>
     <div class="next-name-preview" id="nextPreview"></div>
   </div>
@@ -374,6 +379,7 @@ let failCount = 0;
 // Interpolation state — smoothly tick between server polls
 let serverCountdown = null;   // Last countdown value from server
 let serverPosition = null;    // Last position value from server
+let serverDuration = 0;       // Song duration for end-of-song countdown
 let serverIsPlaying = false;
 let lastPollTime = 0;         // performance.now() when we last got data
 let lastNextName = '';
@@ -435,17 +441,22 @@ function animateCountdown() {
   const cdEl = document.getElementById('countdown');
   const posEl = document.getElementById('positionBar');
   
-  if (serverCountdown != null && serverIsPlaying) {
-    // Calculate elapsed time since last server update
+  if (serverIsPlaying) {
     const elapsed = (performance.now() - lastPollTime) / 1000;
-    
-    // Interpolate countdown (ticks down) and position (ticks up)
-    const smoothCd = Math.max(0, serverCountdown - elapsed);
     const smoothPos = serverPosition + elapsed;
-    
-    cdEl.textContent = formatCountdown(smoothCd);
-    cdEl.className = 'countdown-value' + (smoothCd <= 0.5 ? ' now' : smoothCd < 5 ? ' urgent' : smoothCd < 15 ? ' warn' : '');
     posEl.textContent = formatTime(smoothPos);
+    
+    if (serverCountdown != null) {
+      // Countdown to next cue
+      const smoothCd = Math.max(0, serverCountdown - elapsed);
+      cdEl.textContent = formatCountdown(smoothCd);
+      cdEl.className = 'countdown-value' + (smoothCd <= 0.5 ? ' now' : smoothCd < 5 ? ' urgent' : smoothCd < 15 ? ' warn' : '');
+    } else if (serverDuration > 0) {
+      // No next cue — countdown to song end
+      const remaining = Math.max(0, serverDuration - smoothPos);
+      cdEl.textContent = formatCountdown(remaining);
+      cdEl.className = 'countdown-value' + (remaining <= 0.5 ? ' now' : remaining < 5 ? ' urgent' : remaining < 15 ? ' warn' : '');
+    }
   }
   
   requestAnimationFrame(animateCountdown);
@@ -466,12 +477,16 @@ async function poll() {
     const dot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
     serverIsPlaying = data.is_playing || data.is_looping;
+    serverDuration = data.song_duration || 0;
     if (data.is_looping) {
       dot.className = 'status-dot looping';
       statusText.textContent = 'Looping';
     } else if (data.is_playing) {
       dot.className = 'status-dot playing';
       statusText.textContent = 'Playing';
+    } else if (data.is_paused) {
+      dot.className = 'status-dot paused';
+      statusText.textContent = 'Paused';
     } else {
       dot.className = 'status-dot';
       statusText.textContent = 'Stopped';
@@ -488,9 +503,11 @@ async function poll() {
     
     // Countdown — store for interpolation
     const cdEl = document.getElementById('countdown');
+    const cdLabel = document.getElementById('countdownLabel');
     const nextPreview = document.getElementById('nextPreview');
     if (data.next) {
       serverCountdown = data.next.countdown;
+      cdLabel.textContent = 'NEXT CUE IN';
       // Update display immediately (animation loop takes over between polls)
       if (!serverIsPlaying) {
         cdEl.textContent = formatCountdown(serverCountdown);
@@ -501,9 +518,17 @@ async function poll() {
       lastNextName = data.next.name;
     } else {
       serverCountdown = null;
-      cdEl.textContent = '--:--';
-      cdEl.className = 'countdown-value';
-      nextPreview.textContent = 'End of song';
+      cdLabel.textContent = 'SONG ENDS IN';
+      nextPreview.textContent = '';
+      // Show song-end countdown even on poll (animation loop handles smooth updates)
+      if (serverDuration > 0) {
+        const remaining = Math.max(0, serverDuration - data.position);
+        cdEl.textContent = formatCountdown(remaining);
+        cdEl.className = 'countdown-value' + (remaining <= 0.5 ? ' now' : remaining < 5 ? ' urgent' : remaining < 15 ? ' warn' : '');
+      } else {
+        cdEl.textContent = '--:--';
+        cdEl.className = 'countdown-value';
+      }
     }
     
     // Current card
