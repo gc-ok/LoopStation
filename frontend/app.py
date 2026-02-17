@@ -311,7 +311,7 @@ class LoopStationApp(ctk.CTk):
             font=("Segoe UI", 10, "bold"),
             fg_color=COLOR_BG_LIGHT, hover_color="#555555",
             text_color=COLOR_TEXT, corner_radius=6,
-            command=lambda: webbrowser.open("https://www.gceducationanalytics.com/feedback")
+            command=lambda: webbrowser.open("https://docs.google.com/forms/d/e/1FAIpQLSfR6c3-w6amZM0yICW4g3mId80S-NxKofN3dF7uVvinCxrOGA/viewform?usp=sharing&ouid=105646083626261044389")
         )
         btn_feedback.pack(side="left", expand=True, fill="x", padx=(3, 0))
         ToolTip(btn_feedback, "Opens feedback form in your browser — share bugs, ideas, or requests")
@@ -1489,5 +1489,6 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
 
 
