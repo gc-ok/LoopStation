@@ -1163,7 +1163,9 @@ class LoopStationApp(ctk.CTk):
         if self._web_server and self._web_server.running:
             self._shared_cue_state.update(
                 is_playing=is_playing,
+                is_paused=(state == PlaybackState.PAUSED),
                 is_looping=self.app_state.is_in_loop_mode() if self.app_state else False,
+                song_duration=self.app_state.song_length if self.app_state else 0.0,
             )
         
         if state == PlaybackState.STOPPED:
@@ -1487,4 +1489,5 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
 
