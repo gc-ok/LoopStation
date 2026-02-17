@@ -1294,6 +1294,15 @@ class LoopStationApp(ctk.CTk):
         )
         self.status_label.configure(text=f"Loaded: {duration:.1f}s")
         self.hide_loading()
+        # Immediately push fresh cue state to web server on song change
+        if self._web_server and self._web_server.running:
+            self._shared_cue_state.update_from_app(
+                self.app_state, 0.0,
+                self.notes_sidebar._current_item,
+                self.notes_sidebar._current_item_type,
+                self.notes_sidebar._next_item,
+                self.notes_sidebar._next_item_type,
+            )
 
     def _on_song_ended(self):
         self.status_label.configure(text="Song ended")
@@ -1478,3 +1487,4 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
