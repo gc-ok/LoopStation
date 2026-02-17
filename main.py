@@ -43,6 +43,7 @@ if False:
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
 
 import logging
+from logging.handlers import RotatingFileHandler
 import argparse
 import time
 from datetime import datetime
@@ -245,14 +246,23 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     else:
         log_dir = os.path.join(get_base_path(), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"loop_station_{timestamp}.log")
-    
+    log_file = os.path.join(log_dir, "loop_station.log")
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3
+    )
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(log_file)]
+        handlers=[logging.StreamHandler(sys.stdout), file_handler]
     )
     return logging.getLogger("LoopStation")
 
@@ -439,3 +449,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
