@@ -1382,7 +1382,7 @@ class LoopStationApp(ctk.CTk):
             self.status_label.configure(text=f"Cut created: {candidate.duration:.2f}s removed")
         else:
             # Add as a LOOP region (Existing logic)
-            self.app_state.set_loop_points(candidate.start, candidate.end)
+            self.app_state.add_loop(candidate.start, candidate.end)
             self.status_label.configure(text=f"Vamp created: {candidate.duration:.2f}s loop")
             
         # --- Full cleanup of the auto-detect workflow ---
