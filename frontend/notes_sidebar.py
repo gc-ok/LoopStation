@@ -330,6 +330,10 @@ class NotesSidebar(ctk.CTkFrame):
     # =========================================================================
     
     def _set_empty(self):
+        self._current_item = None
+        self._current_item_type = None
+        self._next_item = None
+        self._next_item_type = None
         self.current_icon.configure(text="--")
         self.current_name.configure(text="No active cue")
         self.current_time.configure(text="")
