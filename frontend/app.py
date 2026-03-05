@@ -1477,27 +1477,31 @@ class LoopStationApp(ctk.CTk):
         self._refresh_cue_sheet()
 
     def _refresh_cue_sheet(self):
-    """Schedule an update to the cue sheet rather than doing it instantly."""
-    if not self._pending_cue_refresh:
-        self._pending_cue_refresh = True
-        self.after(50, self._execute_cue_refresh) # Wait 50ms for events to settle
+        """Schedule an update to the cue sheet rather than doing it instantly."""
+        # Use getattr to prevent crashes if this is called before __init__ finishes
+        if not getattr(self, '_pending_cue_refresh', False):
+            self._pending_cue_refresh = True
+            self.after(50, self._execute_cue_refresh)
 
     def _execute_cue_refresh(self):
-    """Perform the actual destruction and recreation of widgets once."""
-    self._pending_cue_refresh = False
-    if self.app_state:
-        self.cue_sheet.update_data(
-            self.app_state.markers,
-            self.app_state.loops,
-            self.app_state.selected_loop_index,
-            getattr(self.app_state, 'skips', [])
-        )
+        """Perform the actual destruction and recreation of widgets once."""
+        self._pending_cue_refresh = False
+        
+        # Ensure app_state actually exists before trying to read from it
+        if getattr(self, 'app_state', None) is not None:
+            self.cue_sheet.update_data(
+                self.app_state.markers,
+                self.app_state.loops,
+                self.app_state.selected_loop_index,
+                getattr(self.app_state, 'skips', [])
+            )
 
     def _on_toggle_skip(self, skip_id):
         self.app_state.toggle_skip_active(skip_id)
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
 
 
 
