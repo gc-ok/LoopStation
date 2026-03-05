@@ -125,6 +125,7 @@ class LoopStationApp(ctk.CTk):
         self.msg_queue = queue.Queue()
 
         # --- FIX: WINDOWS TASKBAR ICON ---
+        self._pending_cue_refresh = False
         
         # 1. Separate this app from the generic "Python" taskbar group
         try:
@@ -1476,12 +1477,20 @@ class LoopStationApp(ctk.CTk):
         self._refresh_cue_sheet()
 
     def _refresh_cue_sheet(self):
-        """Update cue sheet with all 3 types of data."""
+    """Schedule an update to the cue sheet rather than doing it instantly."""
+    if not self._pending_cue_refresh:
+        self._pending_cue_refresh = True
+        self.after(50, self._execute_cue_refresh) # Wait 50ms for events to settle
+
+    def _execute_cue_refresh(self):
+    """Perform the actual destruction and recreation of widgets once."""
+    self._pending_cue_refresh = False
+    if self.app_state:
         self.cue_sheet.update_data(
             self.app_state.markers,
             self.app_state.loops,
             self.app_state.selected_loop_index,
-            getattr(self.app_state, 'skips', []) # Pass skips safely
+            getattr(self.app_state, 'skips', [])
         )
 
     def _on_toggle_skip(self, skip_id):
@@ -1489,6 +1498,7 @@ class LoopStationApp(ctk.CTk):
 
     def _on_delete_skip(self, skip_id):
         self.app_state.delete_skip(skip_id)
+
 
 
 
