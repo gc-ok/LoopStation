@@ -1,841 +1,1133 @@
 """
 Audio Engine for Loop Station.
 
-Handles all audio operations with two distinct modes:
+Playback runs through a ``sounddevice.OutputStream`` callback that pulls
+float32 blocks from a pure ``MixerCore`` (``backend/mixer_core.py``). All
+mixing, looping, holds, skips, fades and routing happen inside the callback,
+sample-accurately, with no wall-clock timing anywhere.
 
-1. TRANSPORT MODE: Uses pygame.mixer.music for streaming playback.
-   - Good for: playing whole song, scrubbing, finding loop points
+Decoding
+--------
+Every input file (the primary "mix" and each optional stem) is decoded ONCE
+by ffmpeg into a 16-bit stereo WAV at SAMPLE_RATE under
+<tempdir>/LoopStation and memory-mapped at its 'data' chunk. Stems are padded
+with silence so all buffers have the same length. Stale temp files from
+earlier runs are swept when the engine starts.
 
-2. LOOP MODE: Uses pygame.mixer.Sound with pre-sliced, crossfaded audio in RAM.
-   - Good for: seamless, mathematically-perfect looping
+Tempo / key
+-----------
+``set_tempo_pitch`` renders every stem offline with ffmpeg filters
+(``asetrate`` + ``aresample`` for pitch, a chain of ``atempo`` for tempo) in a
+background thread and hot-swaps the buffers inside the callback at the
+equivalent source position. Loop points, holds and skips are kept in source
+seconds, so cue times never move.
 
-The key insight is that pygame.mixer.Sound.play(loops=-1) handles looping
-at the C/SDL layer, removing Python from the timing-critical path.
+Events are delivered on a worker thread, never from the audio callback.
 
-This module has NO UI dependencies and can be tested independently.
+Device loss
+-----------
+The stream's ``finished_callback`` reports a stream that ended without us
+closing it ("device_error"); output underflows are counted
+(``underflow_count``) and ``frames_rendered`` lets a watchdog notice a
+callback that stopped running. ``restart_stream()`` reopens the stream on the
+current device (falling back to the system default) and playback resumes at
+the same sample because all transport state lives in the core.
+
+This module has NO UI dependencies and can be tested without a device by
+passing ``stream_factory`` (see tests/helpers_audio.py).
 """
 
+import gc
 import os
-import sys
-import time
+import inspect
+import uuid
 import wave
+import struct
 import logging
 import tempfile
 import threading
 import subprocess
 import numpy as np
 
+from config import (
+    SAMPLE_RATE, CHANNELS, LOOP_CROSSFADE_MS, FADE_EXIT_DURATION_MS,
+    TEMP_DIR_NAME, FFMPEG_DECODE_TIMEOUT_S,
+    AUDIO_BLOCK_SIZE, DECLICK_MS, TEMPO_MIN, TEMPO_MAX, SEMITONES_MAX,
+)
+from .mixer_core import (
+    MixerCore, StemInfo, build_loop_body, is_click_stem, ROUTING_MODES,
+)
+
+__all__ = [
+    "AudioEngine", "MixerCore", "StemInfo", "build_loop_body", "is_click_stem",
+    "ROUTING_MODES", "parse_wav_data_chunk", "sweep_stale_temp_files",
+    "get_temp_dir", "atempo_chain", "build_tempo_pitch_filter", "TEMP_FILE_PREFIX",
+]
+
+try:
+    import sounddevice as sd
+except Exception:  # pragma: no cover - PortAudio missing on this machine
+    sd = None
+
+logger = logging.getLogger("LoopStation.AudioEngine")
+
 # Suppress console window on Windows for subprocess calls
 _SUBPROCESS_FLAGS = {}
 if os.name == 'nt':
     _SUBPROCESS_FLAGS['creationflags'] = subprocess.CREATE_NO_WINDOW
 
-# Add parent directory to path for config import
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+# Prefix for every temp file this engine creates (used by the stale sweep).
+TEMP_FILE_PREFIX = "loopstation_"
 
-import pygame
-from config import (
-    SAMPLE_RATE, CHANNELS, MIXER_BUFFER_SIZE,
-    LOOP_CROSSFADE_MS, MIN_LOOP_DURATION,
-    EXIT_PATCH_DURATION_MS, EXIT_PATCH_FADE_IN_MS, EXIT_PATCH_FADE_OUT_MS,
-    TRANSPORT_RESUME_OFFSET_MS, FADE_EXIT_DURATION_MS,
-)
+_STOP_EVENTS = object()
 
-logger = logging.getLogger("LoopStation.AudioEngine")
 
+# =============================================================================
+# MODULE-LEVEL HELPERS (pure functions, unit-testable without a device)
+# =============================================================================
+
+def get_temp_dir():
+    """Return (and create) the dedicated temp directory for decoded audio."""
+    path = os.path.join(tempfile.gettempdir(), TEMP_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def sweep_stale_temp_files(temp_dir, keep_pid=None):
+    """
+    Delete leftover decoded-audio files from previous runs.
+
+    Files that are still locked (another running instance, or a memmap that
+    could not be released last time) are skipped silently and retried on the
+    next start. Files belonging to ``keep_pid`` are never touched.
+
+    Returns:
+        Number of files removed.
+    """
+    removed = 0
+    try:
+        names = os.listdir(temp_dir)
+    except OSError:
+        return 0
+
+    own_prefix = f"{TEMP_FILE_PREFIX}{keep_pid}_" if keep_pid is not None else None
+    for name in names:
+        if not name.startswith(TEMP_FILE_PREFIX):
+            continue
+        if own_prefix and name.startswith(own_prefix):
+            continue
+        full = os.path.join(temp_dir, name)
+        try:
+            os.unlink(full)
+            removed += 1
+        except OSError as e:
+            logger.debug(f"Stale temp file still in use, skipping: {name} ({e})")
+    if removed:
+        logger.info(f"Swept {removed} stale temp file(s) from {temp_dir}")
+    return removed
+
+
+def parse_wav_data_chunk(path):
+    """
+    Walk the RIFF chunk list of a WAV file and locate the PCM payload.
+
+    Does NOT assume a 44-byte header: ffmpeg frequently writes a LIST/INFO
+    chunk before 'data', and WAVE_FORMAT_EXTENSIBLE headers are longer.
+
+    Returns:
+        dict with keys data_offset, data_size, channels, sample_rate,
+        bits_per_sample, format_tag, frames.
+
+    Raises:
+        ValueError if the file is not a RIFF/WAVE file or lacks fmt/data chunks.
+    """
+    file_size = os.path.getsize(path)
+    fmt = None
+    data = None
+
+    with open(path, 'rb') as f:
+        header = f.read(12)
+        if len(header) < 12 or header[:4] not in (b'RIFF', b'RF64') or header[8:12] != b'WAVE':
+            raise ValueError(f"Not a RIFF/WAVE file: {path}")
+
+        pos = 12
+        while pos + 8 <= file_size:
+            f.seek(pos)
+            chunk_header = f.read(8)
+            if len(chunk_header) < 8:
+                break
+            chunk_id = chunk_header[:4]
+            chunk_size = struct.unpack('<I', chunk_header[4:8])[0]
+            body = pos + 8
+
+            if chunk_id == b'fmt ':
+                raw = f.read(min(chunk_size, 40))
+                if len(raw) < 16:
+                    raise ValueError("Truncated 'fmt ' chunk")
+                format_tag, channels, sample_rate, _, _, bits = struct.unpack('<HHIIHH', raw[:16])
+                if format_tag == 0xFFFE and len(raw) >= 26:
+                    # WAVE_FORMAT_EXTENSIBLE: real format tag is the first
+                    # two bytes of the SubFormat GUID.
+                    format_tag = struct.unpack('<H', raw[24:26])[0]
+                fmt = {
+                    'format_tag': format_tag,
+                    'channels': channels,
+                    'sample_rate': sample_rate,
+                    'bits_per_sample': bits,
+                }
+            elif chunk_id == b'data':
+                # ffmpeg writes 0xFFFFFFFF when it could not seek back to patch
+                # the size; RF64 files store the real size elsewhere. Either
+                # way the payload runs to the end of the file.
+                if chunk_size == 0xFFFFFFFF or body + chunk_size > file_size:
+                    chunk_size = file_size - body
+                data = (body, chunk_size)
+                break
+
+            pos = body + chunk_size + (chunk_size & 1)  # chunks are word-aligned
+
+    if fmt is None:
+        raise ValueError("WAV file has no 'fmt ' chunk")
+    if data is None:
+        raise ValueError("WAV file has no 'data' chunk")
+
+    bytes_per_frame = max(1, fmt['channels'] * (fmt['bits_per_sample'] // 8))
+    result = dict(fmt)
+    result['data_offset'] = data[0]
+    result['data_size'] = data[1]
+    result['frames'] = data[1] // bytes_per_frame
+    return result
+
+
+def atempo_chain(factor):
+    """Split a speed factor into ffmpeg ``atempo`` factors, each in [0.5, 2]."""
+    factor = float(factor)
+    if factor <= 0:
+        raise ValueError("tempo factor must be positive")
+    chain = []
+    while factor > 2.0:
+        chain.append(2.0)
+        factor /= 2.0
+    while factor < 0.5:
+        chain.append(0.5)
+        factor /= 0.5
+    if abs(factor - 1.0) > 1e-6:
+        chain.append(factor)
+    return chain
+
+
+def build_tempo_pitch_filter(tempo_ratio, semitones, sample_rate=SAMPLE_RATE):
+    """
+    ffmpeg ``-af`` string for a tempo/pitch render, or None for identity.
+
+    Pitch: ``asetrate=SR*2^(semi/12),aresample=SR`` (changes speed by the
+    same factor), then ``atempo`` factors so that the final playback speed
+    equals ``tempo_ratio``.
+    """
+    parts = []
+    speed = float(tempo_ratio)
+    if abs(float(semitones)) > 1e-9:
+        pitch = 2.0 ** (float(semitones) / 12.0)
+        new_rate = int(round(sample_rate * pitch))
+        actual_pitch = new_rate / sample_rate
+        parts.append(f"asetrate={new_rate}")
+        parts.append(f"aresample={int(sample_rate)}")
+        speed = speed / actual_pitch
+    for f in atempo_chain(speed):
+        parts.append(f"atempo={f:.6f}")
+    return ",".join(parts) if parts else None
+
+
+# =============================================================================
+# ENGINE
+# =============================================================================
 
 class AudioEngine:
     """
-    Manages audio playback with seamless looping capabilities.
-    
-    This class is UI-agnostic and can be used independently for testing.
-    
-    Usage:
-        engine = AudioEngine()
-        engine.load_file("song.mp3")
-        engine.set_loop_points(10.0, 20.0)  # Loop from 10s to 20s
-        engine.play_transport(0)  # Start playing
-        # ... later, when approaching loop end ...
-        engine.start_loop_mode()  # Switch to seamless looping
-        # ... when user wants to exit loop ...
-        engine.execute_loop_exit()  # Exit smoothly back to transport
-    """
-    
-    def __init__(self, ffmpeg_path="ffmpeg"):
-        """
-        Initialize the audio engine.
-        
-        Args:
-            ffmpeg_path: Path to ffmpeg executable for audio conversion
-        """
-        self.ffmpeg_path = ffmpeg_path
+    Device-facing wrapper around ``MixerCore``.
 
-        self.SAMPLE_RATE = SAMPLE_RATE
-        
-        # Initialize pygame mixer with low latency buffer
-        pygame.mixer.init(
-            frequency=SAMPLE_RATE,
-            size=-16,
-            channels=CHANNELS,
-            buffer=MIXER_BUFFER_SIZE
-        )
-        
-        # Audio data storage
+    Usage:
+        engine = AudioEngine(ffmpeg_path="ffmpeg")
+        engine.on_event(lambda name, payload: ...)
+        engine.load_file("song.mp3", {"click": "song.stems/click.wav"})
+        engine.arm_loop(10.0, 20.0)       # vamp entered exactly at 20.0 s
+        engine.play_transport(0.0)
+        engine.queue_loop_exit("cut")     # leave at the next wrap
+    """
+
+    def __init__(self, ffmpeg_path="ffmpeg", device=None, sample_rate=SAMPLE_RATE,
+                 block_size=AUDIO_BLOCK_SIZE, stream_factory=None):
+        self.ffmpeg_path = ffmpeg_path
+        self.SAMPLE_RATE = int(sample_rate)
+        self.block_size = int(block_size)
+        self._stream_factory = stream_factory or self._default_stream_factory
+        self._device = device
+
+        self.core = MixerCore(self.SAMPLE_RATE, DECLICK_MS)
+        self.lock = self.core.lock
+
+        # Dedicated temp directory; sweep leftovers from earlier runs
+        self.temp_dir = get_temp_dir()
+        sweep_stale_temp_files(self.temp_dir, keep_pid=os.getpid())
+
+        # Audio data
         self.current_file_path = None
-        self.raw_audio_data = None  # Full song as numpy array (int16, stereo)
+        self.raw_audio_data = None      # "mix" stem int16 (frames, 2) memmap
         self.song_length = 0.0
-        
-        # Loop sound objects (pre-baked in RAM)
-        self.loop_sound = None           # The seamless loop Sound object
-        self.loop_channel = None         # Channel playing the loop
-        self.exit_patch_sound = None     # Audio snippet for smooth exit
-        
-        # Loop parameters (in seconds)
-        self.loop_in = 0.0
-        self.loop_out = 0.0
-        self.loop_duration = 0.0
-        
-        # State tracking
-        self.mode = "transport"  # "transport" or "loop"
-        self.is_playing = False
-        self.is_paused = False
-        self.transport_offset = 0.0  # Where transport playback started from
-        
-        # Loop playback timing
-        self.loop_start_timestamp = 0.0  # time.time() when loop started
-        
-        # Thread safety - use a single RLock for all state
-        self.lock = threading.RLock()
-        
-        # Generation state with versioning for thread safety
-        self._generation_thread = None
-        self._generation_lock = threading.Lock()
-        self._loop_ready = False
-        self._generation_id = 0  # Incremented each time we request generation
-        
+        self._stem_sources = {}         # name -> {"path": wav path, "data": memmap}
+        self._temp_paths = []           # decoded/padded files we own
+        self._render_paths = []         # rendered files in use (or retiring)
+        self._retired_paths = []        # rendered files no longer wanted
+
+        # Tempo / key
+        self._tempo_pitch = (1.0, 0.0)
+        self._render_gen = 0
+        self._render_thread = None
+        self._closed = False
+        self._render_lock = threading.RLock()
+
+        # Events
+        self._callbacks = []
+        self._event_thread = threading.Thread(
+            target=self._event_loop, name="AudioEngineEvents", daemon=True)
+        self._event_thread.start()
+
+        # Stream
+        self._stream = None
+        self._stream_channels = 0
+        self._stream_device = None
+        self._latency_frames = 0
+        self._callback_error_logged = False
+        self._stream_lock = threading.RLock()   # open/close/restart (never the core lock)
+        self._stream_token = 0      # identifies the current stream for finished_callback
+        self._stream_lost = False   # the current stream finished on its own
+        self._underflows = 0
+        self._last_stream_error = None
+        self._open_stream()
+
         logger.info("AudioEngine initialized")
-    
+
+    # =========================================================================
+    # EVENTS
+    # =========================================================================
+
+    def on_event(self, callback):
+        """Register ``callback(name, payload)``; called on a worker thread."""
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    def remove_event_callback(self, callback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    def _emit(self, _event, /, **payload):
+        self.core.events.put((_event, payload))
+
+    def _event_loop(self):
+        q = self.core.events
+        while True:
+            item = q.get()
+            if item is _STOP_EVENTS:
+                break
+            name, payload = item
+            for cb in list(self._callbacks):
+                try:
+                    cb(name, dict(payload))
+                except Exception:
+                    logger.exception(f"Event callback failed for {name}")
+
+    # =========================================================================
+    # DEVICES / STREAM
+    # =========================================================================
+
+    @staticmethod
+    def _device_entry(index, info, default_index):
+        hostapi = info.get('hostapi')
+        hostapi_name = None
+        if sd is not None and hostapi is not None:
+            try:
+                hostapi_name = sd.query_hostapis(hostapi)['name']
+            except Exception:
+                hostapi_name = None
+        return {
+            'index': index,
+            'name': info.get('name'),
+            'channels': int(info.get('max_output_channels', 0)),
+            'default': index == default_index,
+            'hostapi': hostapi_name,
+        }
+
+    def _preferred_default_device(self):
+        """WASAPI default output if present, else PortAudio's default."""
+        if sd is None:
+            return None
+        try:
+            for api in sd.query_hostapis():
+                if 'wasapi' in str(api.get('name', '')).lower():
+                    idx = api.get('default_output_device', -1)
+                    if idx is not None and idx >= 0:
+                        return int(idx)
+        except Exception:
+            pass
+        try:
+            dev = sd.default.device
+            out = dev[1] if isinstance(dev, (list, tuple)) else dev
+            if out is not None and int(out) >= 0:
+                return int(out)
+        except Exception:
+            pass
+        return None
+
+    def list_output_devices(self):
+        if sd is None:
+            return []
+        default_index = self._preferred_default_device()
+        out = []
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            logger.warning(f"query_devices failed: {e}")
+            return []
+        for i, info in enumerate(devices):
+            if int(info.get('max_output_channels', 0)) <= 0:
+                continue
+            out.append(self._device_entry(i, info, default_index))
+        return out
+
+    def get_output_device(self):
+        if self._stream is None or sd is None:
+            return None
+        idx = self._stream_device
+        if idx is None:
+            idx = self._preferred_default_device()
+        if idx is None:
+            return None
+        try:
+            info = sd.query_devices(idx)
+        except Exception:
+            return None
+        return self._device_entry(idx, info, self._preferred_default_device())
+
+    def set_output_device(self, index):
+        """
+        Switch output device (None = system default); restarts the stream.
+        If the new device cannot be opened the previous device is reopened
+        and RuntimeError is raised.
+        """
+        with self._stream_lock:
+            previous = self._device
+            self._device = None if index is None else int(index)
+            if self._restart_stream(emit_error=False):
+                return
+            message = self._last_stream_error or "could not open output device"
+            # Keep a working device rather than a broken one.
+            self._device = previous
+            self._restart_stream()
+            raise RuntimeError(f"Output device {index!r} unavailable: {message}")
+
+    def _default_stream_factory(self, callback, channels, sample_rate, block_size,
+                                finished_callback=None):
+        if sd is None:
+            raise RuntimeError("sounddevice/PortAudio is not available")
+        device = self._device if self._device is not None else self._preferred_default_device()
+        attempts = [device]
+        if self._device is None and device is not None:
+            attempts.append(None)   # PortAudio default as a fallback
+        last_err = None
+        for dev in attempts:
+            kwargs = dict(device=dev, channels=channels, samplerate=sample_rate,
+                          blocksize=block_size, dtype='float32', callback=callback)
+            if finished_callback is not None:
+                kwargs['finished_callback'] = finished_callback
+            try:
+                if dev is not None and self._is_wasapi(dev) and hasattr(sd, 'WasapiSettings'):
+                    try:
+                        kwargs['extra_settings'] = sd.WasapiSettings(auto_convert=True)
+                    except TypeError:
+                        pass
+                stream = sd.OutputStream(**kwargs)
+                self._stream_device = dev
+                return stream
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Could not open output device {dev!r}: {e}")
+        raise RuntimeError(f"No usable output device: {last_err}")
+
+    @staticmethod
+    def _is_wasapi(device):
+        try:
+            info = sd.query_devices(device)
+            return 'wasapi' in str(sd.query_hostapis(info['hostapi'])['name']).lower()
+        except Exception:
+            return False
+
+    def _factory_accepts_finished_callback(self):
+        try:
+            params = inspect.signature(self._stream_factory).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(p.name == 'finished_callback' or p.kind == p.VAR_KEYWORD for p in params)
+
+    def _make_finished_callback(self, token):
+        def finished():
+            self._on_stream_finished(token)
+        return finished
+
+    def _on_stream_finished(self, token):
+        """The stream ended (PortAudio thread). Closed by us, or a lost device?"""
+        if token != self._stream_token or self._stream is None or self._stream_lost:
+            return  # we closed it ourselves (or it was already reported)
+        self._stream_lost = True
+        logger.error("Audio output stream stopped unexpectedly (device lost?)")
+        self._emit("device_error", message="audio output stream stopped unexpectedly "
+                                           "(device disconnected?)")
+
+    def _open_stream(self, emit_error=True):
+        channels = self.core.output_channels
+        with self._stream_lock:
+            if self._closed:
+                return False
+            self._stream_token += 1
+            token = self._stream_token
+            try:
+                if self._factory_accepts_finished_callback():
+                    stream = self._stream_factory(
+                        self._callback, channels, self.SAMPLE_RATE, self.block_size,
+                        finished_callback=self._make_finished_callback(token))
+                else:
+                    stream = self._stream_factory(
+                        self._callback, channels, self.SAMPLE_RATE, self.block_size)
+                self._stream = stream
+                self._stream_lost = False
+                stream.start()
+            except Exception as e:
+                logger.error(f"Audio output unavailable: {e}")
+                failed, self._stream = self._stream, None
+                self._stream_token += 1     # ignore finished_callback of the failed stream
+                if failed is not None:
+                    try:
+                        failed.close()
+                    except Exception:
+                        pass
+                self._stream_channels = 0
+                self._latency_frames = 0
+                self._last_stream_error = str(e)
+                if emit_error:
+                    self._emit("device_error", message=str(e))
+                return False
+            self._stream_channels = channels
+            self._last_stream_error = None
+            self._callback_error_logged = False
+            latency = getattr(stream, 'latency', 0.0)
+            try:
+                if isinstance(latency, (tuple, list)):
+                    latency = latency[-1]
+                self._latency_frames = max(0, int(float(latency) * self.SAMPLE_RATE))
+            except Exception:
+                self._latency_frames = 0
+        logger.info(f"Output stream open: {channels} ch, {self.SAMPLE_RATE} Hz, "
+                    f"block {self.block_size}, latency {self._latency_frames} frames")
+        return True
+
+    def _close_stream(self):
+        with self._stream_lock:
+            self._stream_token += 1      # its finished_callback is now ours, not a loss
+            stream, self._stream = self._stream, None
+            self._stream_channels = 0
+            self._stream_lost = False
+            if stream is None:
+                return
+            for meth in ('stop', 'close'):
+                try:
+                    getattr(stream, meth)()
+                except Exception as e:
+                    logger.debug(f"stream.{meth}() failed: {e}")
+
+    def _restart_stream(self, emit_error=True):
+        with self._stream_lock:
+            self._close_stream()
+            return self._open_stream(emit_error=emit_error)
+
+    def _ensure_stream(self, emit_error=True):
+        """Open/reopen the stream if missing or the channel count changed."""
+        with self._stream_lock:
+            if self._stream is None:
+                return self._open_stream(emit_error=emit_error)
+            if self._stream_channels != self.core.output_channels:
+                return self._restart_stream(emit_error=emit_error)
+            return True
+
+    def restart_stream(self):
+        """
+        Reopen the output stream on the current device, falling back to the
+        system default (which then becomes the selected device). The core is
+        untouched, so playback resumes at the same sample. Emits
+        "device_restored" {name} on success, "device_error" on failure.
+        """
+        with self._stream_lock:
+            ok = self._restart_stream(emit_error=False)
+            if not ok and self._device is not None:
+                logger.warning(f"Output device {self._device!r} unavailable; "
+                               "falling back to the system default")
+                preferred = self._device
+                self._device = None
+                ok = self._restart_stream(emit_error=False)
+                if not ok:
+                    self._device = preferred
+            if not ok:
+                self._emit("device_error",
+                           message=self._last_stream_error or "no usable output device")
+                return False
+            info = self.get_output_device()
+            name = (info or {}).get('name') or "system default"
+        logger.info(f"Output stream restored on {name!r}")
+        self._emit("device_restored", name=name)
+        return True
+
+    def is_stream_active(self):
+        """True while an output stream is open, started and not lost."""
+        stream = self._stream
+        if stream is None or self._stream_lost:
+            return False
+        try:
+            return bool(getattr(stream, 'active', True))
+        except Exception:
+            return False
+
+    @property
+    def frames_rendered(self):
+        """Frames rendered by the callback so far (monotonic; watchdog)."""
+        return self.core.frames_rendered
+
+    @property
+    def underflow_count(self):
+        """Output underflows reported in the stream callback status."""
+        return self._underflows
+
+    def _callback(self, outdata, frames, time_info, status):
+        if status is not None and getattr(status, 'output_underflow', False):
+            self._underflows += 1
+        try:
+            outdata[:] = self.core.render(frames)
+        except Exception as e:
+            outdata.fill(0)
+            if not self._callback_error_logged:
+                self._callback_error_logged = True
+                logger.exception("Render failed inside the audio callback")
+                self._emit("device_error", message=f"render failed: {e}")
+
+    # ---- routing
+
+    def _change_routing(self, apply, restore, what):
+        """
+        Apply a routing change; if a working stream cannot be reopened with
+        the new channel count, restore the previous routing, reopen, and
+        raise RuntimeError. (Without a working stream before the change
+        there is nothing to protect: the change is kept.)
+        """
+        with self._stream_lock:
+            had_stream = self._stream is not None and not self._stream_lost
+            apply()
+            if self._ensure_stream(emit_error=not had_stream) or not had_stream:
+                return
+            message = self._last_stream_error or "could not open output stream"
+            restore()
+            self._ensure_stream()
+            raise RuntimeError(f"{what} not supported by the output device: {message}")
+
+    def set_routing(self, mode):
+        """Raises RuntimeError (routing reverted) if the device cannot do it."""
+        previous = self.core.get_routing()["mode"]
+        self._change_routing(lambda: self.core.set_routing(mode),
+                             lambda: self.core.set_routing(previous),
+                             f"Routing {mode!r}")
+
+    def set_channel_map(self, mix=(0, 1), click=(2, 3)):
+        """Raises RuntimeError (map reverted) if the device cannot do it."""
+        previous = self.core.get_routing()["channel_map"]
+        self._change_routing(lambda: self.core.set_channel_map(mix, click),
+                             lambda: self.core.set_channel_map(previous["mix"], previous["click"]),
+                             "Channel map")
+
+    def get_routing(self):
+        return self.core.get_routing()
+
     # =========================================================================
     # FILE LOADING
     # =========================================================================
-    
-    def load_file(self, path):
+
+    def load_file(self, path, stem_paths=None):
         """
-        Load an audio file for playback.
-        
-        Args:
-            path: Path to audio file
-            
+        Decode ``path`` (stem "mix") and each ``stem_paths[name]`` to WAV
+        temp files, memmap them and hand them to the mixer.
+
         Returns:
-            Tuple of (song_duration, sync_ratio)
-            sync_ratio is used to align waveform with audio if they differ slightly
+            (duration_seconds, 1.0)   # second value kept for compatibility
         """
-        self.cleanup()
+        if self._closed:
+            raise RuntimeError("Audio engine is closed")
         logger.info(f"=== LOADING FILE: {os.path.basename(path)} ===")
         self.stop()
+        self._release_audio()
         self.current_file_path = path
-        self._loop_ready = False
-        self.loop_sound = None
-        self.exit_patch_sound = None
-        
-        # Load into pygame.mixer.music for transport mode
-        pygame.mixer.music.load(path)
-        logger.debug("Loaded into pygame.mixer.music (transport mode)")
-        
-        # Get duration using ffprobe (fast, no memory spike)
-        self.song_length = self._get_duration_ffprobe(path)
-        if self.song_length <= 0:
-            # Fallback: load as Sound to get length (slow but reliable)
-            logger.warning("ffprobe failed, falling back to pygame.mixer.Sound for duration")
-            temp_sound = pygame.mixer.Sound(path)
-            self.song_length = temp_sound.get_length()
-            del temp_sound
-        logger.info(f"Song duration: {self.song_length:.2f}s")
-        
-        # Load raw audio data into memory for slicing
-        self._load_raw_audio(path)
-        
-        # Calculate sync ratio (for waveform alignment)
-        sync_ratio = 1.0
-        if self.raw_audio_data is not None:
-            raw_duration = len(self.raw_audio_data) / SAMPLE_RATE
-            if abs(raw_duration - self.song_length) > 0.1:
-                sync_ratio = self.song_length / raw_duration
-                logger.debug(f"Sync ratio: {sync_ratio:.4f}")
-        
-        return self.song_length, sync_ratio
-    
-    def _get_duration_ffprobe(self, path):
-        """
-        Get audio duration using ffprobe. Fast, no memory spike.
-        
-        Args:
-            path: Path to audio file
-            
-        Returns:
-            Duration in seconds, or 0.0 on failure
-        """
-        try:
-            # Derive ffprobe path from ffmpeg path
-            ffprobe_path = self.ffmpeg_path.replace("ffmpeg", "ffprobe")
-            
-            cmd = [
-                ffprobe_path,
-                '-v', 'quiet',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                path
-            ]
-            proc = subprocess.run(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                timeout=10,
-               **_SUBPROCESS_FLAGS
-            )
-            
-            if proc.returncode == 0 and proc.stdout.strip():
-                duration = float(proc.stdout.strip())
-                logger.debug(f"ffprobe duration: {duration:.3f}s")
-                return duration
-            else:
-                logger.warning(f"ffprobe returned non-zero or empty output")
-                return 0.0
-                
-        except FileNotFoundError:
-            logger.warning("ffprobe not found, will use fallback")
-            return 0.0
-        except Exception as e:
-            logger.warning(f"ffprobe error: {e}")
-            return 0.0
-    
-    def _load_raw_audio(self, path):
-        """
-        Load audio data using memory mapping to prevent RAM spikes.
-        Streams ffmpeg output to a temporary file, then maps it.
-        """
-        logger.debug("Loading raw audio data via memory map...")
-        
-        # Clean up previous temp file if it exists
-        if hasattr(self, '_temp_audio_file') and self._temp_audio_file:
+
+        decoded = {"mix": self._decode(path)}
+        for name, stem_path in (stem_paths or {}).items():
+            if name == "mix" or not stem_path:
+                continue
             try:
-                self._temp_audio_file.close()
-                os.unlink(self._temp_audio_path)
+                decoded[name] = self._decode(stem_path)
             except Exception as e:
-                logger.warning(f"Failed to cleanup old temp file: {e}")
-        
-        self.raw_audio_data = None
-        self._temp_audio_file = None
-        self._temp_audio_path = None
+                logger.error(f"Stem {name!r} could not be decoded, skipping: {e}")
 
+        infos = {name: parse_wav_data_chunk(p) for name, p in decoded.items()}
+        target = max(info['frames'] for info in infos.values())
+        if target <= 0:
+            raise ValueError("Decoded audio is empty")
+        for name, info in infos.items():
+            if info['frames'] < target:
+                decoded[name] = self._pad_wav(decoded[name], info, target)
+                infos[name] = parse_wav_data_chunk(decoded[name])
+
+        buffers = {}
+        for name, p in decoded.items():
+            buffers[name] = self._map_wav(p, infos[name])
+            self._stem_sources[name] = {"path": p, "data": buffers[name]}
+
+        with self._render_lock:
+            if self._closed:
+                buffers.clear()
+                self._release_audio_locked()
+                raise RuntimeError("Audio engine closed while the song was loading")
+            self.core.set_stems(buffers)
+            self.raw_audio_data = buffers["mix"]
+            self.song_length = target / self.SAMPLE_RATE
+            self._tempo_pitch = (1.0, 0.0)
+            self._ensure_stream()
+        logger.info(f"Song duration: {self.song_length:.3f}s, stems: {list(buffers)}")
+        return self.song_length, 1.0
+
+    def _new_temp_path(self, suffix=".wav"):
+        return os.path.join(self.temp_dir, f"{TEMP_FILE_PREFIX}{os.getpid()}_{uuid.uuid4().hex}{suffix}")
+
+    def _run_ffmpeg(self, args, out_path, what):
+        """Run ffmpeg; returns None if the binary is missing, raises on failure."""
+        cmd = [self.ffmpeg_path, '-nostdin', '-v', 'error', '-y'] + args
         try:
-            # 1. Create a temporary file on disk
-            # delete=False is required so we can close it and re-open it with memmap
-            self._temp_audio_file = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
-            self._temp_audio_path = self._temp_audio_file.name
-            
-            # 2. Stream ffmpeg output directly to this file
-            cmd = [
-                self.ffmpeg_path, '-i', path,
-                '-f', 's16le', '-ar', str(SAMPLE_RATE), '-ac', str(CHANNELS),
-                '-v', 'quiet', '-'
-            ]
-            
-            # Use stdout=self._temp_audio_file to write directly to disk
-            proc = subprocess.run(cmd, stdout=self._temp_audio_file, stderr=subprocess.PIPE, timeout=120, **_SUBPROCESS_FLAGS)
-            
-            # Flush and close the file handle so memmap can safely take over
-            self._temp_audio_file.flush()
-            self._temp_audio_file.close()
-            
-            if proc.returncode != 0:
-                logger.error("FFmpeg failed to decode audio")
-                return
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  timeout=FFMPEG_DECODE_TIMEOUT_S, **_SUBPROCESS_FLAGS)
+        except FileNotFoundError:
+            logger.error(f"ffmpeg not found at '{self.ffmpeg_path}'")
+            self._remove_files(out_path)
+            return None
+        except subprocess.TimeoutExpired:
+            self._remove_files(out_path)
+            raise RuntimeError(f"ffmpeg timed out after {FFMPEG_DECODE_TIMEOUT_S}s ({what})")
+        except OSError as e:
+            logger.error(f"ffmpeg could not be run: {e}")
+            self._remove_files(out_path)
+            return None
+        stderr = proc.stderr.decode('utf-8', errors='replace').strip()
+        if proc.returncode != 0:
+            self._remove_files(out_path)
+            logger.error(f"ffmpeg failed (rc={proc.returncode}) {what}:\n{stderr}")
+            raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}) {what}: {stderr}")
+        if stderr:
+            logger.warning(f"ffmpeg warnings: {stderr}")
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            self._remove_files(out_path)
+            raise RuntimeError(f"ffmpeg produced no output ({what})")
+        return out_path
 
-            # 3. Calculate dimensions based on file size
-            file_size = os.path.getsize(self._temp_audio_path)
-            # 16-bit audio = 2 bytes per sample per channel
-            total_samples = file_size // (2 * CHANNELS)
-            
-            if total_samples == 0:
-                logger.warning("Decoded audio file is empty")
-                return
+    def _decode(self, path):
+        """Decode ``path`` to a temp WAV; returns the WAV path."""
+        out = self._new_temp_path(".wav")
+        args = ['-i', path, '-vn', '-f', 'wav', '-acodec', 'pcm_s16le',
+                '-ar', str(self.SAMPLE_RATE), '-ac', str(CHANNELS), out]
+        result = self._run_ffmpeg(args, out, f"decoding {os.path.basename(path)}")
+        if result is not None:
+            self._temp_paths.append(result)
+            return result
+        if self._is_native_pcm_wav(path):
+            logger.warning("ffmpeg unavailable; using the source WAV directly")
+            return path
+        raise RuntimeError(f"ffmpeg is unavailable and {path!r} is not a native PCM WAV")
 
-            # 4. Create the Memory Map (This is the magic part)
-            # It behaves like a numpy array but reads from disk on demand
-            self.raw_audio_data = np.memmap(
-                self._temp_audio_path, 
-                dtype=np.int16, 
-                mode='r', 
-                shape=(total_samples, CHANNELS)
-            )
-            
-            duration = total_samples / SAMPLE_RATE
-            logger.info(f"Memory map created: {total_samples} samples ({duration:.2f}s) at {self._temp_audio_path}")
-            
-        except Exception as e:
-            self.raw_audio_data = None
-            logger.error(f"Error loading raw audio: {e}")
+    def _pad_wav(self, src_path, info, target_frames):
+        """Copy a WAV, appending silence so it has ``target_frames`` frames."""
+        out = self._new_temp_path(".wav")
+        frame_bytes = info['channels'] * (info['bits_per_sample'] // 8)
+        with open(src_path, 'rb') as f, wave.open(out, 'wb') as wf:
+            wf.setnchannels(info['channels'])
+            wf.setsampwidth(info['bits_per_sample'] // 8)
+            wf.setframerate(info['sample_rate'])
+            f.seek(info['data_offset'])
+            remaining = info['frames'] * frame_bytes
+            while remaining > 0:
+                chunk = f.read(min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                wf.writeframes(chunk)
+                remaining -= len(chunk)
+            pad = (target_frames - info['frames']) * frame_bytes
+            zeros = bytes(1 << 20)
+            while pad > 0:
+                n = min(pad, len(zeros))
+                wf.writeframes(zeros[:n])
+                pad -= n
+        self._temp_paths.append(out)
+        return out
+
+    @staticmethod
+    def _remove_files(*paths):
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def _is_native_pcm_wav(self, path):
+        """True if ``path`` is already 16-bit PCM at SAMPLE_RATE/CHANNELS."""
+        try:
+            info = parse_wav_data_chunk(path)
+        except (OSError, ValueError):
+            return False
+        return (info['format_tag'] == 1 and info['bits_per_sample'] == 16
+                and info['channels'] == CHANNELS and info['sample_rate'] == self.SAMPLE_RATE
+                and info['frames'] > 0)
+
+    def _map_wav(self, wav_path, info=None):
+        """Memory-map the PCM payload of a 16-bit WAV at its data chunk."""
+        if info is None:
+            info = parse_wav_data_chunk(wav_path)
+        if info['bits_per_sample'] != 16 or info['channels'] != CHANNELS \
+                or info['sample_rate'] != self.SAMPLE_RATE:
+            raise ValueError(
+                f"Unexpected WAV format: {info['bits_per_sample']}-bit, "
+                f"{info['channels']}ch, {info['sample_rate']}Hz")
+        frames = info['frames']
+        if frames == 0:
+            raise ValueError("Decoded audio is empty")
+        mm = np.memmap(wav_path, dtype=np.int16, mode='r',
+                       offset=info['data_offset'], shape=(frames, CHANNELS))
+        logger.debug(f"Memory map: {frames} frames at offset {info['data_offset']} "
+                     f"of {os.path.basename(wav_path)}")
+        return mm
+
+    def _release_audio(self):
+        """Drop buffers and delete our temp files (stream stays open)."""
+        with self._render_lock:
+            self._release_audio_locked()
+
+    def _release_audio_locked(self):
+        self._render_gen += 1
+        self.core.clear_stems()
+        self.raw_audio_data = None
+        self._stem_sources = {}
+        self.song_length = 0.0
+        self._tempo_pitch = (1.0, 0.0)
+        paths = self._temp_paths + self._render_paths + self._retired_paths
+        self._temp_paths, self._render_paths, self._retired_paths = [], [], []
+        # Memmaps reachable only through reference cycles would keep the
+        # files locked on Windows; collect them before unlinking.
+        gc.collect()
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                    logger.debug(f"Deleted temp file: {p}")
+                except OSError as e:
+                    logger.warning(f"Could not delete temp file {p} ({e}); "
+                                   "it will be swept on next start")
 
     def cleanup(self):
-        """
-        Permanently clean up resources and delete temporary files.
-        Call this ONLY when the app is closing or loading a new song.
-        """
+        """Stop playback, release audio, delete temp files and close the stream."""
         logger.info("Cleaning up AudioEngine resources...")
-        
-        # 1. Close the memory map to release the file handle
-        if hasattr(self, 'raw_audio_data') and isinstance(self.raw_audio_data, np.memmap):
-            try:
-                # Force delete the reference so Python releases the file lock
-                self.raw_audio_data._mmap.close()
-                del self.raw_audio_data
-                self.raw_audio_data = None
-            except Exception as e:
-                logger.warning(f"Error closing memmap: {e}")
+        self.stop()
+        self._release_audio()
+        self._close_stream()
 
-        # 2. Delete the actual temp file from disk
-        if hasattr(self, '_temp_audio_path') and self._temp_audio_path:
-            if os.path.exists(self._temp_audio_path):
-                try:
-                    os.unlink(self._temp_audio_path)
-                    logger.info(f"Deleted temp file: {self._temp_audio_path}")
-                except Exception as e:
-                    logger.warning(f"Could not delete temp file: {e}")
-            self._temp_audio_path = None
+    def close(self):
+        """Final, idempotent shutdown of playback and owned workers."""
+        with self._render_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.cleanup()
+            self.core.events.put(_STOP_EVENTS)
+            self._callbacks.clear()
+        for thread in (self._render_thread, self._event_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+
+    def sweep_stale_temp_files(self):
+        return sweep_stale_temp_files(self.temp_dir, keep_pid=os.getpid())
 
     def get_raw_audio_data(self):
-        """Get the raw audio data for waveform generation."""
+        """int16 memmap of the "mix" stem (frames, 2), source tempo."""
         return self.raw_audio_data
-    
-    # =========================================================================
-    # LOOP SOUND GENERATION
-    # =========================================================================
-    
-    def set_loop_points(self, loop_in, loop_out, crossfade_ms=LOOP_CROSSFADE_MS):
-        """
-        Set loop in/out points and trigger background generation of loop sound.
-        
-        Args:
-            loop_in: Start time in seconds
-            loop_out: End time in seconds
-        """
-        duration = loop_out - loop_in
-        logger.info(f"=== SETTING LOOP POINTS: IN={loop_in:.3f}s OUT={loop_out:.3f}s (duration={duration:.3f}s) ===")
-        
-        with self.lock:
-            self.loop_in = loop_in
-            self.loop_out = loop_out
-            self.loop_duration = duration
-            self._current_crossfade_ms = crossfade_ms
-            self._loop_ready = False
-            # Increment generation ID to invalidate any in-flight generation
-            self._generation_id += 1
-        
-        # Trigger background generation
-        self._generate_loop_sound_async()
-    
-    def _generate_loop_sound_async(self):
-        """Generate the seamless loop sound in a background thread."""
-        with self._generation_lock:
-            if self._generation_thread is not None and self._generation_thread.is_alive():
-                # A thread is already running. It will check generation_id and bail
-                # if a newer request has come in. We still start a new one after it finishes.
-                logger.debug("Loop generation already in progress, will be superseded by new ID")
-            
-            # Capture the current generation ID
-            gen_id = self._generation_id
-            logger.debug(f"Starting background loop generation thread (gen_id={gen_id})")
-            self._generation_thread = threading.Thread(
-                target=self._generate_loop_sound, 
-                args=(gen_id,),
-                daemon=True
-            )
-            self._generation_thread.start()
-    
-    def _generate_loop_sound(self, gen_id):
-        """
-        Create a seamless loop Sound object using numpy array slicing and crossfading.
-        
-        This is the core of the "Slice, Process, and Pre-load" approach:
-        1. Extract the exact samples from loop_in to loop_out
-        2. Apply a crossfade at the seam to eliminate clicks
-        3. Convert to a pygame.mixer.Sound that can loop infinitely at the SDL layer
-        
-        Args:
-            gen_id: The generation ID when this was requested. If it doesn't match
-                    the current _generation_id, we bail out (a newer request superseded us).
-        """
-        logger.info(f">>> GENERATING SEAMLESS LOOP SOUND (gen_id={gen_id}) <<<")
-        start_time = time.time()
-        
-        try:
-            with self.lock:
-                # Check if we've been superseded
-                if gen_id != self._generation_id:
-                    logger.debug(f"Generation {gen_id} superseded by {self._generation_id}, bailing")
-                    return
-                loop_in = self.loop_in
-                loop_out = self.loop_out
-                crossfade_ms = self._current_crossfade_ms
-            
-            if self.raw_audio_data is None or loop_out <= loop_in:
-                logger.warning("Cannot generate loop: no raw audio or invalid loop points")
-                return
-            
-            duration = loop_out - loop_in
-            if duration < MIN_LOOP_DURATION:
-                logger.warning(f"Loop too short ({duration:.3f}s), minimum is {MIN_LOOP_DURATION}s")
-                return
-            
-            # Convert times to sample indices
-            start_sample = int(loop_in * SAMPLE_RATE)
-            end_sample = int(loop_out * SAMPLE_RATE)
-            
-            # Clamp to valid range
-            start_sample = max(0, min(start_sample, len(self.raw_audio_data) - 1))
-            end_sample = max(start_sample + 1, min(end_sample, len(self.raw_audio_data)))
-            
-            logger.debug(f"Slicing samples {start_sample} to {end_sample} ({end_sample - start_sample} samples)")
-            
-            # Calculate crossfade samples
-            crossfade_samples = int((crossfade_ms / 1000.0) * SAMPLE_RATE)
-            logger.debug(f"Crossfade: {LOOP_CROSSFADE_MS}ms = {crossfade_samples} samples")
-            
-            # Extract the loop region
-            loop_audio = self.raw_audio_data[start_sample:end_sample].copy().astype(np.float32)
-            
-            if len(loop_audio) < crossfade_samples * 2:
-                logger.warning("Loop too short for crossfade, using raw audio")
-                loop_audio_int = np.clip(loop_audio, -32768, 32767).astype(np.int16)
-            else:
-                # Apply crossfade to create seamless loop
-                logger.debug("Applying crossfade for seamless loop...")
-                
-                max_crossfade = len(loop_audio) // 3
-                crossfade_samples = min(crossfade_samples, max_crossfade)
 
-                # Get the beginning portion (what we'll fade INTO)
-                beginning = loop_audio[:crossfade_samples].copy()
-                
-                # Create fade curves
-                fade_out = np.linspace(1.0, 0.0, crossfade_samples).reshape(-1, 1)
-                fade_in = np.linspace(0.0, 1.0, crossfade_samples).reshape(-1, 1)
-                
-                # Apply crossfade: fade out the end, fade in the beginning, add them
-                loop_audio[-crossfade_samples:] = (
-                    loop_audio[-crossfade_samples:] * fade_out +
-                    beginning * fade_in
-                )
-                
-                # Convert back to int16
-                loop_audio_int = np.clip(loop_audio, -32768, 32767).astype(np.int16)
-            
-            # Check again if superseded before doing I/O
-            with self.lock:
-                if gen_id != self._generation_id:
-                    logger.debug(f"Generation {gen_id} superseded after processing, bailing")
-                    return
-            
-            # Create pygame.mixer.Sound directly from buffer (no disk I/O)
+    # ---- stems
+
+    def get_stems(self):
+        return self.core.get_stems()
+
+    def set_stem_gain(self, name, gain_db):
+        self.core.set_stem_gain(name, gain_db)
+
+    def set_stem_mute(self, name, muted):
+        self.core.set_stem_mute(name, muted)
+
+    def set_stem_solo(self, name, solo):
+        self.core.set_stem_solo(name, solo)
+
+    # =========================================================================
+    # TEMPO / KEY
+    # =========================================================================
+
+    def set_tempo_pitch(self, tempo_ratio=1.0, semitones=0.0):
+        with self._render_lock:
+            self._request_tempo_pitch(tempo_ratio, semitones)
+
+    def _request_tempo_pitch(self, tempo_ratio, semitones):
+        tempo_ratio = max(TEMPO_MIN, min(TEMPO_MAX, float(tempo_ratio)))
+        semitones = max(-SEMITONES_MAX, min(SEMITONES_MAX, float(semitones)))
+        if self._closed or not self._stem_sources:
+            raise RuntimeError("No open song to render")
+        with self._render_lock:
+            self._render_gen += 1
+            gen = self._render_gen
+            # Cancel a previously rendered swap that has not reached the
+            # callback yet. Only the latest request may become active.
+            with self.core.lock:
+                self.core._pending_swap = None
+        self._emit("render_started", tempo_ratio=tempo_ratio, semitones=semitones)
+        if abs(tempo_ratio - 1.0) < 1e-9 and abs(semitones) < 1e-9:
+            self.core.swap_buffers(self.core.get_stem_buffers(), 1.0, 0.0)
+            self._retire_render_paths([])
+            self._apply_swap_if_no_stream()
+            return
+        self._render_thread = threading.Thread(
+            target=self._render_worker, args=(gen, tempo_ratio, semitones),
+            name="TempoRender", daemon=True)
+        self._render_thread.start()
+
+    def get_tempo_pitch(self):
+        """Applied settings, never the settings of an unfinished render."""
+        with self.core.lock:
+            return self.core.tempo_ratio, self.core.semitones
+
+    def get_playback_rate(self):
+        """Source seconds per playback second for the active buffers."""
+        with self.core.lock:
+            return self.core._scale()
+
+    def get_output_levels(self):
+        return {"peak": self.core.output_peak, "clipped_blocks": self.core.clipped_blocks}
+
+    def _apply_swap_if_no_stream(self):
+        if self._stream is None:
+            self.core.apply_pending_swap()
+
+    def _retire_render_paths(self, keep):
+        """Mark rendered files not in ``keep`` for deletion (best effort)."""
+        retire = [p for p in self._render_paths if p not in keep]
+        self._render_paths = list(keep)
+        self._retired_paths.extend(retire)
+        still = []
+        for p in self._retired_paths:
             try:
-                # pygame.mixer.Sound(buffer=...) expects raw PCM in a bytes object
-                # but it needs to be wrapped in a WAV-like sndarray or use the wav approach
-                # safest cross-platform: use pygame.sndarray
-                import io
-                
-                wav_buffer = io.BytesIO()
-                with wave.open(wav_buffer, 'wb') as wf:
-                    wf.setnchannels(CHANNELS)
-                    wf.setsampwidth(2)  # 16-bit = 2 bytes
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(loop_audio_int.tobytes())
-                
-                wav_buffer.seek(0)
-                new_loop_sound = pygame.mixer.Sound(file=wav_buffer)
-                logger.debug("Created pygame.mixer.Sound from in-memory buffer (no disk I/O)")
-                
-            except Exception as loop_sound_err:
-                logger.error(f"Error creating loop sound from buffer: {loop_sound_err}")
-                return
-            
-            # Generate exit patch
-            logger.debug("Generating exit patch...")
-            exit_patch = self._generate_exit_patch(end_sample)
-            
-            # Final check and atomic store
-            with self.lock:
-                if gen_id != self._generation_id:
-                    logger.debug(f"Generation {gen_id} superseded at final store, discarding")
-                    return
-                    
-                self.loop_sound = new_loop_sound
-                self.exit_patch_sound = exit_patch
-                self._loop_ready = True
-            
-            elapsed = (time.time() - start_time) * 1000
-            logger.info(f">>> LOOP SOUND READY ({elapsed:.1f}ms) - Duration: {duration:.3f}s (gen_id={gen_id}) <<<")
-            
-        except Exception as e:
-            logger.error(f"Error generating loop sound: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def _generate_exit_patch(self, end_sample):
-        """
-        Generate a SHORT audio snippet starting at the loop end point.
-        This bridges the gap while pygame.mixer.music buffers.
-        """
+                if os.path.exists(p):
+                    os.unlink(p)
+            except OSError:
+                still.append(p)    # memmap still alive; swept later
+        self._retired_paths = still
+
+    def _render_worker(self, gen, tempo_ratio, semitones):
+        new_paths = []
         try:
-            if self.raw_audio_data is None:
-                logger.warning("No raw audio data for exit patch")
-                return None
-            
-            # Extract audio for exit patch
-            patch_duration_samples = int((EXIT_PATCH_DURATION_MS / 1000.0) * SAMPLE_RATE)
-            patch_end = min(end_sample + patch_duration_samples, len(self.raw_audio_data))
-            
-            if patch_end <= end_sample:
-                logger.warning("Not enough audio after loop end for exit patch")
-                return None
-            
-            patch_audio = self.raw_audio_data[end_sample:patch_end].copy().astype(np.float32)
-            
-            # Apply fade-in at start
-            fade_in_samples = min(int((EXIT_PATCH_FADE_IN_MS / 1000.0) * SAMPLE_RATE), len(patch_audio))
-            if fade_in_samples > 0:
-                fade_in = np.linspace(0.0, 1.0, fade_in_samples).reshape(-1, 1)
-                patch_audio[:fade_in_samples] *= fade_in
-            
-            # Apply fade-out at end
-            fade_out_samples = min(int((EXIT_PATCH_FADE_OUT_MS / 1000.0) * SAMPLE_RATE), len(patch_audio))
-            if fade_out_samples > 0:
-                fade_out = np.linspace(1.0, 0.0, fade_out_samples).reshape(-1, 1)
-                patch_audio[-fade_out_samples:] *= fade_out
-            
-            # Convert back to int16
-            patch_audio = np.clip(patch_audio, -32768, 32767).astype(np.int16)
-            
-            # Save to temp file and create Sound
-            temp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    temp_path = temp_file.name
-                
-                with wave.open(temp_path, 'wb') as wf:
-                    wf.setnchannels(CHANNELS)
-                    wf.setsampwidth(2)
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(patch_audio.tobytes())
-                
-                patch_sound = pygame.mixer.Sound(temp_path)
-                patch_ms = (patch_end - end_sample) / SAMPLE_RATE * 1000
-                logger.debug(f"Exit patch created: {patch_ms:.0f}ms bridge ({EXIT_PATCH_FADE_OUT_MS}ms fade-out)")
-                return patch_sound
-                
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-                        
+            buffers = {}
+            for name, src in list(self._stem_sources.items()):
+                semi = 0.0 if is_click_stem(name) else semitones
+                filt = build_tempo_pitch_filter(tempo_ratio, semi, self.SAMPLE_RATE)
+                if filt is None:
+                    buffers[name] = src["data"]
+                    continue
+                out = self._new_temp_path(".wav")
+                args = ['-i', src["path"], '-vn', '-af', filt, '-f', 'wav',
+                        '-acodec', 'pcm_s16le', '-ar', str(self.SAMPLE_RATE),
+                        '-ac', str(CHANNELS), out]
+                result = self._run_ffmpeg(args, out, f"rendering {name}")
+                if result is None:
+                    raise RuntimeError(f"ffmpeg not found at '{self.ffmpeg_path}'")
+                if gen != self._render_gen:
+                    self._remove_files(out)
+                    return
+                new_paths.append(out)
+                buffers[name] = self._map_wav(out)
+            # ffmpeg's resampler may round lengths differently per stem
+            n = min(len(b) for b in buffers.values())
+            if n <= 0:
+                raise RuntimeError("render produced empty audio")
+            buffers = {k: (b if len(b) == n else b[:n]) for k, b in buffers.items()}
+            if gen != self._render_gen:
+                self._remove_files(*new_paths)
+                return
+            with self._render_lock:
+                if gen != self._render_gen or self._closed:
+                    self._remove_files(*new_paths)
+                    return
+                self.core.swap_buffers(buffers, tempo_ratio, semitones)
+                self._retire_render_paths(new_paths)
+                self._apply_swap_if_no_stream()
         except Exception as e:
-            logger.error(f"Error generating exit patch: {e}")
-            return None
-    
-    def is_loop_ready(self):
-        """Check if the seamless loop sound has been generated."""
-        with self.lock:
-            return self._loop_ready and self.loop_sound is not None
-    
+            logger.error(f"Tempo/pitch render failed: {e}")
+            self._remove_files(*new_paths)
+            if gen == self._render_gen:
+                self._emit("render_failed", message=str(e))
+
     # =========================================================================
-    # TRANSPORT MODE CONTROLS
+    # TRANSPORT
     # =========================================================================
-    
+
     def play_transport(self, start_pos=None):
-        """
-        Start or resume playback in transport mode (streaming).
-        
-        Args:
-            start_pos: Position to start from (seconds), or None to continue
-        """
-        if start_pos is not None:
-            self.transport_offset = start_pos
-        
-        # Stop any loop playback first
-        self._stop_loop_channel()
-        
-        logger.info(f"[PLAY] TRANSPORT PLAY from {self.transport_offset:.3f}s")
-        pygame.mixer.music.play(start=self.transport_offset)
-        self.mode = "transport"
-        self.is_playing = True
-        self.is_paused = False
-    
+        self.core.play(start_pos)
+
     def pause_transport(self):
-        """Pause transport playback."""
-        if self.mode == "transport" and self.is_playing:
-            self.transport_offset = self.get_position()
-            pygame.mixer.music.pause()
-            self.is_paused = True
-            logger.info(f"[PAUSE] TRANSPORT PAUSED at {self.transport_offset:.3f}s")
+        self.core.pause()
 
     def unpause_transport(self):
-        """Resume transport playback."""
-        if self.mode == "transport" and self.is_paused:
-            # FIX: Use play() instead of unpause(). 
-            # unpause() on macOS often fails to reset the internal get_pos() timer,
-            # causing the display to "double count" the time (Offset + Old Time).
-            # play() forces a clean restart from the specific timestamp.
-            pygame.mixer.music.play(start=self.transport_offset)
-            
-            self.is_paused = False
-            logger.info(f"[PLAY] TRANSPORT RESUMED from {self.transport_offset:.3f}s")
-    
+        self.core.unpause()
+
     def seek_transport(self, position):
-        """
-        Seek to a position in transport mode.
-        
-        Args:
-            position: Time in seconds
-        """
-        position = max(0, min(position, self.song_length - 0.01))
-        logger.debug(f"⏩ TRANSPORT SEEK to {position:.3f}s")
-        self.transport_offset = position
-        
-        # If we're in loop mode, exit it
-        if self.mode == "loop":
-            logger.info("Exiting loop mode due to seek")
-            self._stop_loop_channel()
-            self.mode = "transport"
-        
-        if self.is_playing and not self.is_paused:
-            pygame.mixer.music.play(start=position)
-            logger.info(f"[PLAY] TRANSPORT PLAY from {position:.3f}s")
-        else:
-            pygame.mixer.music.play(start=position)
-            pygame.mixer.music.pause()
-            self.is_paused = True
-    
-    def get_transport_position(self):
-        """Get current position in transport mode."""
-        if self.mode != "transport":
-            return self.transport_offset
-        
-        ms = pygame.mixer.music.get_pos()
-        if ms >= 0:
-            return self.transport_offset + (ms / 1000.0)
-        return self.transport_offset
-    
-    # =========================================================================
-    # LOOP MODE CONTROLS
-    # =========================================================================
-    
-    def start_loop_mode(self, fade_in_ms=15):
-        """
-        Switch to loop mode with position synchronization.
-        """
-        with self.lock:
-            if not self._loop_ready or self.loop_sound is None:
-                logger.warning("Cannot start loop mode: loop sound not ready")
-                return False
-            sound_to_play = self.loop_sound
-            loop_duration = self.loop_duration
-            loop_in = self.loop_in
-        
-        # Get EXACT current position
-        current_pos = self.get_position()
-        
-        # Calculate where we are in the loop cycle
-        # This tells us how far into the loop we should be
-        cycle_offset = (current_pos - loop_in) % loop_duration
-        
-        logger.info(f"[LOOP] Entering loop at pos={current_pos:.3f}s, cycle_offset={cycle_offset:.3f}s")
-        
-        # CRITICAL: Stop transport with NO fadeout
-        pygame.mixer.music.stop()
-        
-        # Start loop sound from beginning
-        with self.lock:
-            self.loop_channel = sound_to_play.play(loops=-1, fade_ms=int(fade_in_ms))
-            
-            # SYNC FIX: Set timestamp as if we started earlier
-            # This makes get_loop_cycle_position() return the correct offset
-            self.loop_start_timestamp = time.time() - cycle_offset
-            
-            self.mode = "loop"
-            self.is_playing = True
-            self.is_paused = False
-        
-        logger.info(f"[LOOP] Timestamp synced: appears to be {cycle_offset:.3f}s into cycle")
-        return True
+        self.core.seek(position)
 
-    def pause_loop(self):
-        """Pause loop playback."""
-        if self.mode == "loop" and self.loop_channel:
-            self.loop_channel.pause()
-            self.is_paused = True
-            logger.info("[PAUSE] LOOP PAUSED")
-    
-    def unpause_loop(self):
-        """Resume loop playback."""
-        if self.mode == "loop" and self.loop_channel:
-            self.loop_channel.unpause()
-            self.is_paused = False
-            logger.info("[PLAY] LOOP RESUMED")
-    
-    def _stop_loop_channel(self):
-        """Stop the loop sound channel."""
-        if self.loop_channel:
-            logger.debug("Stopping loop channel")
-            self.loop_channel.fadeout(30)
-            self.loop_channel = None
-        self.mode = "transport"
-    
-    def get_loop_cycle_position(self):
-        """
-        Get the current position within the loop cycle.
-        Returns a value between 0 and loop_duration.
-        """
-        if self.mode != "loop" or self.loop_duration <= 0:
-            return 0.0
-        
-        elapsed = time.time() - self.loop_start_timestamp
-        return elapsed % self.loop_duration
-    
-    def execute_loop_exit(self):
-        """
-        Actually perform the loop exit. Should be called at the loop boundary.
-        
-        Strategy: Use a SHORT exit patch as a bridge while transport buffers.
-        - Exit patch plays instantly (RAM-based, no latency)
-        - Patch fades out over last portion
-        - Transport starts slightly before patch ends for overlap
-        """
-        logger.info(f"[EXIT] === EXECUTING LOOP EXIT at boundary ===")
-        
-        with self.lock:
-            loop_out = self.loop_out
-        
-        # 1. Stop the loop immediately
-        if self.loop_channel:
-            logger.debug("Stopping loop channel")
-            self.loop_channel.stop()
-            self.loop_channel = None
-        
-        # 2. Play exit patch (bridges the gap while transport buffers)
-        if self.exit_patch_sound:
-            logger.debug(f"Playing exit patch ({EXIT_PATCH_DURATION_MS}ms bridge, fades out)")
-            self.exit_patch_sound.play()
-        
-        # 3. Start transport (overlaps with patch fade-out)
-        resume_point = loop_out + (TRANSPORT_RESUME_OFFSET_MS / 1000.0)
-        if resume_point >= self.song_length:
-            resume_point = loop_out
-        
-        logger.info(f"[PLAY] Starting transport at {resume_point:.3f}s")
-        self.transport_offset = resume_point
-        pygame.mixer.music.play(start=resume_point)
-        
-        self.mode = "transport"
-        self.is_playing = True
-        self.is_paused = False
-    
-    def execute_fade_exit(self, fade_ms=None):
-        """
-        Exit loop mode by fading out the loop sound, then stopping.
-        Used for theater vamping where you want the music to fade away
-        rather than cutting to transport.
-        
-        Args:
-            fade_ms: Fade duration in milliseconds (uses config default if None)
-        """
-        if fade_ms is None:
-            fade_ms = FADE_EXIT_DURATION_MS
-        
-        logger.info(f"[FADE-EXIT] === EXECUTING FADE EXIT ({fade_ms}ms) ===")
-        
-        if self.loop_channel:
-            self.loop_channel.fadeout(int(fade_ms))
-            # Don't set loop_channel to None yet - let the fadeout complete
-        
-        # Don't start transport - just let it fade to silence
-        self.mode = "transport"
-        self.is_playing = False
-        self.is_paused = False
-    
-    # =========================================================================
-    # COMMON CONTROLS
-    # =========================================================================
-    
-    def get_position(self):
-        """Get current playback position regardless of mode."""
-        if self.mode == "loop":
-            return self.loop_in + self.get_loop_cycle_position()
-        else:
-            return self.get_transport_position()
-    
-    def toggle_play_pause(self):
-        """Toggle between play and pause states."""
-        if self.is_playing and not self.is_paused:
-            if self.mode == "loop":
-                self.pause_loop()
-            else:
-                self.pause_transport()
-        else:
-            if self.mode == "loop" and self.loop_channel:
-                self.unpause_loop()
-            else:
-                if self.is_paused:
-                    self.unpause_transport()
-                else:
-                    self.play_transport()
-    
     def stop(self):
-        """Stop all playback and reset state."""
-        logger.info("[STOP] STOP - Stopping all playback")
-        self._stop_loop_channel()
-        pygame.mixer.music.stop()
-        self.is_playing = False
-        self.is_paused = False
-        self.transport_offset = 0.0
-        self.mode = "transport"
-    
+        self.core.stop()
+
+    def toggle_play_pause(self):
+        self.core.toggle_play_pause()
+
+    def get_position(self):
+        return self.core.get_position(latency_frames=self._latency_frames)
+
+    @property
+    def is_playing(self):
+        return self.core.is_playing
+
+    @property
+    def is_paused(self):
+        return self.core.is_paused
+
+    @property
+    def is_held(self):
+        return self.core.is_held
+
+    @property
+    def mode(self):
+        return self.core.mode
+
     def is_transport_active(self):
-        """Check if transport (streaming) is actively playing."""
-        return self.mode == "transport" and pygame.mixer.music.get_busy()
-    
+        c = self.core
+        return c.mode == "transport" and c.is_playing and not c.is_paused and not c.is_held
+
     def is_loop_active(self):
-        """Check if loop mode is active."""
-        return self.mode == "loop" and self.loop_channel and self.loop_channel.get_busy()
+        return self.core.mode == "loop" and self.core.is_playing
 
-    def perform_skip(self, target_pos, fade_out_ms=0, fade_in_ms=0):
-        """
-        Execute a skip jump in the transport.
-        
-        Args:
-            target_pos: Where to jump TO (seconds)
-            fade_out_ms: Duration to fade out BEFORE the jump (requires threading usually, 
-                         so here we might just do a volume dip if supported, or direct seek)
-            fade_in_ms: Not fully supported by pygame.mixer.music without stop/start, 
-                        but we can simulate by seeking.
-        """
-        if self.mode != "transport":
-            return
+    # ---- compatibility attributes used by StateManager
 
-        logger.info(f"[SKIP] Jumping to {target_pos:.3f}s")
-        
-        # Pygame music seeking is blocking and might click. 
-        # Ideally, we would lower volume -> seek -> raise volume.
-        
-        # 1. Simple Seek (Fastest, best for beat-matching)
-        if fade_out_ms == 0:
-            self.seek_transport(target_pos)
-        else:
-            # 2. Fade Seek (Simulated)
-            # Note: Pygame mixer music fadeout STOPS playback. We don't want that.
-            # We will just seek immediately for now. 
-            # A true crossfaded skip requires the "Slice and Process" Loop Mode architecture, 
-            # which is too heavy for random skips.
-            self.seek_transport(target_pos)
+    @property
+    def loop_in(self):
+        return self.core.loop_in
 
+    @property
+    def loop_out(self):
+        return self.core.loop_out
+
+    @property
+    def loop_duration(self):
+        return self.core.loop_duration
+
+    @property
+    def transport_offset(self):
+        """Current transport position (old engines exposed the start offset)."""
+        return self.core.get_position()
+
+    @transport_offset.setter
+    def transport_offset(self, value):
+        self.core.seek(value)
+
+    # =========================================================================
+    # LOOPS / VAMPS
+    # =========================================================================
+
+    def set_loop_points(self, loop_in, loop_out, crossfade_ms=LOOP_CROSSFADE_MS):
+        self.core.set_loop_points(loop_in, loop_out, crossfade_ms)
+
+    def get_loop_points(self):
+        return self.core.get_loop_points()
+
+    def is_loop_ready(self):
+        return self.core.is_loop_ready()
+
+    def arm_loop(self, loop_in, loop_out, crossfade_ms=LOOP_CROSSFADE_MS, count=None,
+                 entry_fade_ms=15):
+        self.core.arm_loop(loop_in, loop_out, crossfade_ms, count, entry_fade_ms)
+
+    def disarm_loop(self):
+        self.core.disarm_loop()
+
+    def start_loop_mode(self, fade_in_ms=15, count=None):
+        """Enter the loop now; loops until exit unless ``count`` is given."""
+        return self.core.enter_loop(fade_in_ms, count)
+
+    def queue_loop_exit(self, mode="cut", fade_ms=None):
+        if mode == "fade" and fade_ms is None:
+            fade_ms = FADE_EXIT_DURATION_MS
+        self.core.queue_loop_exit(mode, fade_ms)
+
+    def cancel_loop_exit(self):
+        self.core.cancel_loop_exit()
+
+    def execute_loop_exit(self):
+        """Exit immediately, continuing from loop_out (compat)."""
+        self.core.exit_loop_now()
+
+    def execute_fade_exit(self, fade_ms=None):
+        self.queue_loop_exit("fade", fade_ms)
+
+    def is_fading_out(self):
+        return self.core.is_fading_out()
+
+    def finish_fade_exit(self):
+        """No-op: the callback finalises a fade exit itself (compat)."""
+        return None
+
+    def get_loop_cycle_position(self):
+        return self.core.get_loop_cycle_position()
+
+    def get_loop_cycle_count(self):
+        return self.core.get_loop_cycle_count()
+
+    # =========================================================================
+    # HOLDS / SKIPS
+    # =========================================================================
+
+    def hold_at(self, position):
+        self.core.hold_at(position)
+
+    def clear_hold(self):
+        self.core.clear_hold()
+
+    def release_hold(self):
+        self.core.release_hold()
+
+    def set_skip_regions(self, regions):
+        self.core.set_skip_regions(regions)
+
+    def perform_skip(self, target_pos):
+        """Manual skip: a declicked seek that also reports ``skip_executed``."""
+        from_pos = self.core.get_position()
+        self.core.seek(target_pos)
+        self._emit("skip_executed", from_pos=from_pos, to_pos=self.core.get_position())

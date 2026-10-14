@@ -10,19 +10,16 @@ that the tk canvas widget may be larger than the matplotlib figure.
 """
 
 import logging
+import math
 import numpy as np
 import tkinter as tk
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Tuple
 
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from config import (
     COLOR_WAVEFORM, COLOR_WAVEFORM_BG, COLOR_PLAYHEAD,
@@ -33,6 +30,97 @@ from config import (
 )
 
 logger = logging.getLogger("LoopStation.Waveform")
+
+# Hold cues (caesuras): distinct from cue yellow, vamp green and cut red.
+COLOR_HOLD = "#5ec8f2"
+# Bar grid: faint line every bar, a stronger one every BAR_GRID_STRONG_EVERY bars.
+COLOR_BAR_LINE = "#ffffff"
+BAR_LINE_ALPHA = 0.07
+BAR_LINE_STRONG_ALPHA = 0.18
+BAR_GRID_STRONG_EVERY = 4
+# Thinning thresholds (pixels between drawn lines / labels).
+BAR_GRID_MIN_PX = 5
+BAR_LABEL_MIN_PX = 34
+# Never build more than this many bar lines in one draw.
+BAR_GRID_MAX_LINES = 4000
+
+# Frames read from the memmap per step while computing the envelope.
+# 1 M stereo int16 frames = 4 MB resident at a time.
+_ENVELOPE_CHUNK_FRAMES = 1 << 20
+
+
+def compute_envelope(samples, n_buckets: int) -> np.ndarray:
+    """
+    Reduce PCM samples to a small peak envelope for drawing.
+
+    Args:
+        samples: array-like of shape (frames,) or (frames, channels), any
+            integer or float dtype. A numpy memmap is read in chunks so the
+            full file is never materialised (no float64 copy of the song).
+        n_buckets: number of output points (the waveform's pixel budget).
+
+    Returns:
+        float32 array of length min(n_buckets, frames) with the max absolute
+        sample of each bucket (across all channels), normalised to 0..1.
+        Empty input gives an empty array.
+    """
+    if samples is None or n_buckets <= 0:
+        return np.zeros(0, dtype=np.float32)
+    n_frames = int(samples.shape[0]) if hasattr(samples, 'shape') else len(samples)
+    if n_frames == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    n_buckets = min(int(n_buckets), n_frames)
+    bucket = n_frames // n_buckets           # frames per bucket (>= 1)
+    env = np.zeros(n_buckets, dtype=np.float32)
+
+    # Step over whole buckets so each chunk reshapes cleanly.
+    buckets_per_chunk = max(1, _ENVELOPE_CHUNK_FRAMES // bucket)
+    for b0 in range(0, n_buckets, buckets_per_chunk):
+        b1 = min(n_buckets, b0 + buckets_per_chunk)
+        block = np.asarray(samples[b0 * bucket:b1 * bucket])
+        block = block.reshape(b1 - b0, -1)   # (buckets, frames*channels)
+        # max(|x|) without an abs() copy and without int16 overflow on -32768
+        hi = block.max(axis=1).astype(np.float32)
+        lo = block.min(axis=1).astype(np.float32)
+        env[b0:b1] = np.maximum(hi, -lo)
+
+    peak = float(env.max()) if env.size else 0.0
+    if peak > 0:
+        env /= peak
+    return env
+
+
+def bar_times(bpm: float, beats_per_bar: int, downbeat_offset: float,
+              start: float, end: float) -> List[Tuple[float, int]]:
+    """
+    Bar-line times inside [start, end] (seconds) for a constant tempo map.
+
+    Bar ``n`` starts at ``downbeat_offset + (n - 1) * bar_seconds`` -- the
+    same numbering as StateManager.bar_beat_at, so bar 1 begins at the
+    first downbeat and a pickup before it is bar 0 (or lower).
+
+    Returns a list of (time, bar_number), ascending. Empty when bpm <= 0,
+    the range is empty, or the inputs are not finite.
+    """
+    try:
+        bpm = float(bpm)
+        bpb = max(1, int(beats_per_bar))
+        offset = float(downbeat_offset or 0.0)
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError):
+        return []
+    if not all(math.isfinite(v) for v in (bpm, offset, start, end)):
+        return []
+    if bpm <= 0 or end < start:
+        return []
+    bar_len = 60.0 / bpm * bpb
+    first = math.ceil((start - offset) / bar_len - 1e-9)   # zero-based bar index
+    last = math.floor((end - offset) / bar_len + 1e-9)
+    if last < first or last - first + 1 > BAR_GRID_MAX_LINES * 16:
+        return []        # empty, or absurdly dense (caller would thin it away)
+    return [(offset + k * bar_len, k + 1) for k in range(first, last + 1)]
 
 
 class WaveformWidget:
@@ -47,6 +135,7 @@ class WaveformWidget:
         # State
         self.duration = 0.0
         self.waveform_data: Optional[np.ndarray] = None
+        self._placeholder_text = "Choose a folder in the Library, then click a song to see its waveform"
 
         self.view_start = 0.0  # 0.0 = start of song
         self.view_end = 1.0    # 1.0 = end of song
@@ -60,7 +149,12 @@ class WaveformWidget:
         self.skips = []
         self.selected_index = -1
         self.markers = []
-        
+        self.holds = []
+
+        # Tempo map for the bar grid: (bpm, beats_per_bar, offset); bpm 0 = off
+        self._tempo_map = (0.0, 4, 0.0)
+        self._grid_drawn_width = 0
+
         # Container frame with fixed height
         self.container = tk.Frame(parent, bg=COLOR_WAVEFORM_BG, height=WAVEFORM_HEIGHT)
         self.container.pack_propagate(False)  # Enforce fixed height
@@ -85,6 +179,8 @@ class WaveformWidget:
         # Overlay item IDs
         self._playhead_line_id = None
         self._marker_ids = []
+        self._hold_ids = []
+        self._holds_sig = None
         self._playhead_frac = 0.0
         
         # Loop Detection Attributes
@@ -103,37 +199,30 @@ class WaveformWidget:
         # After matplotlib draws, redraw our overlay items on top
         self.canvas.mpl_connect('draw_event', self._on_mpl_draw)
         self.canvas.mpl_connect('scroll_event', self._on_scroll)
-        # Resize: need to resize the figure to match the widget
-        self.container.bind("<Configure>", self._on_configure)
-        
+        # Resizing: FigureCanvasTk binds <Configure> on its own canvas and
+        # resizes the figure to the widget size, so nothing to do here.
+
+        # Signature of the last drawn loop/skip regions (to skip redundant redraws)
+        self._drawn_regions_sig = None
+
         logger.debug("WaveformWidget initialized")
-    
+
     def _on_mpl_draw(self, event):
         """Called after matplotlib redraws. Redraw overlay items on top."""
         self._draw_overlay_playhead()
         self._draw_overlay_markers()
-    
-    # frontend/waveform.py
-
-    def _on_configure(self, event):
-        """
-        Handle widget resize. Resize the matplotlib figure to exactly
-        match the container size.
-        """
-        w = event.width
-        h = event.height
-        
-        # Basic sanity check
-        if w <= 1 or h <= 1:
-            return
-        
-        dpi = self.figure.get_dpi()
-        # Update the figure size to match the container's pixel dimensions
-        self.figure.set_size_inches(w / dpi, h / dpi, forward=False)
-        
-        # Re-enforce layout and redraw
-        self.figure.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        self.canvas.draw_idle()
+        self._draw_overlay_holds()
+        # matplotlib re-creates its image item on resize, which would cover
+        # our overlay items; keep them on top.
+        self._tk_canvas.tag_raise("overlay")
+        # The bar grid is thinned for the canvas width; after a big resize,
+        # rebuild it once for the new width.
+        if self._tempo_map[0] > 0 and self.waveform_data is not None:
+            width = self._tk_canvas.winfo_width()
+            old = self._grid_drawn_width
+            if width > 1 and old > 1 and abs(width - old) > 0.3 * old:
+                self._grid_drawn_width = width
+                self._tk_canvas.after_idle(self._draw_waveform)
 
     def _setup_axes(self):
         """Configure the matplotlib axes to fill the entire figure."""
@@ -142,6 +231,11 @@ class WaveformWidget:
         self.ax.set_ylim(-1, 1)
         self.ax.axis('off')
         self.figure.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        if self.waveform_data is None and self._placeholder_text:
+            # Empty state: tell the user what this area is for.
+            self.ax.text(0.5, 0.5, self._placeholder_text,
+                         ha='center', va='center', fontsize=11,
+                         color=COLOR_TEXT_DIM, transform=self.ax.transAxes)
 
     def _on_scroll(self, event):
         """Handle mouse wheel for zooming."""
@@ -227,22 +321,21 @@ class WaveformWidget:
     # =========================================================================
     
     def _draw_overlay_playhead(self):
-        """Draw playhead line on the tk canvas (fast, no matplotlib redraw)."""
-        if self._playhead_line_id is not None:
-            self._tk_canvas.delete(self._playhead_line_id)
-            self._playhead_line_id = None
-        
+        """Move the playhead line on the tk canvas (fast, no matplotlib redraw)."""
         canvas_height = self._tk_canvas.winfo_height()
         if canvas_height <= 1:
             return
-        
+
         x = self._frac_to_pixel_x(self._playhead_frac)
-        
-        self._playhead_line_id = self._tk_canvas.create_line(
-            x, 0, x, canvas_height,
-            fill=COLOR_PLAYHEAD, width=2, tags="overlay"
-        )
-    
+
+        if self._playhead_line_id is None:
+            self._playhead_line_id = self._tk_canvas.create_line(
+                x, 0, x, canvas_height,
+                fill=COLOR_PLAYHEAD, width=2, tags="overlay"
+            )
+        else:
+            self._tk_canvas.coords(self._playhead_line_id, x, 0, x, canvas_height)
+
     def _draw_overlay_markers(self):
         """Draw marker lines and name labels on the tk canvas."""
         for item_id in self._marker_ids:
@@ -280,44 +373,194 @@ class WaveformWidget:
             )
             self._marker_ids.append(text_id)
     
+    def _draw_overlay_holds(self):
+        """Draw hold (caesura) lines and ⏸ labels on the tk canvas."""
+        for item_id in self._hold_ids:
+            self._tk_canvas.delete(item_id)
+        self._hold_ids.clear()
+
+        if not self.holds or self.duration <= 0:
+            return
+        canvas_height = self._tk_canvas.winfo_height()
+        if canvas_height <= 1:
+            return
+
+        for hold in self.holds:
+            frac = hold.time / self.duration
+            if frac < 0 or frac > 1:
+                continue
+            x = self._frac_to_pixel_x(frac)
+            self._hold_ids.append(self._tk_canvas.create_line(
+                x, 0, x, canvas_height,
+                fill=COLOR_HOLD, width=2, tags="overlay"))
+            name = hold.name[:12] + "…" if len(hold.name) > 12 else hold.name
+            # Labels sit at the bottom so they never collide with cue labels.
+            self._hold_ids.append(self._tk_canvas.create_text(
+                x + 3, canvas_height - 4, text=f"⏸ {name}",
+                fill=COLOR_HOLD, anchor="sw",
+                font=("Segoe UI", 8, "bold"), tags="overlay"))
+
+    @staticmethod
+    def _holds_signature(holds):
+        return tuple((h.id, h.time, h.name) for h in holds)
+
+    def update_holds_display(self, holds):
+        """Store holds and redraw their overlay only if they changed."""
+        holds = list(holds or [])
+        self.holds = holds
+        sig = self._holds_signature(holds)
+        if sig == self._holds_sig:
+            return
+        self._holds_sig = sig
+        self._draw_overlay_holds()
+        self._tk_canvas.tag_raise("overlay")
+
+    # =========================================================================
+    # BAR GRID
+    # =========================================================================
+
+    def set_tempo_map(self, bpm, beats_per_bar, downbeat_offset):
+        """
+        Show a bar grid for a constant tempo (bpm <= 0 removes it). Redraws
+        only when the map actually changes; zooming redraws it along with
+        the waveform.
+        """
+        try:
+            bpm = float(bpm or 0.0)
+            bpb = max(1, int(beats_per_bar or 4))
+            offset = float(downbeat_offset or 0.0)
+        except (TypeError, ValueError):
+            bpm, bpb, offset = 0.0, 4, 0.0
+        new_map = (bpm, bpb, offset) if bpm > 0 else (0.0, 4, 0.0)
+        if new_map == self._tempo_map:
+            return
+        self._tempo_map = new_map
+        self._draw_waveform()
+
+    def _draw_bar_grid(self):
+        """Faint bar lines (stronger every 4 bars), numbers when zoomed in."""
+        bpm, bpb, offset = self._tempo_map
+        if bpm <= 0 or self.duration <= 0:
+            return
+        view_w = self.view_end - self.view_start
+        if view_w <= 0:
+            return
+        width = self._tk_canvas.winfo_width()
+        if width <= 1:
+            width = int(self.figure.get_figwidth() * self.figure.dpi)
+        self._grid_drawn_width = width
+
+        bar_len = 60.0 / bpm * bpb
+        px_per_bar = width * (bar_len / self.duration) / view_w
+        if px_per_bar >= BAR_GRID_MIN_PX:
+            step = 1
+        elif px_per_bar * BAR_GRID_STRONG_EVERY >= BAR_GRID_MIN_PX:
+            step = BAR_GRID_STRONG_EVERY
+        else:
+            return  # far too dense to be useful
+
+        bars = bar_times(bpm, bpb, offset,
+                         self.view_start * self.duration, self.view_end * self.duration)
+        if not bars or len(bars) // step > BAR_GRID_MAX_LINES:
+            return
+
+        weak, strong = [], []
+        for t, n in bars:
+            if (n - 1) % step:
+                continue
+            if (n - 1) % BAR_GRID_STRONG_EVERY == 0:
+                strong.append(t / self.duration)
+            else:
+                weak.append(t / self.duration)
+        if weak:
+            self.ax.vlines(weak, -1, 1, colors=COLOR_BAR_LINE,
+                           alpha=BAR_LINE_ALPHA, linewidth=1, zorder=1.2)
+        if strong:
+            self.ax.vlines(strong, -1, 1, colors=COLOR_BAR_LINE,
+                           alpha=BAR_LINE_STRONG_ALPHA, linewidth=1, zorder=1.2)
+
+        # Bar numbers: every bar when roomy, otherwise every 4th bar.
+        if px_per_bar >= BAR_LABEL_MIN_PX:
+            label_every = 1
+        elif px_per_bar * BAR_GRID_STRONG_EVERY >= BAR_LABEL_MIN_PX:
+            label_every = BAR_GRID_STRONG_EVERY
+        else:
+            return
+        for t, n in bars:
+            if n < 1 or (n - 1) % label_every:
+                continue
+            self.ax.text(t / self.duration, -0.98, f" {n}", ha='left', va='bottom',
+                         fontsize=6.5, color=COLOR_BAR_LINE, alpha=0.5,
+                         zorder=5, fontfamily='sans-serif', clip_on=True)
+
     # =========================================================================
     # WAVEFORM GENERATION
     # =========================================================================
     
-    def load_waveform(self, audio_data: np.ndarray, duration: float):
-        """Load and display waveform from audio data."""
+    def begin_song(self, duration: float):
+        """
+        A new song was loaded but its envelope is still being computed:
+        drop the old waveform and remember the duration so loop/marker
+        updates that arrive before the envelope are positioned correctly.
+        """
+        self.waveform_data = None
         self.duration = duration
-        
-        if audio_data is None or len(audio_data) == 0:
+        self.loops = []
+        self.skips = []
+        self.markers = []
+        self.holds = []
+        self._holds_sig = None
+        self._draw_overlay_holds()
+        self.selected_index = -1
+        self._drawn_regions_sig = None
+        self.view_start, self.view_end = 0.0, 1.0
+        self._playhead_frac = 0.0
+        self._placeholder_text = "Loading waveform…"
+        self.ax.clear()
+        self._setup_axes()
+        self.canvas.draw_idle()
+
+    def load_waveform(self, envelope: np.ndarray, duration: float):
+        """
+        Display a precomputed envelope (see compute_envelope). Raw PCM is
+        accepted too, but callers should compute the envelope off the Tk
+        thread and pass the small array in.
+        """
+        self.duration = duration
+
+        if envelope is None or len(envelope) == 0:
             logger.warning("No audio data for waveform")
             return
-        
-        logger.debug(f"Generating waveform from {len(audio_data)} samples")
-        
-        if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
-            mono = audio_data.mean(axis=1)
-        else:
-            mono = audio_data.flatten()
-        
-        target_samples = WAVEFORM_TARGET_SAMPLES
-        if len(mono) > target_samples:
-            chunk_size = len(mono) // target_samples
-            chunks = mono[:chunk_size * target_samples].reshape(-1, chunk_size)
-            self.waveform_data = np.max(np.abs(chunks), axis=1)
-        else:
-            self.waveform_data = np.abs(mono)
-        
-        max_val = np.max(self.waveform_data)
-        if max_val > 0:
-            self.waveform_data = self.waveform_data / max_val
-        
+
+        envelope = np.asarray(envelope)
+        if envelope.ndim != 1 or len(envelope) > WAVEFORM_TARGET_SAMPLES:
+            envelope = compute_envelope(envelope, WAVEFORM_TARGET_SAMPLES)
+
+        self.waveform_data = envelope.astype(np.float32, copy=False)
+        self._drawn_regions_sig = None
         self._draw_waveform()
-        logger.debug("Waveform generated")
-    
+        logger.debug(f"Waveform plotted ({len(self.waveform_data)} points)")
+
+    @staticmethod
+    def _regions_signature(loops, skips, selected_index, tempo_map=None):
+        return (
+            tuple((l.start, l.end, l.name, getattr(l, 'active', True)) for l in loops),
+            tuple((s.start, s.end, getattr(s, 'active', True)) for s in skips),
+            selected_index,
+            tempo_map,
+        )
+
+    def _redraw_if_regions_changed(self):
+        sig = self._regions_signature(self.loops, self.skips, self.selected_index,
+                                      self._tempo_map)
+        if sig == self._drawn_regions_sig:
+            return
+        self._draw_waveform()
+
     def update_skips_display(self, skips):
-        """Update stored skips and redraw."""
+        """Update stored skips and redraw if they changed."""
         self.skips = skips
-        self._draw_waveform()
+        self._redraw_if_regions_changed()
 
     def _draw_waveform(self):
         """Draw the waveform on the axes."""
@@ -334,15 +577,20 @@ class WaveformWidget:
         self.ax.fill_between(x, -self.waveform_data, self.waveform_data, 
                              color=COLOR_WAVEFORM, alpha=0.8)
         
+        # Bar grid (faint lines over the waveform, under the vamp regions)
+        self._draw_bar_grid()
+
         # Draw regions (Loops, Skips)
         self._draw_skip_regions() 
         self._draw_loop_regions()
         
         if self.selection_start is not None and self.selection_end is not None:
             self._redraw_selection_patch()
-        
+
+        self._drawn_regions_sig = self._regions_signature(
+            self.loops, self.skips, self.selected_index, self._tempo_map)
         self.canvas.draw_idle()
-    
+
     def _draw_skip_regions(self):
         """Draw skip regions (Cuts) in the theme color."""
         if self.duration <= 0 or not self.skips:
@@ -369,10 +617,10 @@ class WaveformWidget:
             )
 
     def update_loops_display(self, loops, selected_index):
-        """Update stored loops and redraw."""
+        """Update stored loops and redraw if they changed."""
         self.loops = loops
         self.selected_index = selected_index
-        self._draw_waveform()
+        self._redraw_if_regions_changed()
 
     def update_markers_display(self, markers):
         """Update stored markers and redraw overlay."""
@@ -432,24 +680,29 @@ class WaveformWidget:
         self._draw_overlay_playhead()
     
     def update_loop_markers(self, loop_in: float, loop_out: float):
-        """Update loop in/out markers (triggers full matplotlib redraw)."""
+        """
+        Store the selected vamp's in/out points. Drawing uses the loop list
+        (update_loops_display), so this never triggers a redraw by itself.
+        """
         self.loop_in = loop_in
         self.loop_out = loop_out
-        if self.duration <= 0:
-            return
-        self._draw_waveform()
-    
+
     def clear(self):
         """Clear the waveform display."""
         self.waveform_data = None
         self.duration = 0.0
         self.loops = []
+        self.skips = []
         self.markers = []
+        self.holds = []
+        self._holds_sig = None
+        self._draw_overlay_holds()
         self.selected_index = -1
+        self._drawn_regions_sig = None
         self.ax.clear()
         self._setup_axes()
         self.canvas.draw_idle()
-    
+
     # =========================================================================
     # INTERACTION
     # =========================================================================
@@ -521,6 +774,17 @@ class WaveformWidget:
             facecolor='#4caf50', alpha=0.3, edgecolor='#4caf50'
         )
         self.ax.add_patch(self.selection_rect)
+
+    def get_selection(self):
+        """(start, end) of the current selection in seconds, or None."""
+        if self.selection_start is None or self.selection_end is None or self.duration <= 0:
+            return None
+        a, b = sorted((self.selection_start, self.selection_end))
+        a = max(0.0, min(1.0, a))
+        b = max(0.0, min(1.0, b))
+        if b <= a:
+            return None
+        return (a * self.duration, b * self.duration)
 
     def set_selection_mode(self, active: bool):
         self.selection_mode_active = active

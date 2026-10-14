@@ -5,6 +5,8 @@ A right-side panel that shows:
 - Current cue/vamp details with per-tag notes
 - Next cue/vamp preview with countdown timer
 - Editable tag cards: each tag has its own notes with Save/Edit toggle
+- Hold cues (caesuras) count as cues; acks from crew devices are shown
+  under NOW / UP NEXT; live mode makes the notes read-only
 
 This gives rehearsal directors at-a-glance information about
 where they are in the show and what's coming up next.
@@ -13,25 +15,46 @@ where they are in the show and what's coming up next.
 import logging
 import time
 import tkinter as tk
-from typing import Callable, Optional, List
+from typing import Callable, Optional
 
 import customtkinter as ctk
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
 from config import (
     COLOR_BG_DARK, COLOR_BG_MEDIUM, COLOR_BG_LIGHT,
-    COLOR_TEXT, COLOR_TEXT_DIM, COLOR_MARKER, COLOR_LOOP_REGION,
-    COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, COLOR_BTN_DANGER,
-    PADDING_SMALL, PADDING_MEDIUM, PADDING_LARGE,
-    AVAILABLE_TAGS, TAG_COLORS, COLOR_BTN_TEXT,
+    COLOR_TEXT, COLOR_TEXT_DIM, COLOR_MARKER,
+    COLOR_BTN_SUCCESS,
+    PADDING_SMALL, PADDING_MEDIUM,
+    AVAILABLE_TAGS, TAG_COLORS,
     RIGHT_SIDEBAR_WIDTH,
 )
+from utils.formatting import format_time
 from utils.tooltip import ToolTip
 
 logger = logging.getLogger("LoopStation.NotesSidebar")
+
+# Hold cues: same colour as the cue sheet / waveform hold markers.
+COLOR_HOLD = "#5ec8f2"
+COLOR_ACK = "#7ddc8a"
+COLOR_LIVE = "#ff9f43"
+
+TYPE_ICONS = {'marker': "📍", 'vamp': "🔁", 'hold': "⏸"}
+TYPE_LABELS = {'marker': "Cue", 'vamp': "Vamp", 'hold': "Hold"}
+
+
+def item_start_time(item_type, obj):
+    """Start time of a timeline item (markers/holds: .time, vamps: .start)."""
+    return obj.start if item_type == 'vamp' else obj.time
+
+
+def ack_devices(acks, cue_id):
+    """Unique device names (first-ack order) that acknowledged ``cue_id``."""
+    names = []
+    for ack in (acks or {}).get(cue_id) or []:
+        name = ack.get("device") if isinstance(ack, dict) else ack
+        name = str(name or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 class NotesSidebar(ctk.CTkFrame):
@@ -59,10 +82,20 @@ class NotesSidebar(ctk.CTkFrame):
         self._current_item_type = None
         self._next_item_type = None
         self._last_countdown_update = 0
-        
-        # Tag card widgets (managed dynamically)
+        self._acks = {}
+        self._live_mode = False
+        self._playback_rate = 1.0
+        self._countdown_to = None
+
+        # Tag card widgets (managed dynamically). The edit section always
+        # shows the cards for ``_edit_item``; that may lag behind
+        # ``_current_item`` while a card is open for editing, because we
+        # never destroy a card the user is typing in.
         self._tag_cards = []
-        
+        self._edit_item = None
+        self._edit_item_type = None
+        self._cards_rebuild_pending = False
+
         self._create_widgets()
     
     def _create_widgets(self):
@@ -120,6 +153,13 @@ class NotesSidebar(ctk.CTkFrame):
         # Container for per-tag note summaries in NOW section
         self.current_tags_notes = ctk.CTkFrame(self.current_frame, fg_color="transparent")
         self.current_tags_notes.pack(fill="x", padx=PADDING_SMALL, pady=(4, PADDING_SMALL))
+
+        # "✓ Acked by: ..." (packed only when the shown cue has acks)
+        self.current_acks = ctk.CTkLabel(
+            self.current_frame, text="", font=("Segoe UI", 10, "bold"),
+            text_color=COLOR_ACK, anchor="w", justify="left",
+            wraplength=RIGHT_SIDEBAR_WIDTH - 50
+        )
         
         # ==========================================================
         # SECTION 2: UP NEXT (with countdown)
@@ -167,6 +207,12 @@ class NotesSidebar(ctk.CTkFrame):
         # Container for per-tag note summaries in NEXT section
         self.next_tags_notes = ctk.CTkFrame(self.next_frame, fg_color="transparent")
         self.next_tags_notes.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
+
+        self.next_acks = ctk.CTkLabel(
+            self.next_frame, text="", font=("Segoe UI", 10, "bold"),
+            text_color=COLOR_ACK, anchor="w", justify="left",
+            wraplength=RIGHT_SIDEBAR_WIDTH - 50
+        )
         
         # ==========================================================
         # SECTION 3: EDIT TAGS & NOTES
@@ -181,13 +227,22 @@ class NotesSidebar(ctk.CTkFrame):
         # Editing target
         self.edit_target_label = ctk.CTkLabel(
             self.edit_frame, text="Select a cue to edit",
-            font=("Segoe UI", 11, "bold"), text_color=COLOR_TEXT_DIM
+            font=("Segoe UI", 11, "bold"), text_color=COLOR_TEXT_DIM,
+            anchor="w", justify="left", wraplength=RIGHT_SIDEBAR_WIDTH - 60
         )
-        self.edit_target_label.pack(anchor="w", padx=PADDING_MEDIUM, pady=(PADDING_SMALL, 4))
+        self.edit_target_label.pack(anchor="w", fill="x", padx=PADDING_MEDIUM,
+                                    pady=(PADDING_SMALL, 4))
         
         # "Add Tag" dropdown
         add_tag_frame = ctk.CTkFrame(self.edit_frame, fg_color="transparent")
         add_tag_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
+        self._add_tag_frame = add_tag_frame
+
+        # Shown instead of the Add Tag menu while live
+        self.live_note = ctk.CTkLabel(
+            self.edit_frame, text="🔒 LIVE — notes are read-only",
+            font=("Segoe UI", 10, "bold"), text_color=COLOR_LIVE
+        )
         
         self.add_tag_var = tk.StringVar(value="+ Add Tag")
         self.add_tag_menu = ctk.CTkOptionMenu(
@@ -225,13 +280,15 @@ class NotesSidebar(ctk.CTkFrame):
     # TIMELINE / POSITION UPDATES
     # =========================================================================
     
-    def update_timeline(self, markers, loops):
-        """Rebuild internal timeline from current markers and loops."""
+    def update_timeline(self, markers, loops, holds=None):
+        """Rebuild internal timeline from current markers, loops and holds."""
         items = []
         for marker in (markers or []):
             items.append((marker.time, 'marker', marker))
         for loop in (loops or []):
             items.append((loop.start, 'vamp', loop))
+        for hold in (holds or []):
+            items.append((hold.time, 'hold', hold))
         items.sort(key=lambda x: x[0])
         self._timeline_items = items
         self._evaluate_cues(self._current_position)
@@ -247,6 +304,15 @@ class NotesSidebar(ctk.CTkFrame):
         
         self._last_countdown_update = now
         self._evaluate_cues(position)
+
+    def set_playback_timing(self, rate, countdown_to=None):
+        self._playback_rate = max(0.01, float(rate))
+        self._countdown_to = countdown_to
+
+    def _remaining(self, next_time, position):
+        if self._countdown_to is not None:
+            return self._countdown_to(next_time, position)
+        return max(0, next_time - position) / self._playback_rate
     
     def _evaluate_cues(self, position):
         """Determine current and next cue, update displays."""
@@ -261,8 +327,8 @@ class NotesSidebar(ctk.CTkFrame):
         
         # Pass 1: Find CURRENT item (last item we're inside/past)
         for i, (t, item_type, obj) in enumerate(self._timeline_items):
-            item_time = obj.time if item_type == 'marker' else obj.start
-            
+            item_time = item_start_time(item_type, obj)
+
             if item_time <= position:
                 if item_type == 'vamp' and position > obj.end:
                     continue  # We've passed this vamp entirely
@@ -271,11 +337,8 @@ class NotesSidebar(ctk.CTkFrame):
         
         # Pass 2: Find NEXT item (first item whose start is after current position)
         for i, (t, item_type, obj) in enumerate(self._timeline_items):
-            if item_type == 'marker':
-                item_time = obj.time
-            else:
-                item_time = obj.start
-            
+            item_time = item_start_time(item_type, obj)
+
             if item_time > position:
                 next_item = obj
                 next_type = item_type
@@ -287,36 +350,40 @@ class NotesSidebar(ctk.CTkFrame):
                 next_type = item_type
                 break
         
-        old_current_id = self._current_item.id if self._current_item else None
-        old_next_id = self._next_item.id if self._next_item else None
-        
+        # Compare by object identity: the backend hands us the same objects
+        # on every emission, and a reload that recreates them (same ids,
+        # fresh objects) must refresh too.
+        current_changed = current is not self._current_item
+        next_changed = next_item is not self._next_item
+
         self._current_item = current
         self._current_item_type = current_type
         self._next_item = next_item
         self._next_item_type = next_type
-        
-        new_current_id = current.id if current else None
-        new_next_id = next_item.id if next_item else None
-        
-        # Only rebuild the tag summary widgets when the item identity changes,
+
+        # Only rebuild the tag summary widgets when the item changes,
         # NOT on every position tick — this prevents the visible flash/flicker.
-        if new_current_id != old_current_id:
+        if current_changed:
             self._refresh_current(position)
-        
-        if new_next_id != old_next_id:
+
+        if next_changed:
             self._refresh_next(position)
-        
+
         # Update countdown (lightweight, no widget destruction)
         self._update_countdown_only(position)
-        
-        if new_current_id != old_current_id:
+
+        if current_changed:
+            # Deferred automatically if a card is open for editing.
             self._rebuild_tag_cards()
     
     def _update_countdown_only(self, position):
         """Fast path: just update countdown number."""
         if self._next_item:
-            next_time = self._next_item.time if self._next_item_type == 'marker' else self._next_item.start
-            remaining = max(0, next_time - position)
+            next_time = item_start_time(self._next_item_type, self._next_item)
+            remaining = self._remaining(next_time, position)
+            if remaining is None:
+                self.countdown_label.configure(text="Waiting for release", text_color="#ffcc00")
+                return
             self.countdown_label.configure(text=self._fmt_countdown(remaining))
             if remaining < 5:
                 self.countdown_label.configure(text_color="#ff4444")
@@ -343,7 +410,10 @@ class NotesSidebar(ctk.CTkFrame):
         self.next_name.configure(text="--")
         self.next_time.configure(text="")
         self._clear_children(self.next_tags_notes)
-    
+        self._refresh_acks()
+        if self._edit_item is not None:
+            self._rebuild_tag_cards()
+
     def _refresh_current(self, position):
         item = self._current_item
         itype = self._current_item_type
@@ -354,14 +424,21 @@ class NotesSidebar(ctk.CTkFrame):
             self.current_time.configure(text="")
             self.current_frame.configure(fg_color="#1a1a1a")
             self._clear_children(self.current_tags_notes)
+            self._refresh_acks()
             return
-        
+
         if itype == 'marker':
             self.current_icon.configure(text="📍")
             self.current_time.configure(
                 text=f"at {self._fmt(item.time)}", text_color=COLOR_MARKER
             )
             self.current_frame.configure(fg_color="#2a2a1e")
+        elif itype == 'hold':
+            self.current_icon.configure(text="⏸")
+            self.current_time.configure(
+                text=f"Hold at {self._fmt(item.time)}", text_color=COLOR_HOLD
+            )
+            self.current_frame.configure(fg_color="#1a2a33")
         else:
             self.current_icon.configure(text="🔁")
             self.current_time.configure(
@@ -371,6 +448,7 @@ class NotesSidebar(ctk.CTkFrame):
         
         self.current_name.configure(text=item.name)
         self._render_tag_notes_summary(self.current_tags_notes, item.tag_notes)
+        self._refresh_acks()
     
     # =========================================================================
     # DISPLAY: NEXT SECTION
@@ -386,13 +464,20 @@ class NotesSidebar(ctk.CTkFrame):
             self.next_name.configure(text="End of song")
             self.next_time.configure(text="")
             self._clear_children(self.next_tags_notes)
+            self._refresh_acks()
             return
-        
+
         if itype == 'marker':
             self.next_icon.configure(text="📍")
             next_time = item.time
             self.next_time.configure(
                 text=f"at {self._fmt(next_time)}", text_color=COLOR_MARKER
+            )
+        elif itype == 'hold':
+            self.next_icon.configure(text="⏸")
+            next_time = item.time
+            self.next_time.configure(
+                text=f"Hold at {self._fmt(next_time)}", text_color=COLOR_HOLD
             )
         else:
             self.next_icon.configure(text="🔁")
@@ -403,7 +488,8 @@ class NotesSidebar(ctk.CTkFrame):
         
         self.next_name.configure(text=item.name)
         
-        remaining = max(0, next_time - position)
+        remaining = self._remaining(next_time, position)
+        remaining = 0 if remaining is None else remaining
         self.countdown_label.configure(text=self._fmt_countdown(remaining))
         if remaining < 5:
             self.countdown_label.configure(text_color="#ff4444")
@@ -413,7 +499,57 @@ class NotesSidebar(ctk.CTkFrame):
             self.countdown_label.configure(text_color="#88cc88")
         
         self._render_tag_notes_summary(self.next_tags_notes, item.tag_notes)
-    
+        self._refresh_acks()
+
+    # =========================================================================
+    # ACKS
+    # =========================================================================
+
+    def update_acks(self, acks):
+        """acks: {cue_id: [{"device": str, "ts": float}, ...]} from crew devices."""
+        self._acks = dict(acks or {})
+        self._refresh_acks()
+
+    def _refresh_acks(self):
+        """Show / hide the "✓ Acked by" line under the NOW and UP NEXT cards."""
+        for label, item, anchor in (
+            (self.current_acks, self._current_item, self.current_tags_notes),
+            (self.next_acks, self._next_item, self.next_tags_notes),
+        ):
+            names = ack_devices(self._acks, item.id) if item is not None else []
+            try:
+                if names:
+                    label.configure(text="✓ Acked by: " + ", ".join(names))
+                    label.pack(anchor="w", fill="x", padx=PADDING_MEDIUM,
+                               pady=(0, PADDING_SMALL), after=anchor)
+                else:
+                    label.pack_forget()
+            except tk.TclError:
+                pass
+
+    # =========================================================================
+    # LIVE MODE
+    # =========================================================================
+
+    def set_live_mode(self, enabled: bool):
+        """Lock tag/notes editing (read-only cards, no Add Tag) while live."""
+        enabled = bool(enabled)
+        if enabled == self._live_mode:
+            return
+        if enabled:
+            # Keep whatever is being typed right now.
+            self._commit_open_editors()
+        self._live_mode = enabled
+        if enabled:
+            self._add_tag_frame.pack_forget()
+            self.live_note.pack(anchor="w", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL),
+                                before=self.cards_frame)
+        else:
+            self.live_note.pack_forget()
+            self._add_tag_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL),
+                                     before=self.cards_frame)
+        self._rebuild_tag_cards(force=True)
+
     def _render_tag_notes_summary(self, parent, tag_notes):
         """Render read-only tag+notes summary in NOW or NEXT section."""
         self._clear_children(parent)
@@ -437,15 +573,16 @@ class NotesSidebar(ctk.CTkFrame):
                 text_color="#ffffff", height=18
             ).pack(side="left", padx=(4, 6), pady=1)
             
-            display = notes.strip().replace('\n', ' ')
-            if len(display) > 60:
-                display = display[:57] + "..."
-            
+            # Show the whole note, wrapped: a crew member reading this
+            # backstage needs the full instruction, not a truncated one.
+            display = notes.strip()
+
             ctk.CTkLabel(
                 row, text=display if display else "(empty)",
                 font=("Segoe UI", 10),
                 text_color=COLOR_TEXT if display else COLOR_TEXT_DIM,
-                anchor="w"
+                anchor="w", justify="left",
+                wraplength=RIGHT_SIDEBAR_WIDTH - 110
             ).pack(side="left", fill="x", expand=True, padx=(0, 4))
     
     # =========================================================================
@@ -454,62 +591,101 @@ class NotesSidebar(ctk.CTkFrame):
     
     def _on_add_tag(self, tag_name):
         """Handle tag selection from the Add Tag dropdown."""
-        if self._current_item is None or tag_name == "(all tags added)":
-            self.add_tag_var.set("+ Add Tag")
-            return
-        
-        # Don't add duplicate
-        if tag_name in self._current_item.tag_notes:
-            self.add_tag_var.set("+ Add Tag")
-            return
-        
-        # Add tag with empty notes
-        self._current_item.tag_notes[tag_name] = ""
-        
-        # Save to backend
-        if self.on_tag_note_save:
-            self.on_tag_note_save(self._current_item.id, tag_name, "")
-        
-        # Reset dropdown and rebuild
+        # The dropdown belongs to the item the cards are showing, which is
+        # ``_edit_item`` (not necessarily the playback-current item).
+        item = self._edit_item
         self.add_tag_var.set("+ Add Tag")
-        self._rebuild_tag_cards()
-        self._refresh_current(self._current_position)
-    
-    def _rebuild_tag_cards(self):
-        """Rebuild all tag editing cards for the current item."""
+        if item is None or tag_name == "(all tags added)" or self._live_mode:
+            return
+
+        # Don't add duplicate
+        if tag_name in item.tag_notes:
+            return
+
+        # Anything being typed in another card is committed first so the
+        # rebuild below cannot lose it.
+        self._commit_open_editors()
+
+        # The backend owns the item: it adds the tag, emits and saves.
+        if self.on_tag_note_save:
+            self.on_tag_note_save(item.id, tag_name, "")
+
+        self._rebuild_tag_cards(force=True)
+        if item is self._current_item:
+            self._refresh_current(self._current_position)
+
+    def _any_card_editing(self) -> bool:
+        return any(getattr(card, "_editing", False) for card in self._tag_cards)
+
+    def _commit_open_editors(self):
+        """Save every card that is currently in edit mode."""
+        for card in list(self._tag_cards):
+            if getattr(card, "_editing", False):
+                card._commit()
+
+    def _on_card_edit_ended(self):
+        """A card left edit mode; run any rebuild that was deferred meanwhile."""
+        if self._cards_rebuild_pending and not self._any_card_editing():
+            self._rebuild_tag_cards()
+
+    def _rebuild_tag_cards(self, force: bool = False):
+        """
+        Rebuild all tag editing cards for the current item.
+
+        If a card is open for editing the rebuild is deferred until that
+        edit ends (see _on_card_edit_ended), so the user's text is never
+        destroyed under them. ``force`` commits open editors first instead.
+        """
+        if self._any_card_editing():
+            if not force:
+                self._cards_rebuild_pending = True
+                return
+            self._commit_open_editors()
+        self._cards_rebuild_pending = False
+
         # Destroy old cards
         for card in self._tag_cards:
             card.destroy()
         self._tag_cards.clear()
-        
+
         item = self._current_item
-        
+        self._edit_item = item
+        self._edit_item_type = self._current_item_type
+
         if item is None:
             self.edit_target_label.configure(text="Select a cue to edit")
+            self.add_tag_menu.configure(values=AVAILABLE_TAGS)
+            self.add_tag_var.set("+ Add Tag")
             return
-        
-        type_str = "Cue" if self._current_item_type == 'marker' else "Vamp"
-        self.edit_target_label.configure(text=f"Editing: {type_str} — {item.name}")
-        
-        # Update dropdown to only show tags not yet added
+
+        type_str = TYPE_LABELS.get(self._current_item_type, "Cue")
+        verb = "Notes" if self._live_mode else "Editing"
+        self.edit_target_label.configure(text=f"{verb}: {type_str} — {item.name}")
+
+        self._refresh_add_tag_menu(item)
+
+        # Build a card for each tag
+        for tag, notes in item.tag_notes.items():
+            card = self._create_tag_card(item, tag, notes)
+            self._tag_cards.append(card)
+
+    def _refresh_add_tag_menu(self, item):
+        """Offer only the tags the item does not have yet."""
         existing = set(item.tag_notes.keys())
         available = [t for t in AVAILABLE_TAGS if t not in existing]
         self.add_tag_menu.configure(values=available if available else ["(all tags added)"])
         self.add_tag_var.set("+ Add Tag")
-        
-        # Build a card for each tag
-        for tag, notes in item.tag_notes.items():
-            card = self._create_tag_card(tag, notes)
-            self._tag_cards.append(card)
-    
-    def _create_tag_card(self, tag, notes):
+
+    def _create_tag_card(self, item, tag, notes):
         """
-        Create an editable card for a single tag.
+        Create an editable card for a single tag of ``item``.
         Starts in VIEW mode (label). Edit button toggles to EDIT mode (textbox).
-        Save button persists and returns to VIEW mode.
+        Save button (or focus leaving the textbox) persists and returns to
+        VIEW mode. The card writes to ``item`` -- the object it was built
+        for -- even if the playback-current cue has moved on since.
         """
         color = TAG_COLORS.get(tag, "#555555")
-        
+
         card = ctk.CTkFrame(self.cards_frame, fg_color="#1a1a1a", corner_radius=6)
         card.pack(fill="x", pady=3)
         
@@ -523,13 +699,26 @@ class NotesSidebar(ctk.CTkFrame):
             fg_color=color, corner_radius=8,
             text_color="#ffffff", height=22
         ).pack(side="left", padx=(2, 6))
-        
+
+        if self._live_mode:
+            # Read-only card: no Edit / Delete while live.
+            card._editing = False
+            card._commit = lambda: None
+            ctk.CTkLabel(
+                card, text=notes if notes else "(no notes)",
+                font=("Segoe UI", 11),
+                text_color=COLOR_TEXT if notes else COLOR_TEXT_DIM,
+                wraplength=RIGHT_SIDEBAR_WIDTH - 60,
+                justify="left", anchor="w"
+            ).pack(fill="x", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+            return card
+
         # Delete tag button
         btn_delete = ctk.CTkButton(
             header, text="✕", width=26, height=22,
             fg_color="transparent", hover_color="#442222",
             text_color="#aa4444", font=("Segoe UI", 11),
-            command=lambda: self._remove_tag(tag, card)
+            command=lambda: self._remove_tag(item, tag, card)
         )
         btn_delete.pack(side="right", padx=2)
         
@@ -565,17 +754,27 @@ class NotesSidebar(ctk.CTkFrame):
         textbox.insert("0.0", notes)
         
         # ---- Toggle logic ----
+        # ``item`` is captured here: Save always writes to the cue the card
+        # was opened for, never to whatever is "current" at click time.
         card._editing = False
-        
-        def toggle_edit():
-            if card._editing:
-                # === SAVE ===
+
+        def commit():
+            """Leave edit mode, persisting the text to ``item``."""
+            if not card._editing:
+                return
+            card._editing = False
+            try:
+                if not textbox.winfo_exists():
+                    return
                 new_text = textbox.get("0.0", "end").strip()
-                if self._current_item:
-                    self._current_item.tag_notes[tag] = new_text
-                    if self.on_tag_note_save:
-                        self.on_tag_note_save(self._current_item.id, tag, new_text)
-                
+            except tk.TclError:
+                # Card torn down while focus was leaving it; nothing to save.
+                return
+
+            if self.on_tag_note_save:
+                self.on_tag_note_save(item.id, tag, new_text)
+
+            try:
                 view_label.configure(
                     text=new_text if new_text else "(click Edit to add notes)",
                     text_color=COLOR_TEXT if new_text else COLOR_TEXT_DIM
@@ -583,49 +782,61 @@ class NotesSidebar(ctk.CTkFrame):
                 edit_container.pack_forget()
                 view_label.pack(fill="x", padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
                 btn_edit.configure(text="Edit", fg_color=COLOR_BG_LIGHT, text_color=COLOR_TEXT)
-                card._editing = False
-                
-                # Refresh NOW display to show updated notes
+            except tk.TclError:
+                logger.debug("Tag card destroyed during commit", exc_info=True)
+
+            # Refresh NOW display to show updated notes (if this is the current cue)
+            if item is self._current_item:
                 self._refresh_current(self._current_position)
+
+            self._on_card_edit_ended()
+
+        def begin_edit():
+            if self._live_mode:
+                return
+            textbox.delete("0.0", "end")
+            textbox.insert("0.0", item.tag_notes.get(tag, ""))
+
+            view_label.pack_forget()
+            edit_container.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
+            btn_edit.configure(text="Save", fg_color=COLOR_BTN_SUCCESS, text_color="#ffffff")
+            card._editing = True
+            textbox.focus_set()
+
+        def toggle_edit():
+            if card._editing:
+                commit()
             else:
-                # === EDIT ===
-                textbox.delete("0.0", "end")
-                current_notes = ""
-                if self._current_item:
-                    current_notes = self._current_item.tag_notes.get(tag, "")
-                textbox.insert("0.0", current_notes)
-                
-                view_label.pack_forget()
-                edit_container.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
-                btn_edit.configure(text="Save", fg_color=COLOR_BTN_SUCCESS, text_color="#ffffff")
-                card._editing = True
-                textbox.focus_set()
-        
+                begin_edit()
+
+        card._commit = commit
         btn_edit.configure(command=toggle_edit)
-        
+        # Save on focus-out so nothing is lost if the user clicks elsewhere.
+        textbox.bind("<FocusOut>", lambda e: commit())
+
         return card
-    
-    def _remove_tag(self, tag, card_widget):
-        """Remove a tag from the current item."""
-        if self._current_item is None:
+
+    def _remove_tag(self, item, tag, card_widget):
+        """Remove ``tag`` from ``item`` (the cue the card was built for)."""
+        if self._live_mode:
             return
-        
-        self._current_item.tag_notes.pop(tag, None)
-        
+        card_widget._editing = False  # discard any in-progress text
+
+        # The backend owns the item: it removes the tag, emits and saves.
         if self.on_tag_remove:
-            self.on_tag_remove(self._current_item.id, tag)
-        
+            self.on_tag_remove(item.id, tag)
+
         card_widget.destroy()
         if card_widget in self._tag_cards:
             self._tag_cards.remove(card_widget)
-        
+
         # Update dropdown and NOW display
-        existing = set(self._current_item.tag_notes.keys())
-        available = [t for t in AVAILABLE_TAGS if t not in existing]
-        self.add_tag_menu.configure(values=available if available else ["(all tags added)"])
-        self.add_tag_var.set("+ Add Tag")
-        
-        self._refresh_current(self._current_position)
+        if item is self._edit_item:
+            self._refresh_add_tag_menu(item)
+        if item is self._current_item:
+            self._refresh_current(self._current_position)
+
+        self._on_card_edit_ended()
     
     # =========================================================================
     # UTILITIES
@@ -635,10 +846,9 @@ class NotesSidebar(ctk.CTkFrame):
         for w in frame.winfo_children():
             w.destroy()
     
-    def _fmt(self, seconds):
-        minutes = int(seconds // 60)
-        secs = seconds % 60
-        return f"{minutes}:{secs:05.2f}"
+    @staticmethod
+    def _fmt(seconds):
+        return format_time(seconds)
     
     def _fmt_countdown(self, seconds):
         if seconds <= 0:

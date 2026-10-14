@@ -5,47 +5,23 @@ All tunable parameters in one place for easy adjustment and debugging.
 Modify these values to fine-tune audio behavior, UI appearance, and performance.
 """
 
-import sys
 import os
 import customtkinter as ctk
 from themes import THEMES, DEFAULT_THEME
 from utils.preferences import get_theme_preference
+from utils.paths import get_base_path, get_data_dir
 
 # =============================================================================
 # PATHS
 # =============================================================================
+# All path logic lives in utils/paths.py (get_base_path, get_asset_path,
+# get_data_dir, get_log_dir). Import from there directly.
 
-# HELPER: Detect if we are running as a compiled exe or a script
-def get_base_path():
-    if getattr(sys, 'frozen', False):
-        # We are running as an exe - use the folder the exe is sitting in
-        return os.path.dirname(sys.executable)
-    else:
-        # We are running as a script - use the script's folder
-        return os.path.dirname(os.path.abspath(__file__))
-
-# ROOT DIR
+# ROOT DIR (executable folder when frozen, project root when run from source)
 BASE_DIR = get_base_path()
 
-# ASSET DIR (For internal read-only files like logo.png)
-# If using --onefile, internal assets are in sys._MEIPASS
-def get_asset_path(relative_path):
-    if getattr(sys, 'frozen', False):
-        base = sys._MEIPASS
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, relative_path)
-
-# Data directory for saved loop points
-# On macOS frozen builds, the .app bundle is read-only (especially under App Translocation),
-# so we use ~/Library/Application Support/LoopStation/ instead.
-if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
-    DATA_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "LoopStation")
-else:
-    DATA_DIR = os.path.join(BASE_DIR, "data")
-
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# Writable per-user data directory (platform-appropriate; see utils/paths.py)
+DATA_DIR = get_data_dir()
 
 LOOP_DATA_FILE = os.path.join(DATA_DIR, "loop_data.json")
 
@@ -65,6 +41,28 @@ CHANNELS = 2
 # Pygame mixer buffer size (lower = less latency, but more CPU)
 # 512 is good for low latency, 1024 is safer for older machines
 MIXER_BUFFER_SIZE = 1024
+
+# Name of the per-user temp subdirectory (under tempfile.gettempdir()) that
+# holds decoded audio. Stale files from earlier runs are swept on startup.
+TEMP_DIR_NAME = "LoopStation"
+
+# Maximum time to wait for ffmpeg to decode one file (seconds)
+FFMPEG_DECODE_TIMEOUT_S = 300
+
+# sounddevice output block size in frames (lower = less latency, more CPU).
+# 512 frames = 11.6 ms at 44.1 kHz.
+AUDIO_BLOCK_SIZE = 512
+
+# Declick crossfade applied inside the audio callback on every seek, skip,
+# hold, pause and tempo hot-swap (milliseconds).
+DECLICK_MS = 10
+
+# Tempo ratio bounds for set_tempo_pitch (1.0 = original speed)
+TEMPO_MIN = 0.5
+TEMPO_MAX = 2.0
+
+# Largest key change in either direction (semitones)
+SEMITONES_MAX = 12
 
 # =============================================================================
 # LOOP CROSSFADE SETTINGS  
@@ -124,17 +122,40 @@ FADE_EXIT_MAX_MS = 5000
 # MONITOR THREAD SETTINGS
 # =============================================================================
 
-# How often to update the UI (seconds)
-# 0.033 = ~30 FPS
+# Monitor thread scan interval (seconds). The monitor polls the playback
+# position this often to catch loop boundaries and skip regions. This is
+# NOT the UI refresh rate (see UI_EMIT_INTERVAL).
 UI_UPDATE_INTERVAL = 0.010
 
+# How often the monitor emits 'position_update' to the UI (seconds)
+# 0.033 = ~30 FPS
+UI_EMIT_INTERVAL = 0.033
+
 # How early to switch to loop mode before reaching loop end (milliseconds)
-# Compensates for Python/pygame latency
+# Compensates for Python/pygame latency. Default for a vamp's per-loop
+# early_switch_ms setting.
 # TUNABLE: Increase if loop starts late, decrease if it starts early
 LOOP_SWITCH_EARLY_MS = 60
 
 # Threshold for detecting loop boundary when exiting (milliseconds)
 EXIT_BOUNDARY_THRESHOLD_MS = 30
+
+# If a monitor tick lands late and the playhead is already past a vamp's end,
+# the vamp is still entered as long as we are within this window (milliseconds).
+LOOP_ENTRY_GRACE_MS = 250
+
+# Loop/marker edits are written to disk this long after the last change (ms).
+# stop() and cleanup() flush immediately.
+SAVE_DEBOUNCE_MS = 500
+
+# GO button / pedal debounce: a second GO within this window is ignored (ms)
+GO_DEBOUNCE_MS = 300
+
+# OSC output defaults (user preferences "osc" override these at runtime)
+OSC_DEFAULT_ENABLED = False
+OSC_DEFAULT_HOST = "127.0.0.1"
+OSC_DEFAULT_PORT = 53000
+OSC_DEFAULT_SCHEME = "loopstation"   # "loopstation" | "qlab"
 
 # =============================================================================
 # WAVEFORM SETTINGS
@@ -271,8 +292,11 @@ PADDING_LARGE = 20
 # FILE SETTINGS
 # =============================================================================
 
-# Supported audio formats
-SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac')
+# Supported audio formats. Everything is decoded by ffmpeg to PCM before
+# playback, so any format ffmpeg can read works; this list is what the
+# library browser shows.
+SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac',
+                     '.wma', '.aiff', '.aif', '.opus')
 
 # =============================================================================
 # DEFAULT VAMP/MARKER NAMES

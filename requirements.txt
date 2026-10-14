@@ -1,14 +1,28 @@
 # Core
-pygame>=2.5
 customtkinter>=5.2
 matplotlib>=3.7
 numpy>=1.24
 soundfile>=0.12
+Pillow>=10.0
 
-# Loop detection
+# Audio output (PortAudio) — the playback engine
+sounddevice>=0.5
+
+# MIDI input (mido parses messages; pygame's portmidi backend opens ports,
+# so no compiler is needed on any platform). python-rtmidi is optional.
+pygame>=2.5
+mido>=1.3
+
+# OSC output (QLab / lighting console integration)
+python-osc>=1.9
+
+# Loop / tempo detection
 librosa>=0.10
 
 # Web sharing (local network cue monitor)
 flask>=3.0
 qrcode>=7.4
-Pillow>=10.0
+
+# Development
+# pytest>=8
+# pyflakes>=3

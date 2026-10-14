@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Runtime data (per-user loop data, preferences, logs)
+data/
+logs/
+
+# Editors
+.vscode/
+.idea/

@@ -49,17 +49,26 @@ class ToolTip:
         # FIX: Wrap in try/except because some CTk widgets (like SegmentedButton) 
         # raise NotImplementedError for bind().
         try:
-            widget.bind("<Enter>", self._on_enter, add="+")
-            widget.bind("<Leave>", self._on_leave, add="+")
-            widget.bind("<ButtonPress>", self._on_leave, add="+")
+            self._bind(widget)
         except NotImplementedError:
-            # Widget doesn't support binding. Fail gracefully so app doesn't crash.
-            # (The tooltip just won't show for this specific widget)
-            print(f"Warning: Tooltip not supported on {widget.__class__.__name__}")
-            return
+            # Composite CTk widgets (e.g. CTkSegmentedButton) refuse bind();
+            # bind to their child buttons instead so the tip still shows.
+            children = list(getattr(widget, "_buttons_dict", {}).values())
+            if not children:
+                return
+            for child in children:
+                try:
+                    self._bind(child)
+                except (NotImplementedError, AttributeError):
+                    pass
         except AttributeError:
              # Some widgets might not even have a bind method
             return
+
+    def _bind(self, widget):
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
 
     def update_text(self, new_text):
         """Update the tooltip text dynamically."""

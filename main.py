@@ -6,197 +6,221 @@ A professional audio loop player that provides mathematically-perfect
 seamless loops by pre-processing audio in RAM.
 
 Usage:
-    python main.py [--ffmpeg PATH]
+    python main.py [--ffmpeg PATH] [--debug]
 """
 
 import os
 import sys
 
-# [START OF NEW BLOCK]
-# FORCE PYINSTALLER TO BUNDLE THESE MODULES
-# Since we import them inside main() for the "Restart" feature, 
-# PyInstaller's static analyzer misses them. We list them here 
-# inside 'if False' so they are bundled but not executed on launch.
-if False:
-    import config
-    import frontend.app
-    import frontend.waveform
-    import frontend.transport
-    import frontend.library
-    import frontend.cue_sheet
-    import frontend.detector_panel
-    import frontend.loop_controls
-    import frontend.marker_panel
-    import frontend.splash
-    import frontend.vamp_settings
-    import frontend.vamp_modal
-    import frontend.notes_sidebar
-    import backend.audio_engine
-    import backend.state_manager
-    import backend.loop_detector
-    import backend.web_server
-    import utils.ffmpeg_downloader
-    import utils.formatting
-    import utils.preferences
-
 # Must be done BEFORE importing pygame (which happens in backend imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
 
+import argparse
+import ctypes
 import logging
 from logging.handlers import RotatingFileHandler
-import argparse
-import time
-from datetime import datetime
+import shutil
+
+try:
+    import ctypes.wintypes  # Windows work-area lookup; harmless elsewhere
+except Exception:  # pragma: no cover
+    pass
 import tkinter as tk
 from tkinter import ttk
-import ctypes
-import shutil # Needed for which
 
-from utils.ffmpeg_downloader import check_startup
+from utils.paths import get_base_path, get_asset_path, get_log_dir
+from frontend import __version__
 
-# PIL is required for handling the logo image
-from PIL import Image, ImageTk
+# Third-party packages the app cannot run without (checked before they are
+# imported so a missing one produces a readable message, not a traceback).
+REQUIRED_PACKAGES = ('pygame', 'numpy', 'matplotlib', 'customtkinter', 'PIL')
 
-# Ensure we can import from our package
-sys.path.insert(0, os.path.dirname(__file__))
-
-from config import WINDOW_WIDTH, WINDOW_HEIGHT, get_asset_path
-
-# =============================================================================
-# HELPER: DETECT BASE PATH
-# =============================================================================
-def get_base_path():
-    """Returns the directory where the executable or script is running."""
-    if getattr(sys, 'frozen', False):
-        # Running as compiled app/exe
-        return os.path.dirname(sys.executable)
-    else:
-        # Running as script
-        return os.path.dirname(os.path.abspath(__file__))
 
 # =============================================================================
 # HELPER: CENTER WINDOW & HIGH DPI FIX
 # =============================================================================
 def make_dpi_aware():
     """Fixes blurry UI and incorrect positioning on Windows."""
+    if os.name != 'nt':
+        return
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
+        import ctypes
         try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
             ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def get_work_area(window):
+    """
+    Usable screen area in physical pixels (excludes the Windows taskbar).
+    Falls back to the full screen minus a margin elsewhere.
+    """
+    if os.name == 'nt':
+        try:
+            rect = ctypes.wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
+                return rect.right - rect.left, rect.bottom - rect.top
         except Exception:
             pass
+    return window.winfo_screenwidth(), window.winfo_screenheight() - 80
+
 
 def center_window(window, width, height):
-    """Centers a tkinter window on the screen reliably."""
+    """
+    Size a window to at most the usable screen area and centre it.
+
+    `width`/`height` are the desired size in the window's own geometry units
+    (customtkinter windows scale geometry() by the DPI factor, plain Tk
+    windows do not), so on a high-DPI laptop the default 1400x800 would
+    otherwise overflow the screen and hide the bottom and right edges.
+    """
     window.update_idletasks()
-    screen_width = window.winfo_screenwidth()
-    screen_height = window.winfo_screenheight()
-    x = int((screen_width / 2) - (width / 2))
-    y = int((screen_height / 2) - (height / 2))
+    work_w, work_h = get_work_area(window)
+
+    scaling = 1.0
+    if hasattr(window, "_apply_geometry_scaling"):  # customtkinter window
+        try:
+            from customtkinter import ScalingTracker
+            scaling = float(ScalingTracker.get_window_scaling(window)) or 1.0
+        except Exception:
+            scaling = 1.0
+
+    title_bar = 40  # physical pixels reserved for the OS title bar
+    max_w = int(work_w / scaling) - 16
+    max_h = int((work_h - title_bar) / scaling)
+    width = max(300, min(width, max_w))
+    height = max(200, min(height, max_h))
+
+    # Position is in physical pixels for both window types.
+    x = max(0, int((work_w - width * scaling) / 2))
+    y = max(0, int((work_h - title_bar - height * scaling) / 2))
     window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def show_fatal_error(title, message):
+    """
+    Report a startup error with a message box and on stderr.
+
+    Error path ONLY: a throw-away tk.Tk() root is fine here because we exit
+    right after. The success path must never create a plain tk.Tk() before
+    ctk.CTk() — on macOS that corrupts the Tcl/Tk interpreter and the frozen
+    app crashes with SIGSEGV.
+    """
+    print(f"{title}: {message}", file=sys.stderr)
+    try:
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        pass
+
 
 # =============================================================================
 # BOOTSTRAP SPLASH SCREEN
 # =============================================================================
 class BootstrapSplash(tk.Toplevel):
     """Splash screen with determinate progress bar and step descriptions."""
-    
+
     STEPS = [
-        ("Initializing Audio Engine...", 40),
-        ("Loading User Interface...", 70),
-        ("Loading User Library...", 90),
+        ("Initializing Audio Engine...", 50),
+        ("Loading User Interface...", 90),
         ("Ready!", 100),
     ]
-    
-    def __init__(self, parent):
+
+    def __init__(self, parent, width, height):
         super().__init__(parent)
         self.parent = parent
         self._current_progress = 0
         self._target_progress = 0
         self._step_index = 0
-        
+
         # 1. BORDERLESS
         self.overrideredirect(True)
-        
+
         # 2. STYLE
         bg_color = "#111111"
         self.configure(bg=bg_color)
-        
+
         # 3. CENTER
-        center_window(self, WINDOW_WIDTH, WINDOW_HEIGHT)
-        
+        center_window(self, width, height)
+
         # --- CONTENT LAYOUT ---
-        
+
         # Defaults (if no logo found)
         text_y_start = 0.40
-        
+
         # A. LOGO
         try:
+            from PIL import Image, ImageTk
             logo_path = get_asset_path("logo.png")
-            
+
             if os.path.exists(logo_path):
                 original = Image.open(logo_path)
-                
-                target_width = 500   
-                target_height = 250  
-                
+
+                target_width = 500
+                target_height = 250
+
                 ratio = min(target_width / original.width, target_height / original.height)
                 new_width = int(original.width * ratio)
                 new_height = int(original.height * ratio)
-                
+
                 resized = original.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(resized)
-                
+
                 logo_lbl = tk.Label(self, image=self.logo_img, bg=bg_color)
                 logo_lbl.place(relx=0.5, rely=0.25, anchor="center")
-                
+
                 text_y_start = 0.55
-                
+
         except Exception as e:
-            print(f"Could not load logo: {e}")
+            logging.getLogger("LoopStation").warning(f"Could not load logo: {e}")
 
         # B. TEXT
         tk.Label(self, text="LOOP STATION", font=("Segoe UI", 36, "bold"),
                  bg=bg_color, fg="#ffffff").place(relx=0.5, rely=text_y_start, anchor="center")
-        
+
         tk.Label(self, text="Professional Audio Looper", font=("Segoe UI", 12),
                  bg=bg_color, fg="#3b8ed0").place(relx=0.5, rely=text_y_start + 0.10, anchor="center")
-        
+
         # C. PROGRESS BAR (Determinate)
         style = ttk.Style()
         style.theme_use('default')
-        style.configure("Horizontal.TProgressbar", background="#3b8ed0", 
+        style.configure("Horizontal.TProgressbar", background="#3b8ed0",
                         troughcolor="#222222", bordercolor="#111111", thickness=6)
-        
-        self.progress = ttk.Progressbar(self, style="Horizontal.TProgressbar", 
-                                        mode='determinate', maximum=100, 
+
+        self.progress = ttk.Progressbar(self, style="Horizontal.TProgressbar",
+                                        mode='determinate', maximum=100,
                                         value=0, length=400)
         self.progress.place(relx=0.5, rely=0.79, anchor="center")
-        
+
         # D. STEP STATUS
         self.status = tk.Label(self, text="Starting up...", font=("Segoe UI", 11),
                                bg=bg_color, fg="#888888", width=50)
         self.status.place(relx=0.5, rely=0.85, anchor="center")
-        
+
         # E. PERCENT LABEL
         self.percent_label = tk.Label(self, text="0%", font=("Consolas", 9),
                                       bg=bg_color, fg="#555555")
         self.percent_label.place(relx=0.5, rely=0.91, anchor="center")
-        
+
         # F. FIRST-RUN HINT
         self.hint = tk.Label(self, text="This may take a moment on first launch",
                              font=("Segoe UI", 9), bg=bg_color, fg="#333333")
         self.hint.place(relx=0.5, rely=0.95, anchor="center")
-        
+
         # G. FOOTER
-        tk.Label(self, text="v1.0.0", font=("Segoe UI", 8),
+        tk.Label(self, text=f"v{__version__}", font=("Segoe UI", 8),
                  bg=bg_color, fg="#333333").place(relx=0.98, rely=0.98, anchor="se")
 
     def update_status(self, text, step=None):
         """Update status text and advance progress to the next step target."""
         self.status.config(text=text)
-        
+
         if step is not None and step < len(self.STEPS):
             self._step_index = step
             _, target = self.STEPS[step]
@@ -207,27 +231,28 @@ class BootstrapSplash(tk.Toplevel):
                 _, target = self.STEPS[self._step_index]
                 self._target_progress = target
                 self._step_index += 1
-        
+
         # Animate progress to target
         self._animate_to_target()
 
     def _animate_to_target(self):
         """Smoothly animate the progress bar to the target value."""
+        if not self.winfo_exists():
+            return
         if self._current_progress < self._target_progress:
             # Move in increments for smooth animation
             step_size = max(1, (self._target_progress - self._current_progress) // 8)
             self._current_progress = min(self._current_progress + step_size, self._target_progress)
-            
+
             self.progress['value'] = self._current_progress
             self.percent_label.config(text=f"{self._current_progress}%")
             self.update()
-            
+
             if self._current_progress < self._target_progress:
                 self.after(30, self._animate_to_target)
 
     def finish(self):
         """Complete the progress bar and close."""
-        # Fill to 100%
         self._target_progress = 100
         self._current_progress = 100
         self.progress['value'] = 100
@@ -236,22 +261,19 @@ class BootstrapSplash(tk.Toplevel):
         self.update()
         self.destroy()
 
+
 # =============================================================================
 # UTILS
 # =============================================================================
 
 def setup_logging(debug: bool = False) -> logging.Logger:
-    if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
-        log_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "LoopStation", "logs")
-    else:
-        log_dir = os.path.join(get_base_path(), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "loop_station.log")
+    log_file = os.path.join(get_log_dir(), "loop_station.log")
 
     file_handler = RotatingFileHandler(
         log_file,
         maxBytes=2 * 1024 * 1024,
-        backupCount=3
+        backupCount=3,
+        encoding="utf-8",
     )
     file_handler.setFormatter(logging.Formatter(
         "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
@@ -264,189 +286,188 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout), file_handler]
     )
+    # Third-party libraries are very chatty at DEBUG (font matching, PNG
+    # chunks, HTTP requests); keep the log focused on Loop Station itself.
+    for noisy in ("matplotlib", "PIL", "werkzeug", "numba", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     return logging.getLogger("LoopStation")
 
-def find_ffmpeg() -> str:
-    """
-    Robustly find FFmpeg.
-    PRIORITY 1: Check sys._MEIPASS (PyInstaller bundles --add-binary files here).
-    PRIORITY 2: Check the local folder (next to the .exe or script).
-    PRIORITY 3: Check global system PATH.
-    """
-    binary_name = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
-    
-    # 1. Check PyInstaller bundle directory (CRITICAL for macOS .app)
-    # On macOS: LoopStation.app/Contents/Resources/ (sys._MEIPASS)
-    # On Windows --onefile: temp _MEIPASS dir
-    # On Windows --onedir: same as exe dir
-    if getattr(sys, '_MEIPASS', None):
-        meipass_binary = os.path.join(sys._MEIPASS, binary_name)
-        if os.path.isfile(meipass_binary):
-            if os.name != 'nt':
-                try:
-                    os.chmod(meipass_binary, 0o755)
-                except:
-                    pass
-            return meipass_binary
-    
-    # 2. Check Local Folder (next to executable or script)
-    base_path = get_base_path()
-    local_binary = os.path.join(base_path, binary_name)
-    
-    if os.path.isfile(local_binary):
-        if os.name != 'nt':
-            try:
-                os.chmod(local_binary, 0o755)
-            except:
-                pass
-        return local_binary
-
-    # 3. Check Global PATH
-    if shutil.which("ffmpeg"): 
-        return "ffmpeg"
-        
-    # 4. Fallback (likely to fail if not found above)
-    return "ffmpeg"
 
 def check_dependencies():
+    """Return the list of required packages that cannot be imported."""
     missing = []
-    for dep in ['pygame', 'numpy', 'matplotlib', 'customtkinter', 'PIL']:
+    for dep in REQUIRED_PACKAGES:
         try:
             __import__(dep)
         except ImportError:
             missing.append(dep)
-    if missing:
-        print(f"Missing: {', '.join(missing)}")
-        sys.exit(1)
+    return missing
 
-def smart_sleep(root, seconds):
-    end_time = time.time() + seconds
-    while time.time() < end_time:
-        root.update()
-        time.sleep(0.01)
+
+def _make_executable(path):
+    """ffmpeg extracted by PyInstaller may have lost its x bit."""
+    if os.name != 'nt':
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+
+
+def find_ffmpeg(explicit=None):
+    """
+    Locate the ffmpeg binary. Returns an absolute path (or the name resolved
+    via PATH) or None if not found.
+
+    Search order:
+      1. --ffmpeg PATH given on the command line
+      2. sys._MEIPASS (PyInstaller --add-binary; macOS .app Resources)
+      3. next to the executable / project root
+      4. system PATH
+    """
+    binary_name = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
+
+    if explicit:
+        if os.path.isfile(explicit):
+            return os.path.abspath(explicit)
+        return shutil.which(explicit)
+
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidate = os.path.join(meipass, binary_name)
+        if os.path.isfile(candidate):
+            _make_executable(candidate)
+            return candidate
+
+    candidate = os.path.join(get_base_path(), binary_name)
+    if os.path.isfile(candidate):
+        _make_executable(candidate)
+        return candidate
+
+    return shutil.which("ffmpeg")
+
+
+def ffmpeg_install_hint():
+    if sys.platform == 'darwin':
+        how = "Install it with Homebrew:\n    brew install ffmpeg"
+    elif os.name == 'nt':
+        how = ("Install it with winget or Chocolatey:\n"
+               "    winget install Gyan.FFmpeg\n"
+               "    choco install ffmpeg\n"
+               "or download a build from https://ffmpeg.org/download.html and "
+               "place ffmpeg.exe next to Loop Station.")
+    else:
+        how = "Install it with your package manager, e.g.:\n    sudo apt install ffmpeg"
+    return (
+        "FFmpeg is required to decode audio files but was not found.\n\n"
+        f"{how}\n\n"
+        "You can also start Loop Station with:  --ffmpeg <path to ffmpeg>"
+    )
+
+
+def reset_python_imports():
+    """
+    Force Python to forget all 'frontend' modules so a restart re-reads the
+    new color values from config.py instead of using the cached ones.
+    """
+    modules_to_reset = [name for name in sys.modules if name.startswith("frontend")]
+    for module_name in modules_to_reset:
+        del sys.modules[module_name]
+    logging.getLogger("LoopStation").info(f"Cache cleared for {len(modules_to_reset)} UI modules.")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def reset_python_imports():
-    """
-    Force Python to forget all 'frontend' modules.
-    This ensures that when we reload the app, it re-reads the new 
-    color values from config.py instead of using the cached old ones.
-    """
-    # Create a list of modules to remove to avoid changing dictionary while iterating
-    modules_to_reset = [name for name in sys.modules.keys() if name.startswith("frontend")]
-    
-    for module_name in modules_to_reset:
-        if module_name in sys.modules:
-            del sys.modules[module_name]
-    
-    print(f"Cache cleared for {len(modules_to_reset)} UI modules.")
-
-
 def main():
     make_dpi_aware()
 
-    # 1. SETUP & LOGGING (Must happen first!)
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ffmpeg", default=None)
-    parser.add_argument("--debug", action="store_true")
+    parser = argparse.ArgumentParser(description="Loop Station")
+    parser.add_argument("--ffmpeg", default=None, help="path to the ffmpeg executable")
+    parser.add_argument("--debug", action="store_true", help="verbose logging")
+    parser.add_argument("--version", action="version", version=f"Loop Station {__version__}")
     args = parser.parse_args()
 
-    check_dependencies()
     logger = setup_logging(debug=args.debug)
-    logger.info("Loop Station Starting")
-    
-    # 2. DETERMINE PATHS (Initial check)
-    ffmpeg_path = args.ffmpeg or find_ffmpeg()
-    
-    # Import config after logging setup just in case
-    import config 
+    logger.info(f"Loop Station {__version__} starting")
 
-    # 3. AUTO-DOWNLOAD CHECK
-    # NOTE: We do NOT create a dummy tk.Tk() here anymore.
-    # On macOS, creating tk.Tk() then destroying it before creating ctk.CTk()
-    # corrupts the Tcl/Tk interpreter and causes SIGSEGV in the frozen app.
-    # Instead, we just check if ffmpeg exists. If it's bundled (frozen), it
-    # will always be found. If running from source and it's missing, we
-    # print an error and exit — the user can install ffmpeg via brew/choco.
-    try:
-        ffmpeg_path = args.ffmpeg or find_ffmpeg()
-        logger.info(f"Using ffmpeg: {ffmpeg_path}")
-        
-        # Verify it actually exists (not just a fallback "ffmpeg" string)
-        if ffmpeg_path == "ffmpeg" and not shutil.which("ffmpeg"):
-            # ffmpeg not found anywhere — in frozen mode this shouldn't happen
-            # In dev mode, tell the user to install it
-            if getattr(sys, 'frozen', False):
-                logger.error("FFmpeg not found in bundled app. This is a build error.")
-            else:
-                logger.error("FFmpeg not found. Install it: brew install ffmpeg (Mac) or choco install ffmpeg (Windows)")
-            sys.exit(1)
-        
-    except Exception as e:
-        logger.exception(f"Startup check failed: {e}")
+    # 1. Dependencies (before anything imports them)
+    missing = check_dependencies()
+    if missing:
+        msg = ("Missing Python packages: " + ", ".join(missing) +
+               "\n\nInstall them with:\n    pip install -r requirements.txt")
+        logger.error(msg)
+        show_fatal_error("Loop Station - Missing dependencies", msg)
         sys.exit(1)
 
-    # 4. APP LIFECYCLE LOOP (Now safe to start)
+    # 2. FFmpeg
+    ffmpeg_path = find_ffmpeg(args.ffmpeg)
+    if not ffmpeg_path:
+        if args.ffmpeg:
+            msg = f"The ffmpeg given with --ffmpeg was not found:\n{args.ffmpeg}"
+        elif getattr(sys, 'frozen', False):
+            msg = ("FFmpeg is missing from this Loop Station build (it should be "
+                   "bundled). Please reinstall the application.")
+        else:
+            msg = ffmpeg_install_hint()
+        logger.error(msg)
+        show_fatal_error("Loop Station - FFmpeg not found", msg)
+        sys.exit(1)
+    logger.info(f"Using ffmpeg: {ffmpeg_path}")
+
+    # 3. Heavy imports only now that the checks passed
+    import config
+    from config import WINDOW_WIDTH, WINDOW_HEIGHT
+
+    # 4. APP LIFECYCLE LOOP. A theme change asks for a restart: the app
+    #    shuts its backend down (request_restart), mainloop returns, and a
+    #    fresh app is created with the new colours. The previous AudioEngine
+    #    is always released before the next one is created.
     first_run = True
-    while True:
-        try:
+    try:
+        while True:
             if not first_run:
                 reset_python_imports()
 
             config.load_theme()
-            
-            # Late import to ensure it uses fresh config
-            from frontend.app import LoopStationApp 
+            from frontend.app import LoopStationApp  # late import: fresh config colours
 
-            # Create the REAL app
-            # Pass the ABSOLUTE PATH to ffmpeg we found
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
-            
+            center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
+
             if first_run:
                 app.withdraw()
-                center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
-
-                splash = BootstrapSplash(app)
+                splash = BootstrapSplash(app, WINDOW_WIDTH, WINDOW_HEIGHT)
                 splash.update()
-                
-                splash.update_status("Initializing Audio Engine...")
-                smart_sleep(app, 0.1)
+
+                splash.update_status("Initializing Audio Engine...", 0)
                 app.initialize_audio_system()
-                
-                splash.update_status("Loading User Interface...")
-                smart_sleep(app, 0.3)
-                
-                splash.update_status("Loading User Library...")
-                smart_sleep(app, 0.3)
-                
-                splash.update_status("Ready!")
-                smart_sleep(app, 0.3)
+
+                splash.update_status("Loading User Interface...", 1)
+                app.update_idletasks()
 
                 splash.finish()
                 app.deiconify()
-                first_run = False 
+                first_run = False
             else:
-                center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
                 app.initialize_audio_system()
 
             app.run()
-            
+
             if not app.restart_required:
-                break 
-                
+                break
             logger.info("Theme change detected. Reloading application...")
 
-        except Exception as e:
-            logger.exception(f"Critical Error: {e}")
-            break 
-        finally:
-            if not first_run and ('app' in locals() and not app.restart_required):
-                 logger.info("Loop Station Exiting")
+    except Exception as e:
+        logger.exception("Critical error")
+        show_fatal_error(
+            "Loop Station - Error",
+            f"Loop Station hit an unexpected error and has to close:\n\n{e}\n\n"
+            f"Details are in the log folder:\n{get_log_dir()}",
+        )
+    finally:
+        logger.info("Loop Station exiting")
+
 
 if __name__ == "__main__":
     main()
-
