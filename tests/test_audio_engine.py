@@ -3,7 +3,6 @@ import gc
 import os
 import queue
 import struct
-import subprocess
 import threading
 import time
 import types
@@ -528,7 +527,10 @@ def test_ffmpeg_decode_memmap_matches_wav(make_engine, song_wav):
 def test_ffmpeg_decodes_flac_and_pads_short_stems(make_engine, song_wav, tmp_path):
     path, data = song_wav
     flac = tmp_path / "song.flac"
-    subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-y", "-i", path, str(flac)], check=True)
+    # Written with soundfile: the bundled LGPL ffmpeg on Mac can only decode
+    # (encoders/muxers other than WAV/PCM are disabled), like the app needs.
+    import soundfile
+    soundfile.write(str(flac), data, SR, subtype="PCM_16")
     click = make_signal(1.0, freq=1000.0)
     click_path = write_wav(tmp_path / "click.wav", click)
     eng, _ = make_engine(FFMPEG)

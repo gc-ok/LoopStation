@@ -121,7 +121,7 @@ jobs:
         python -m pyflakes backend frontend utils main.py config.py
         # -v names each test as it runs; a test stuck for 5 min dumps every
         # thread's stack and fails instead of hanging the job.
-        python -m pytest tests -v --timeout=300 --timeout-method=thread \
+        python -m pytest tests -v --timeout=300 --timeout-method=thread --durations=15 \
           --ignore=tests/test_frontend_smoke.py --ignore=tests/test_review_fixes_frontend.py \
           --ignore=tests/test_ui_polish.py --ignore=tests/test_show_ui.py
 
