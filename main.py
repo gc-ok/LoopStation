@@ -35,10 +35,8 @@ try:
 except Exception:  # pragma: no cover
     pass
 import tkinter as tk
-from tkinter import ttk
 
-from utils.fonts import FONT_UI
-from utils.paths import get_base_path, get_asset_path, get_log_dir
+from utils.paths import get_base_path, get_log_dir
 from frontend import __version__
 
 # Third-party packages the app cannot run without (checked before they are
@@ -133,137 +131,6 @@ def show_fatal_error(title, message):
 # =============================================================================
 # BOOTSTRAP SPLASH SCREEN
 # =============================================================================
-class BootstrapSplash(tk.Toplevel):
-    """Compact startup card: app name, thin progress bar, current step."""
-
-    STEPS = [
-        ("Initializing Audio Engine...", 50),
-        ("Loading User Interface...", 90),
-        ("Ready!", 100),
-    ]
-    CARD_WIDTH = 480
-    CARD_HEIGHT = 280
-
-    def __init__(self, parent, width=None, height=None):
-        # width / height are the main window's size; the card is fixed-size
-        super().__init__(parent)
-        self.parent = parent
-        self._current_progress = 0
-        self._target_progress = 0
-        self._step_index = 0
-
-        import config
-        bg = config.COLOR_BG_MEDIUM
-        accent = config.COLOR_BTN_PRIMARY
-        text = config.COLOR_TEXT
-        dim = config.COLOR_TEXT_DIM
-        faint = config.mix(bg, dim, 0.6)
-        track = config.COLOR_BG_LIGHT
-
-        self.overrideredirect(True)
-        self.configure(bg=bg, highlightthickness=1,
-                       highlightbackground=config.COLOR_BORDER,
-                       highlightcolor=config.COLOR_BORDER)
-        center_window(self, self.CARD_WIDTH, self.CARD_HEIGHT)
-
-        # Accent strip along the top edge
-        tk.Frame(self, bg=accent, height=3).place(relx=0, rely=0, relwidth=1)
-
-        tk.Label(self, text="Loop Station", font=(FONT_UI, 30, "bold"),
-                 bg=bg, fg=text).place(relx=0.5, rely=0.30, anchor="center")
-        tk.Label(self, text="Seamless vamps for live theater", font=(FONT_UI, 12),
-                 bg=bg, fg=dim).place(relx=0.5, rely=0.45, anchor="center")
-
-        style = ttk.Style(self)
-        style.theme_use('default')
-        style.configure("Splash.Horizontal.TProgressbar", background=accent,
-                        troughcolor=track, bordercolor=track,
-                        lightcolor=accent, darkcolor=accent, thickness=4)
-        self.progress = ttk.Progressbar(self, style="Splash.Horizontal.TProgressbar",
-                                        mode='determinate', maximum=100,
-                                        value=0, length=320)
-        self.progress.place(relx=0.5, rely=0.64, anchor="center")
-
-        self.status = tk.Label(self, text="Starting up...", font=(FONT_UI, 11),
-                               bg=bg, fg=dim)
-        self.status.place(relx=0.5, rely=0.74, anchor="center")
-
-        # Footer: maker's mark (dark themes only: the logo is white) + version
-        self._add_logo(bg, dark=self._is_dark(bg))
-        tk.Label(self, text=f"v{__version__}", font=(FONT_UI, 9),
-                 bg=bg, fg=faint).place(relx=0.96, rely=0.93, anchor="se")
-
-    @staticmethod
-    def _is_dark(color):
-        return sum(int(color[i:i + 2], 16) for i in (1, 3, 5)) < 382
-
-    def _add_logo(self, bg, dark):
-        if not dark:
-            return
-        try:
-            from PIL import Image, ImageTk
-            logo_path = get_asset_path("logo.png")
-            if not os.path.exists(logo_path):
-                return
-            image = Image.open(logo_path).convert("RGBA")
-            box = image.getbbox()           # trim the transparent padding
-            if box:
-                image = image.crop(box)
-            target_h = 22
-            ratio = target_h / image.height
-            image = image.resize((max(1, int(image.width * ratio)), target_h),
-                                 Image.Resampling.LANCZOS)
-            # Fade the white mark so it sits quietly in the footer
-            alpha = image.getchannel("A").point(lambda a: int(a * 0.45))
-            image.putalpha(alpha)
-            self.logo_img = ImageTk.PhotoImage(image)
-            tk.Label(self, image=self.logo_img, bg=bg).place(
-                relx=0.04, rely=0.93, anchor="sw")
-        except Exception as e:
-            logging.getLogger("LoopStation").warning(f"Could not load logo: {e}")
-
-    def update_status(self, text, step=None):
-        """Update status text and advance progress to the next step target."""
-        self.status.config(text=text)
-
-        if step is not None and step < len(self.STEPS):
-            self._step_index = step
-            _, target = self.STEPS[step]
-            self._target_progress = target
-        else:
-            # Auto-advance to next step
-            if self._step_index < len(self.STEPS):
-                _, target = self.STEPS[self._step_index]
-                self._target_progress = target
-                self._step_index += 1
-
-        # Animate progress to target
-        self._animate_to_target()
-
-    def _animate_to_target(self):
-        """Smoothly animate the progress bar to the target value."""
-        if not self.winfo_exists():
-            return
-        if self._current_progress < self._target_progress:
-            # Ease out: big steps first, then small ones
-            step_size = max(1, (self._target_progress - self._current_progress) // 6)
-            self._current_progress = min(self._current_progress + step_size, self._target_progress)
-
-            self.progress['value'] = self._current_progress
-            self.update()
-
-            if self._current_progress < self._target_progress:
-                self.after(16, self._animate_to_target)
-
-    def finish(self):
-        """Complete the progress bar and close."""
-        self._target_progress = 100
-        self._current_progress = 100
-        self.progress['value'] = 100
-        self.status.config(text="Ready")
-        self.update()
-        self.destroy()
-
 
 # =============================================================================
 # UTILS
@@ -471,25 +338,16 @@ def main():
             from frontend.app import LoopStationApp  # late import: fresh config colours
 
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
+            # Build everything hidden and show the window ONCE, fully drawn.
+            # (A splash card used to flash for ~1 s before the main window,
+            # and centring could map the half-built window for a frame.)
+            app.withdraw()
             install_tk_crash_handler(app, logger)
             center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
-
-            if first_run:
-                app.withdraw()
-                splash = BootstrapSplash(app, WINDOW_WIDTH, WINDOW_HEIGHT)
-                splash.update()
-
-                splash.update_status("Initializing Audio Engine...", 0)
-                app.initialize_audio_system()
-
-                splash.update_status("Loading User Interface...", 1)
-                app.update_idletasks()
-
-                splash.finish()
-                app.deiconify()
-                first_run = False
-            else:
-                app.initialize_audio_system()
+            app.initialize_audio_system()
+            app.update_idletasks()
+            app.deiconify()
+            first_run = False
 
             app.run()
 

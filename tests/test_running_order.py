@@ -40,13 +40,16 @@ def _song(folder, name, secs, freq=440.0):
 @pytest.fixture
 def show(sm, tmp_path):
     folder = str(tmp_path / "music")
-    a = _song(folder, "Overture <A&B>.wav", 2.0, 300)
-    b = _song(folder, "Ballad, \"Slow\".wav", 3.0, 400)
+    # < > " are illegal in Windows filenames, so those titles come from renames.
+    a = _song(folder, "Overture AB.wav", 2.0, 300)
+    b = _song(folder, "Ballad, Slow.wav", 3.0, 400)
     c = _song(folder, "Cut Song.wav", 4.0, 500)
     d = _song(folder, "Finale ♪ Ünï.wav", 5.0, 600)
     sm.new_show("Act <One> & Two")
     sm.add_divider("Act 1 <script>")
     ids = sm.add_songs([a, b, c])
+    assert sm.rename_entry(ids[0], "Overture <A&B>")
+    assert sm.rename_entry(ids[1], 'Ballad, "Slow"')
     sm.add_divider("Act 2")
     ids += sm.add_songs([d])
     sm.set_entry_cut(ids[2], True)

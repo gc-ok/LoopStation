@@ -180,3 +180,15 @@ MIDI in, OSC out). Entry point: `main.py`.
   14. Live conductor-follow tempo.
 - Deliberately not done yet: undo, delete confirmations, waveform pan/zoom,
   and editing notes for future cues.
+- Someday (NOT current scope, don't start it unprompted): a community library
+  of vamp/cue packs. Users upload and download cue data only, never audio.
+  Each pack is tagged with show, licensor, track version, track number and
+  title, track length and any modifications, so people find packs that match
+  the tracks they own.
+  - Plan: first, cue-pack export/import in the app (`.loopcues` JSON). On
+    import, check the length against the loaded file, preview over the
+    waveform, then save through `state_manager`. Then a hosted backend,
+    likely Supabase: packs as size-capped `jsonb` rows, anonymous download,
+    sign-in to upload, votes, auto-hide after reports.
+  - Today's fingerprint (`_get_file_fingerprint`, an MD5 of size plus
+    chunks) only matches byte-identical files, so packs can't key on it.

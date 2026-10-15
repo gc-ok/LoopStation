@@ -15,7 +15,7 @@ from backend.midi_control import MidiController, describe_key, legacy_key, _matc
 from backend.osc_output import OscOutput, sanitize_osc_cue
 from backend.web_server import (
     CueWebServer, SharedCueState, WebServerStartError, create_flask_app, get_local_ips,
-    TOKEN_COOKIE,
+    TOKEN_COOKIE, REQUEST_TIMEOUT_S,
 )
 from utils import preferences
 
@@ -457,7 +457,11 @@ def test_stop_drops_lingering_connections_quickly(fresh_server_globals):
         for s in socks:
             _, closed = _recv_all(s, timeout=2.0)
             assert closed
-        assert wait_until(lambda: inner.connection_count == 0, timeout=2.0)
+        # Windows CI: clients see the close at once, but handler threads seem
+        # to stay parked until their socket timeout (shutdown() doesn't wake
+        # them there), so allow REQUEST_TIMEOUT_S before they're forgotten.
+        settle = REQUEST_TIMEOUT_S + 2.0 if os.name == "nt" else 2.0
+        assert wait_until(lambda: inner.connection_count == 0, timeout=settle)
     finally:
         for s in socks:
             s.close()

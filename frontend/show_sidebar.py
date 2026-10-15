@@ -48,6 +48,10 @@ from utils import preferences
 from utils.tooltip import ToolTip
 from .go_panel import ACTION_COLORS
 
+NO_SHOW_TITLE = "No show open"
+NO_SHOW_SUB = "A show is the running order of your songs."
+RECENT_ON_WELCOME = 4
+
 logger = logging.getLogger("LoopStation.ShowSidebar")
 
 # The NEXT badge uses the GO panel's "GO: next song" colour so both agree
@@ -163,13 +167,13 @@ class ShowSidebar(ctk.CTkFrame):
         header.pack(fill="x", padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 0))
 
         self.name_label = ctk.CTkLabel(
-            header, text="No show", font=(FONT_UI, 16, "bold"),
+            header, text=NO_SHOW_TITLE, font=(FONT_UI, 16, "bold"),
             text_color=COLOR_TEXT, anchor="w", justify="left",
             wraplength=SIDEBAR_WIDTH - 30)
         self.name_label.pack(fill="x")
 
         self.folder_label = ctk.CTkLabel(
-            header, text="Open a folder or a show", font=(FONT_UI, 10),
+            header, text=NO_SHOW_SUB, font=(FONT_UI, 10),
             text_color=COLOR_TEXT_DIM, anchor="w", justify="left",
             wraplength=SIDEBAR_WIDTH - 30)
         self.folder_label.pack(fill="x")
@@ -208,8 +212,9 @@ class ShowSidebar(ctk.CTkFrame):
         self.empty_label = ctk.CTkLabel(
             self.song_list_frame, font=(FONT_UI, 12), text_color=COLOR_TEXT_DIM,
             justify="center", wraplength=SIDEBAR_WIDTH - 80,
-            text="This show is empty.\n\nOpen a folder or show from Show ▾, "
-                 "click + Add songs, or drag audio files here.")
+            text="No songs in this show yet.\n\n"
+                 "Click + Add songs, or drag audio files here.")
+        self._build_welcome()
 
         self.count_label = ctk.CTkLabel(self, text="0 songs", font=(FONT_UI, 10),
                                         text_color=COLOR_TEXT_DIM)
@@ -397,7 +402,7 @@ class ShowSidebar(ctk.CTkFrame):
 
     def _apply_enabled(self):
         editable = "normal" if self.accepting_clicks else "disabled"
-        for widget in (self.btn_add, self.theme_menu):
+        for widget in (self.btn_add, self.theme_menu, *getattr(self, "welcome_buttons", ())):
             try:
                 widget.configure(state=editable)
             except (tk.TclError, ValueError):
@@ -441,6 +446,7 @@ class ShowSidebar(ctk.CTkFrame):
         if self._selected_id is not None and self._entry(self._selected_id) is None:
             self._selected_id = None
         self._update_header()
+        self._update_empty_state()
         key = self._structure(snap["entries"])
         if key != self._structure_key:
             self._structure_key = key
@@ -461,13 +467,93 @@ class ShowSidebar(ctk.CTkFrame):
         self.snapshot["next_up_entry_id"] = entry_id
         self._apply_highlight()
 
+    # ---- empty states ----------------------------------------------------------
+
+    def _build_welcome(self):
+        """'Get started' panel shown while no show is open."""
+        w = self.welcome = ctk.CTkFrame(self.song_list_frame, fg_color="transparent")
+        ctk.CTkLabel(w, text="Get started", font=(FONT_UI, 13, "bold"),
+                     text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(8, 6))
+        self.welcome_buttons = []
+        choices = (
+            ("Open a music folder…", "Every audio file in the folder, in name order",
+             self.open_folder_dialog, True),
+            ("Open a saved show…", "A .loopshow file you saved earlier",
+             self.open_show_dialog, False),
+            ("New empty show", "Then add songs or drag audio files in",
+             self.new_show, False),
+        )
+        for text, hint, command, primary in choices:
+            btn = ctk.CTkButton(
+                w, text=text, height=32, anchor="w", font=(FONT_UI, 12, "bold"),
+                fg_color=COLOR_BTN_PRIMARY if primary else COLOR_BG_LIGHT,
+                hover_color=None if primary else COLOR_HOVER,
+                text_color=COLOR_BTN_TEXT if primary else COLOR_TEXT,
+                border_width=0 if primary else 1, border_color=COLOR_BORDER,
+                command=command)
+            btn.pack(fill="x")
+            ctk.CTkLabel(w, text=hint, font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM,
+                         anchor="w", justify="left",
+                         wraplength=SIDEBAR_WIDTH - 50).pack(fill="x", pady=(1, 8))
+            self.welcome_buttons.append(btn)
+        self.welcome_recent = ctk.CTkFrame(w, fg_color="transparent")
+        self.welcome_recent.pack(fill="x", pady=(4, 0))
+        self._welcome_recent_refs = None
+
+    def _refresh_welcome_recent(self):
+        refs = preferences.get_recent_shows()[:RECENT_ON_WELCOME]
+        key = [(r.get("kind"), r.get("path")) for r in refs]
+        if key == self._welcome_recent_refs:
+            return
+        self._welcome_recent_refs = key
+        for child in self.welcome_recent.winfo_children():
+            child.destroy()
+        if not refs:
+            return
+        ctk.CTkLabel(self.welcome_recent, text="RECENT", font=(FONT_UI, 10, "bold"),
+                     text_color=COLOR_TEXT_DIM, anchor="w").pack(fill="x", pady=(0, 2))
+        for ref in refs:
+            if ref["kind"] == "file":
+                name = os.path.splitext(os.path.basename(ref["path"]))[0]
+                kind = "show"
+            else:
+                name, kind = self.folder_display_name(ref["path"]), "folder"
+            btn = ctk.CTkButton(
+                self.welcome_recent, text=f"{name}   ·  {kind}", height=26, anchor="w",
+                font=(FONT_UI, 11), fg_color="transparent", hover_color=COLOR_HOVER,
+                text_color=COLOR_TEXT, command=lambda r=ref: self.open_recent(r))
+            btn.pack(fill="x")
+            ToolTip(btn, ref["path"])
+            self.welcome_buttons.append(btn)
+        self._apply_enabled()
+
+    def is_no_show(self) -> bool:
+        snap = self.snapshot
+        return not (snap["entries"] or snap.get("file_path") or snap.get("folder")
+                    or snap.get("dirty"))
+
+    def _update_empty_state(self):
+        """Welcome panel (no show), 'no songs yet' (empty show), or nothing."""
+        if self.snapshot["entries"]:
+            self.welcome.pack_forget()
+            self.empty_label.pack_forget()
+        elif self.is_no_show():
+            self.empty_label.pack_forget()
+            self._refresh_welcome_recent()
+            if not self.welcome.winfo_manager():
+                self.welcome.pack(fill="x", padx=PADDING_SMALL)
+        else:
+            self.welcome.pack_forget()
+            if not self.empty_label.winfo_manager():
+                self.empty_label.pack(fill="x", pady=30)
+
     def _update_header(self):
         snap = self.snapshot
         entries = snap["entries"]
         name = snap.get("name") or "Untitled show"
         if not entries and not snap.get("file_path") and not snap.get("folder") \
                 and not snap.get("dirty"):
-            title = "No show"
+            title = NO_SHOW_TITLE
         else:
             title = name + ("  •" if snap.get("dirty") else "")
         self.name_label.configure(text=title)
@@ -478,7 +564,7 @@ class ShowSidebar(ctk.CTkFrame):
         elif entries:
             sub = "Not saved yet - Show ▾ › Save As…"
         else:
-            sub = "Open a folder or a show"
+            sub = NO_SHOW_SUB
         self.folder_label.configure(text=sub)
         songs = [e for e in entries if e.get("kind") == "song"]
         cut = sum(1 for e in songs if e.get("cut"))
@@ -512,10 +598,7 @@ class ShowSidebar(ctk.CTkFrame):
         self._clear_rows()
         entries = self.snapshot["entries"]
         self._numbers = self.compute_numbers(entries)
-        if entries:
-            self.empty_label.pack_forget()
-        else:
-            self.empty_label.pack(fill="x", pady=30)
+        self._update_empty_state()
         self._create_rows_batch(self._load_generation, 0)
 
     @property

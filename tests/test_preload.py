@@ -140,6 +140,7 @@ def test_preload_then_load_adopts_files_without_ffmpeg(make_engine, song, popen_
     streams[-1].pump(512)
     assert eng.get_position() == pytest.approx(0.5 + 512 / SR, abs=1e-4)
 
+    del buffers     # still-mapped files can't be deleted on Windows
     eng.cleanup()
     assert temp_files(eng) == []
 

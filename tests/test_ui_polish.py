@@ -66,3 +66,39 @@ def test_held_go_pulses_and_stops(ui):
         gp.set_held(held=False)
     assert gp._pulse_after is None
     assert gp.btn_go.cget("border_width") == 0
+
+
+# ------------------------------------------------- show sidebar empty states --
+
+def _render(lib, **snap):
+    lib.render(snap)
+    lib.update_idletasks()
+
+
+def test_no_show_offers_get_started_choices(ui):
+    lib = ui.library
+    try:
+        _render(lib)                                         # nothing open
+        assert lib.name_label.cget("text") == "No show open"
+        assert lib.welcome.winfo_manager() and not lib.empty_label.winfo_manager()
+        labels = [b.cget("text") for b in lib.welcome_buttons]
+        assert labels[:3] == ["Open a music folder…", "Open a saved show…", "New empty show"]
+
+        _render(lib, name="Spring", dirty=True)              # new, empty show
+        assert not lib.welcome.winfo_manager() and lib.empty_label.winfo_manager()
+        assert "No songs in this show yet" in lib.empty_label.cget("text")
+    finally:
+        lib.refresh_from_state()
+
+
+def test_welcome_choices_locked_in_live_mode(ui):
+    lib = ui.library
+    try:
+        _render(lib)
+        lib.set_locked(True)
+        assert all(b.cget("state") == "disabled" for b in lib.welcome_buttons)
+        lib.set_locked(False)
+        assert all(b.cget("state") == "normal" for b in lib.welcome_buttons)
+    finally:
+        lib.set_locked(False)
+        lib.refresh_from_state()

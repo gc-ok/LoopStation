@@ -9,7 +9,9 @@ jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60        # a hung test must not burn the 6 h default
     strategy:
+      fail-fast: false         # one OS failing must not cancel the other
       matrix:
         include:
           - os: windows-latest
@@ -106,7 +108,7 @@ jobs:
     - name: Install Python Dependencies
       run: |
         pip install --upgrade pip
-        pip install -r requirements.txt pyinstaller pytest pyflakes
+        pip install -r requirements.txt pyinstaller pytest pytest-timeout pyflakes
 
     - name: Lint and test
       shell: bash
@@ -116,7 +118,9 @@ jobs:
       run: |
         python -c "import os, subprocess; subprocess.run([os.environ['LOOPSTATION_FFMPEG'], '-hide_banner', '-filters'], check=True)"
         python -m pyflakes backend frontend utils main.py config.py
-        python -m pytest tests -q
+        # -v names each test as it runs; a test stuck for 5 min dumps every
+        # thread's stack and fails instead of hanging the job.
+        python -m pytest tests -v --timeout=300 --timeout-method=thread
 
     # BUILD WINDOWS (bundles LGPL ffmpeg + ffprobe)
     - name: Build Windows .exe
