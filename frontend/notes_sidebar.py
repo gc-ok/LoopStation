@@ -19,8 +19,10 @@ from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
-    COLOR_BG_DARK, COLOR_BG_MEDIUM, COLOR_BG_LIGHT,
+    COLOR_BORDER, COLOR_BTN_DANGER, COLOR_HOVER, COLOR_TEXT_DISABLED, COLOR_VAMP, tint,
+    COLOR_BG_MEDIUM, COLOR_BG_LIGHT,
     COLOR_TEXT, COLOR_TEXT_DIM, COLOR_MARKER,
     COLOR_BTN_SUCCESS,
     PADDING_SMALL, PADDING_MEDIUM,
@@ -37,7 +39,7 @@ COLOR_HOLD = "#5ec8f2"
 COLOR_ACK = "#7ddc8a"
 COLOR_LIVE = "#ff9f43"
 
-TYPE_ICONS = {'marker': "📍", 'vamp': "🔁", 'hold': "⏸"}
+TYPE_ICONS = {'marker': "◆", 'vamp': "↻", 'hold': "⏸"}
 TYPE_LABELS = {'marker': "Cue", 'vamp': "Vamp", 'hold': "Hold"}
 
 
@@ -81,7 +83,7 @@ class NotesSidebar(ctk.CTkFrame):
         self._next_item = None
         self._current_item_type = None
         self._next_item_type = None
-        self._last_countdown_update = 0
+        self._last_countdown_update = -1e9
         self._acks = {}
         self._live_mode = False
         self._playback_rate = 1.0
@@ -102,13 +104,13 @@ class NotesSidebar(ctk.CTkFrame):
         """Build the sidebar UI."""
         
         # Title bar
-        title_frame = ctk.CTkFrame(self, fg_color="#1a1a2e", corner_radius=0, height=40)
+        title_frame = ctk.CTkFrame(self, fg_color=COLOR_BG_MEDIUM, corner_radius=0, height=40)
         title_frame.pack(fill="x")
         title_frame.pack_propagate(False)
         
         ctk.CTkLabel(
             title_frame, text="CUE DETAILS",
-            font=("Segoe UI", 13, "bold"),
+            font=(FONT_UI, 13, "bold"),
             text_color=COLOR_TEXT
         ).pack(side="left", padx=PADDING_MEDIUM, pady=8)
         
@@ -125,7 +127,7 @@ class NotesSidebar(ctk.CTkFrame):
         self._section_header(self.scroll, "NOW")
         
         self.current_frame = ctk.CTkFrame(
-            self.scroll, fg_color="#1e2a1e", corner_radius=8
+            self.scroll, fg_color=COLOR_BG_LIGHT, corner_radius=8
         )
         self.current_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
@@ -133,20 +135,20 @@ class NotesSidebar(ctk.CTkFrame):
         self.current_header.pack(fill="x", padx=PADDING_SMALL, pady=(PADDING_SMALL, 0))
         
         self.current_icon = ctk.CTkLabel(
-            self.current_header, text="--", font=("Segoe UI", 16), width=30
+            self.current_header, text="--", font=(FONT_UI, 16), width=30
         )
         self.current_icon.pack(side="left")
         
         self.current_name = ctk.CTkLabel(
             self.current_header, text="No active cue",
-            font=("Segoe UI", 15, "bold"), text_color=COLOR_TEXT,
+            font=(FONT_UI, 15, "bold"), text_color=COLOR_TEXT,
             wraplength=RIGHT_SIDEBAR_WIDTH - 80
         )
         self.current_name.pack(side="left", padx=5, fill="x", expand=True)
         
         self.current_time = ctk.CTkLabel(
             self.current_frame, text="",
-            font=("Consolas", 11), text_color=COLOR_TEXT_DIM
+            font=(FONT_MONO, 11), text_color=COLOR_TEXT_DIM
         )
         self.current_time.pack(anchor="w", padx=PADDING_MEDIUM, pady=(2, 0))
         
@@ -156,7 +158,7 @@ class NotesSidebar(ctk.CTkFrame):
 
         # "✓ Acked by: ..." (packed only when the shown cue has acks)
         self.current_acks = ctk.CTkLabel(
-            self.current_frame, text="", font=("Segoe UI", 10, "bold"),
+            self.current_frame, text="", font=(FONT_UI, 10, "bold"),
             text_color=COLOR_ACK, anchor="w", justify="left",
             wraplength=RIGHT_SIDEBAR_WIDTH - 50
         )
@@ -167,40 +169,40 @@ class NotesSidebar(ctk.CTkFrame):
         self._section_header(self.scroll, "UP NEXT")
         
         self.next_frame = ctk.CTkFrame(
-            self.scroll, fg_color="#2a2a1e", corner_radius=8
+            self.scroll, fg_color=COLOR_BG_LIGHT, corner_radius=8
         )
         self.next_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
         # Big countdown
         self.countdown_label = ctk.CTkLabel(
             self.next_frame, text="--:--",
-            font=("Consolas", 36, "bold"), text_color="#ffcc00"
+            font=(FONT_MONO, 36, "bold"), text_color=COLOR_TEXT_DISABLED
         )
         self.countdown_label.pack(pady=(PADDING_SMALL, 2))
         
         ctk.CTkLabel(
             self.next_frame, text="until next cue",
-            font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM
+            font=(FONT_UI, 9), text_color=COLOR_TEXT_DIM
         ).pack(pady=(0, 4))
         
         self.next_header = ctk.CTkFrame(self.next_frame, fg_color="transparent")
         self.next_header.pack(fill="x", padx=PADDING_SMALL, pady=(0, 2))
         
         self.next_icon = ctk.CTkLabel(
-            self.next_header, text="", font=("Segoe UI", 14), width=30
+            self.next_header, text="", font=(FONT_UI, 14), width=30
         )
         self.next_icon.pack(side="left")
         
         self.next_name = ctk.CTkLabel(
             self.next_header, text="--",
-            font=("Segoe UI", 13, "bold"), text_color=COLOR_TEXT,
+            font=(FONT_UI, 13, "bold"), text_color=COLOR_TEXT,
             wraplength=RIGHT_SIDEBAR_WIDTH - 80
         )
         self.next_name.pack(side="left", padx=5, fill="x", expand=True)
         
         self.next_time = ctk.CTkLabel(
             self.next_frame, text="",
-            font=("Consolas", 10), text_color=COLOR_TEXT_DIM
+            font=(FONT_MONO, 10), text_color=COLOR_TEXT_DIM
         )
         self.next_time.pack(anchor="w", padx=PADDING_MEDIUM, pady=(0, 2))
         
@@ -209,7 +211,7 @@ class NotesSidebar(ctk.CTkFrame):
         self.next_tags_notes.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
 
         self.next_acks = ctk.CTkLabel(
-            self.next_frame, text="", font=("Segoe UI", 10, "bold"),
+            self.next_frame, text="", font=(FONT_UI, 10, "bold"),
             text_color=COLOR_ACK, anchor="w", justify="left",
             wraplength=RIGHT_SIDEBAR_WIDTH - 50
         )
@@ -220,14 +222,14 @@ class NotesSidebar(ctk.CTkFrame):
         self._section_header(self.scroll, "EDIT TAGS & NOTES")
         
         self.edit_frame = ctk.CTkFrame(
-            self.scroll, fg_color=COLOR_BG_DARK, corner_radius=8
+            self.scroll, fg_color=COLOR_BG_LIGHT, corner_radius=8
         )
         self.edit_frame.pack(fill="x", padx=PADDING_SMALL, pady=(0, PADDING_MEDIUM))
         
         # Editing target
         self.edit_target_label = ctk.CTkLabel(
             self.edit_frame, text="Select a cue to edit",
-            font=("Segoe UI", 11, "bold"), text_color=COLOR_TEXT_DIM,
+            font=(FONT_UI, 11, "bold"), text_color=COLOR_TEXT_DIM,
             anchor="w", justify="left", wraplength=RIGHT_SIDEBAR_WIDTH - 60
         )
         self.edit_target_label.pack(anchor="w", fill="x", padx=PADDING_MEDIUM,
@@ -240,8 +242,8 @@ class NotesSidebar(ctk.CTkFrame):
 
         # Shown instead of the Add Tag menu while live
         self.live_note = ctk.CTkLabel(
-            self.edit_frame, text="🔒 LIVE — notes are read-only",
-            font=("Segoe UI", 10, "bold"), text_color=COLOR_LIVE
+            self.edit_frame, text="LIVE · notes are read-only",
+            font=(FONT_UI, 10, "bold"), text_color=COLOR_LIVE
         )
         
         self.add_tag_var = tk.StringVar(value="+ Add Tag")
@@ -249,14 +251,15 @@ class NotesSidebar(ctk.CTkFrame):
             add_tag_frame,
             values=AVAILABLE_TAGS,
             width=140, height=28,
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             command=self._on_add_tag,
-            fg_color="#336633",
-            button_color="#336633",
-            text_color="#ffffff",
-            dropdown_fg_color="#336633",
-            dropdown_text_color="#ffffff",
-            dropdown_hover_color="#448844",
+            fg_color=COLOR_BORDER,
+            button_color=COLOR_BORDER,
+            button_hover_color=COLOR_HOVER,
+            text_color=COLOR_TEXT,
+            dropdown_fg_color=COLOR_BG_LIGHT,
+            dropdown_text_color=COLOR_TEXT,
+            dropdown_hover_color=COLOR_HOVER,
             variable=self.add_tag_var
         )
         self.add_tag_menu.pack(side="left")
@@ -273,7 +276,7 @@ class NotesSidebar(ctk.CTkFrame):
     def _section_header(self, parent, text):
         ctk.CTkLabel(
             parent, text=text,
-            font=("Segoe UI", 10, "bold"), text_color=COLOR_TEXT_DIM
+            font=(FONT_UI, 10, "bold"), text_color=COLOR_TEXT_DIM
         ).pack(anchor="w", padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 4))
     
     # =========================================================================
@@ -297,7 +300,7 @@ class NotesSidebar(ctk.CTkFrame):
         """Update current playback position."""
         self._current_position = position
         
-        now = time.time()
+        now = time.monotonic()      # wall-clock jumps must not freeze the countdown
         if now - self._last_countdown_update < 0.25:
             self._update_countdown_only(position)
             return
@@ -405,7 +408,7 @@ class NotesSidebar(ctk.CTkFrame):
         self.current_name.configure(text="No active cue")
         self.current_time.configure(text="")
         self._clear_children(self.current_tags_notes)
-        self.countdown_label.configure(text="--:--", text_color="#555555")
+        self.countdown_label.configure(text="--:--", text_color=COLOR_TEXT_DISABLED)
         self.next_icon.configure(text="")
         self.next_name.configure(text="--")
         self.next_time.configure(text="")
@@ -422,29 +425,29 @@ class NotesSidebar(ctk.CTkFrame):
             self.current_icon.configure(text="--")
             self.current_name.configure(text="No active cue")
             self.current_time.configure(text="")
-            self.current_frame.configure(fg_color="#1a1a1a")
+            self.current_frame.configure(fg_color=COLOR_BG_LIGHT)
             self._clear_children(self.current_tags_notes)
             self._refresh_acks()
             return
 
         if itype == 'marker':
-            self.current_icon.configure(text="📍")
+            self.current_icon.configure(text="◆", text_color=COLOR_MARKER)
             self.current_time.configure(
                 text=f"at {self._fmt(item.time)}", text_color=COLOR_MARKER
             )
-            self.current_frame.configure(fg_color="#2a2a1e")
+            self.current_frame.configure(fg_color=tint(COLOR_MARKER, 0.10))
         elif itype == 'hold':
-            self.current_icon.configure(text="⏸")
+            self.current_icon.configure(text="⏸", text_color=COLOR_HOLD)
             self.current_time.configure(
                 text=f"Hold at {self._fmt(item.time)}", text_color=COLOR_HOLD
             )
-            self.current_frame.configure(fg_color="#1a2a33")
+            self.current_frame.configure(fg_color=tint(COLOR_HOLD, 0.12))
         else:
-            self.current_icon.configure(text="🔁")
+            self.current_icon.configure(text="↻", text_color=COLOR_VAMP)
             self.current_time.configure(
-                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color="#66bb6a"
+                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color=COLOR_VAMP
             )
-            self.current_frame.configure(fg_color="#1e2a1e")
+            self.current_frame.configure(fg_color=tint(COLOR_VAMP, 0.12))
         
         self.current_name.configure(text=item.name)
         self._render_tag_notes_summary(self.current_tags_notes, item.tag_notes)
@@ -459,7 +462,7 @@ class NotesSidebar(ctk.CTkFrame):
         itype = self._next_item_type
         
         if item is None:
-            self.countdown_label.configure(text="--:--", text_color="#555555")
+            self.countdown_label.configure(text="--:--", text_color=COLOR_TEXT_DISABLED)
             self.next_icon.configure(text="")
             self.next_name.configure(text="End of song")
             self.next_time.configure(text="")
@@ -468,22 +471,22 @@ class NotesSidebar(ctk.CTkFrame):
             return
 
         if itype == 'marker':
-            self.next_icon.configure(text="📍")
+            self.next_icon.configure(text="◆", text_color=COLOR_MARKER)
             next_time = item.time
             self.next_time.configure(
                 text=f"at {self._fmt(next_time)}", text_color=COLOR_MARKER
             )
         elif itype == 'hold':
-            self.next_icon.configure(text="⏸")
+            self.next_icon.configure(text="⏸", text_color=COLOR_HOLD)
             next_time = item.time
             self.next_time.configure(
                 text=f"Hold at {self._fmt(next_time)}", text_color=COLOR_HOLD
             )
         else:
-            self.next_icon.configure(text="🔁")
+            self.next_icon.configure(text="↻", text_color=COLOR_VAMP)
             next_time = item.start
             self.next_time.configure(
-                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color="#558855"
+                text=f"{self._fmt(item.start)} → {self._fmt(item.end)}", text_color=COLOR_VAMP
             )
         
         self.next_name.configure(text=item.name)
@@ -556,7 +559,7 @@ class NotesSidebar(ctk.CTkFrame):
         
         if not tag_notes:
             ctk.CTkLabel(
-                parent, text="(no tags)", font=("Segoe UI", 10),
+                parent, text="(no tags)", font=(FONT_UI, 10),
                 text_color=COLOR_TEXT_DIM
             ).pack(anchor="w", padx=4, pady=2)
             return
@@ -568,7 +571,7 @@ class NotesSidebar(ctk.CTkFrame):
             color = TAG_COLORS.get(tag, "#555555")
             ctk.CTkLabel(
                 row, text=f" {tag} ",
-                font=("Segoe UI", 9, "bold"),
+                font=(FONT_UI, 9, "bold"),
                 fg_color=color, corner_radius=8,
                 text_color="#ffffff", height=18
             ).pack(side="left", padx=(4, 6), pady=1)
@@ -579,7 +582,7 @@ class NotesSidebar(ctk.CTkFrame):
 
             ctk.CTkLabel(
                 row, text=display if display else "(empty)",
-                font=("Segoe UI", 10),
+                font=(FONT_UI, 10),
                 text_color=COLOR_TEXT if display else COLOR_TEXT_DIM,
                 anchor="w", justify="left",
                 wraplength=RIGHT_SIDEBAR_WIDTH - 110
@@ -686,7 +689,7 @@ class NotesSidebar(ctk.CTkFrame):
         """
         color = TAG_COLORS.get(tag, "#555555")
 
-        card = ctk.CTkFrame(self.cards_frame, fg_color="#1a1a1a", corner_radius=6)
+        card = ctk.CTkFrame(self.cards_frame, fg_color=COLOR_BG_MEDIUM, corner_radius=6)
         card.pack(fill="x", pady=3)
         
         # ---- Header row: colored tag badge + Edit/Save + Delete ----
@@ -695,7 +698,7 @@ class NotesSidebar(ctk.CTkFrame):
         
         ctk.CTkLabel(
             header, text=f" {tag} ",
-            font=("Segoe UI", 10, "bold"),
+            font=(FONT_UI, 10, "bold"),
             fg_color=color, corner_radius=8,
             text_color="#ffffff", height=22
         ).pack(side="left", padx=(2, 6))
@@ -706,7 +709,7 @@ class NotesSidebar(ctk.CTkFrame):
             card._commit = lambda: None
             ctk.CTkLabel(
                 card, text=notes if notes else "(no notes)",
-                font=("Segoe UI", 11),
+                font=(FONT_UI, 11),
                 text_color=COLOR_TEXT if notes else COLOR_TEXT_DIM,
                 wraplength=RIGHT_SIDEBAR_WIDTH - 60,
                 justify="left", anchor="w"
@@ -716,8 +719,8 @@ class NotesSidebar(ctk.CTkFrame):
         # Delete tag button
         btn_delete = ctk.CTkButton(
             header, text="✕", width=26, height=22,
-            fg_color="transparent", hover_color="#442222",
-            text_color="#aa4444", font=("Segoe UI", 11),
+            fg_color="transparent", hover_color=tint(COLOR_BTN_DANGER, 0.3),
+            text_color="#aa4444", font=(FONT_UI, 11),
             command=lambda: self._remove_tag(item, tag, card)
         )
         btn_delete.pack(side="right", padx=2)
@@ -725,8 +728,8 @@ class NotesSidebar(ctk.CTkFrame):
         # Edit / Save toggle button
         btn_edit = ctk.CTkButton(
             header, text="Edit", width=50, height=22,
-            fg_color=COLOR_BG_LIGHT, hover_color="#555555",
-            text_color=COLOR_TEXT, font=("Segoe UI", 10),
+            fg_color=COLOR_BORDER, hover_color=COLOR_HOVER,
+            text_color=COLOR_TEXT, font=(FONT_UI, 10),
             command=None  # Set below
         )
         btn_edit.pack(side="right", padx=2)
@@ -734,7 +737,7 @@ class NotesSidebar(ctk.CTkFrame):
         # ---- VIEW mode: label showing saved notes ----
         view_label = ctk.CTkLabel(
             card, text=notes if notes else "(click Edit to add notes)",
-            font=("Segoe UI", 11),
+            font=(FONT_UI, 11),
             text_color=COLOR_TEXT if notes else COLOR_TEXT_DIM,
             wraplength=RIGHT_SIDEBAR_WIDTH - 60,
             justify="left", anchor="w"
@@ -746,7 +749,7 @@ class NotesSidebar(ctk.CTkFrame):
         
         textbox = ctk.CTkTextbox(
             edit_container, height=70,
-            font=("Segoe UI", 11),
+            font=(FONT_UI, 11),
             fg_color=COLOR_BG_MEDIUM, text_color=COLOR_TEXT,
             corner_radius=4, wrap="word"
         )

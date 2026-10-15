@@ -5,12 +5,14 @@ Small reusable widgets shared by the Loop Station frontend.
   ``content`` frame.
 - after_if_alive(): schedule a Tk callback that is skipped if the widget has
   been destroyed in the meantime (safe for pop-ups the user may close early).
+- ModalDialog / NamePrompt: dialogs that keep the show keys (GO...) working.
 """
 
 import tkinter as tk
 import customtkinter as ctk
 
-from config import COLOR_TEXT_DIM, PADDING_SMALL
+from utils.fonts import FONT_UI
+from config import COLOR_TEXT_DIM, PADDING_SMALL, COLOR_BG_LIGHT, COLOR_BORDER, COLOR_HOVER
 
 
 class CollapsibleSection(ctk.CTkFrame):
@@ -21,14 +23,14 @@ class CollapsibleSection(ctk.CTkFrame):
         self._is_open = initially_open
         self._title = title
 
-        self.header = ctk.CTkFrame(self, fg_color="#222222", corner_radius=4, height=30)
+        self.header = ctk.CTkFrame(self, fg_color=COLOR_BG_LIGHT, corner_radius=6, height=30)
         self.header.pack(fill="x", pady=(0, 2))
         self.header.pack_propagate(False)
 
         self.toggle_label = ctk.CTkLabel(
             self.header,
             text=f"{'▼' if self._is_open else '▶'}  {title}",
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             text_color=COLOR_TEXT_DIM,
             cursor="hand2"
         )
@@ -177,7 +179,7 @@ class ModalDialog(ctk.CTkToplevel):
 
         self.body = ctk.CTkScrollableFrame(
             main, fg_color="transparent",
-            scrollbar_button_color="#5a5a5a", scrollbar_button_hover_color="#7a7a7a",
+            scrollbar_button_color=COLOR_BORDER, scrollbar_button_hover_color=COLOR_HOVER,
         )
         self.body.pack(side="top", fill="both", expand=True, padx=(20, 10), pady=16)
         self.bind("<Escape>", lambda _e: self.close())
@@ -259,7 +261,7 @@ class ModalDialog(ctk.CTkToplevel):
             from config import COLOR_TEXT
         except Exception:
             COLOR_TEXT = None
-        ctk.CTkLabel(self.body, text=title, font=("Segoe UI", 13, "bold"),
+        ctk.CTkLabel(self.body, text=title, font=(FONT_UI, 13, "bold"),
                      text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(12, 4))
         frame = ctk.CTkFrame(self.body, fg_color="transparent")
         frame.pack(fill="x")
@@ -269,4 +271,62 @@ class ModalDialog(ctk.CTkToplevel):
 # Outlined style for secondary buttons (visible on every theme, where the
 # "light" background can equal the panel colour).
 SECONDARY_BTN = dict(fg_color="transparent", border_width=1,
-                     border_color="#5a5a5a", hover_color="#3a3a3a")
+                     border_color=COLOR_BORDER, hover_color=COLOR_HOVER)
+
+
+class NamePrompt(ModalDialog):
+    """
+    Small modal "enter a name" prompt (replaces ctk.CTkInputDialog, which
+    grabs the keyboard and so swallowed GO). Built on ModalDialog, so GO /
+    play-pause / stop keep working whenever focus is not in the entry.
+
+    ``get_input()`` blocks (running the Tk event loop) until OK / Cancel and
+    returns the typed text, or None when cancelled.
+    """
+    WIDTH = 400
+    MIN_HEIGHT = 170
+
+    def __init__(self, parent, title, text, initial=""):
+        try:
+            from config import COLOR_TEXT, COLOR_BTN_PRIMARY, COLOR_BTN_TEXT
+        except Exception:
+            COLOR_TEXT = COLOR_BTN_PRIMARY = COLOR_BTN_TEXT = None
+        super().__init__(parent, title, modal=True)
+        self._result = None
+        ctk.CTkLabel(self.body, text=text, anchor="w", justify="left",
+                     text_color=COLOR_TEXT).pack(fill="x", pady=(0, 6))
+        self.entry = ctk.CTkEntry(self.body)
+        self.entry.pack(fill="x")
+        if initial:
+            self.entry.insert(0, initial)
+            try:
+                self.entry.select_range(0, "end")
+            except (tk.TclError, AttributeError):
+                pass
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.entry.bind(seq, lambda _e: self._on_ok() or "break")
+        ctk.CTkButton(self.actions, text="Cancel", width=90, height=32,
+                      **SECONDARY_BTN, text_color=COLOR_TEXT,
+                      command=self.close).pack(side="right")
+        ctk.CTkButton(self.actions, text="OK", width=90, height=32,
+                      fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
+                      command=self._on_ok).pack(side="right", padx=(0, 6))
+        self.finish_layout()
+        try:
+            self.entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _on_ok(self):
+        if self._closed:
+            return
+        self._result = self.entry.get()
+        self.close()
+
+    def get_input(self):
+        try:
+            if not self._closed:
+                self.wait_window()
+        except tk.TclError:
+            pass
+        return self._result

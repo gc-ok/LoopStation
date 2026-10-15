@@ -8,6 +8,10 @@ Sends show events over UDP using python-osc. Two address schemes:
 - "qlab": only fired cues are sent, as ``/cue/<osc_cue>/start`` (events are
   swallowed, since QLab would not understand them).
 
+Cue numbers go through ``sanitize_osc_cue`` (no OSC pattern characters or
+whitespace), so a cue typed as "1/2" or "*" can never address other cues.
+UDP gives no delivery receipt: a successful send only means "sent".
+
 Sending never blocks or raises into the caller: send_event / send_cue only
 append to a bounded queue (oldest dropped when full) that a daemon worker
 drains. The worker resolves the host once per configuration (with a short
@@ -48,18 +52,40 @@ RESOLVE_TIMEOUT_S = 1.0
 RESOLVE_RETRY_S = 5.0
 
 
+# Characters with a meaning in OSC address patterns (and the path
+# separator): a cue number containing one would address other cues.
+_OSC_UNSAFE = set("/*?[]{}#,")
+
+
+def sanitize_osc_cue(value) -> str:
+    """
+    A cue number that is safe inside ``/cue/<cue>/start``: ``str(value)``
+    without surrounding whitespace, with every OSC pattern character
+    (``/ * ? [ ] { } # ,``), whitespace and control character removed.
+    "" for None (or when nothing usable is left).
+    """
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value).strip()
+                   if ch not in _OSC_UNSAFE and not ch.isspace()
+                   and ord(ch) >= 0x20 and ord(ch) != 0x7f)
+
+
 def _resolve(host: str, port: int, timeout: float = RESOLVE_TIMEOUT_S) -> str:
     """
     Resolve ``host`` to an IP address string, giving up after ``timeout``.
     socket.getaddrinfo has no timeout of its own, so it runs on a helper
-    thread that is abandoned (daemon) if it hangs.
+    thread that is abandoned (daemon) if it hangs. IPv4 is preferred: the
+    client socket is IPv4-capable everywhere, and "localhost" often lists
+    ::1 first while QLab / consoles usually listen on IPv4 only.
     """
     result: dict = {}
 
     def _lookup():
         try:
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
-            result["ip"] = infos[0][4][0]
+            v4 = [i for i in infos if i[0] == socket.AF_INET]
+            result["ip"] = (v4 or infos)[0][4][0]
         except Exception as e:
             result["error"] = e
 
@@ -298,8 +324,12 @@ class OscOutput:
         return self._send(f"/loopstation/{event}", list(kw.values()))
 
     def send_cue(self, osc_cue: str) -> bool:
-        """qlab: /cue/<osc_cue>/start ; loopstation: /loopstation/cue <osc_cue>."""
-        osc_cue = str(osc_cue or "").strip()
+        """
+        qlab: /cue/<osc_cue>/start ; loopstation: /loopstation/cue <osc_cue>.
+        The cue number is passed through sanitize_osc_cue first; nothing is
+        sent when it is empty afterwards.
+        """
+        osc_cue = sanitize_osc_cue(osc_cue)
         if not osc_cue:
             return False
         if self.scheme == "qlab":

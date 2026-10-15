@@ -21,6 +21,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
+from utils.fonts import FONT_UI
 from config import (
     COLOR_WAVEFORM, COLOR_WAVEFORM_BG, COLOR_PLAYHEAD,
     COLOR_LOOP_IN, COLOR_LOOP_OUT, COLOR_LOOP_REGION,
@@ -123,6 +124,18 @@ def bar_times(bpm: float, beats_per_bar: int, downbeat_offset: float,
     return [(offset + k * bar_len, k + 1) for k in range(first, last + 1)]
 
 
+def _widget_scaling(widget) -> float:
+    """customtkinter's widget scaling for ``widget`` (1.0 if unknown)."""
+    try:
+        import customtkinter as ctk
+        value = float(ctk.ScalingTracker.get_widget_scaling(widget))
+    except Exception:
+        return 1.0
+    if not math.isfinite(value) or value <= 0:
+        return 1.0
+    return max(0.5, min(value, 4.0))
+
+
 class WaveformWidget:
     """
     Waveform display with overlay playhead on the matplotlib tk canvas.
@@ -135,7 +148,7 @@ class WaveformWidget:
         # State
         self.duration = 0.0
         self.waveform_data: Optional[np.ndarray] = None
-        self._placeholder_text = "Choose a folder in the Library, then click a song to see its waveform"
+        self._placeholder_text = "Open a show or add songs, then pick a song to see its waveform"
 
         self.view_start = 0.0  # 0.0 = start of song
         self.view_end = 1.0    # 1.0 = end of song
@@ -155,14 +168,23 @@ class WaveformWidget:
         self._tempo_map = (0.0, 4, 0.0)
         self._grid_drawn_width = 0
 
+        # Plain tk widgets are not scaled by customtkinter: on a high-DPI
+        # Windows display (150 %, 200 %...) use its widget scaling for the
+        # fixed height. Text inside the figure is already scaled by
+        # matplotlib's TkAgg device-pixel-ratio handling (figure dpi x
+        # ratio), so the dpi stays 100 here. macOS reports 1.0 (Retina is
+        # handled by the OS).
+        self._scaling = _widget_scaling(parent)
+        height_px = int(round(WAVEFORM_HEIGHT * self._scaling))
+
         # Container frame with fixed height
-        self.container = tk.Frame(parent, bg=COLOR_WAVEFORM_BG, height=WAVEFORM_HEIGHT)
+        self.container = tk.Frame(parent, bg=COLOR_WAVEFORM_BG, height=height_px)
         self.container.pack_propagate(False)  # Enforce fixed height
         
         # Matplotlib figure
         # figsize width is arbitrary since we pack fill=x, but height matters
-        # We'll compute inches from WAVEFORM_HEIGHT at 100 dpi
-        fig_height_inches = WAVEFORM_HEIGHT / 100.0
+        # We'll compute inches from the pixel height at 100 dpi
+        fig_height_inches = height_px / 100.0
         self.figure = Figure(figsize=(10, fig_height_inches), dpi=100, facecolor=COLOR_WAVEFORM_BG)
         self.ax = self.figure.add_subplot(111)
         self._setup_axes()
@@ -368,7 +390,7 @@ class WaveformWidget:
                 x + 3, 10,
                 text=display_name,
                 fill=color, anchor="nw",
-                font=("Segoe UI", 8),
+                font=(FONT_UI, 8),
                 tags="overlay"
             )
             self._marker_ids.append(text_id)
@@ -398,7 +420,7 @@ class WaveformWidget:
             self._hold_ids.append(self._tk_canvas.create_text(
                 x + 3, canvas_height - 4, text=f"⏸ {name}",
                 fill=COLOR_HOLD, anchor="sw",
-                font=("Segoe UI", 8, "bold"), tags="overlay"))
+                font=(FONT_UI, 8, "bold"), tags="overlay"))
 
     @staticmethod
     def _holds_signature(holds):
@@ -515,6 +537,11 @@ class WaveformWidget:
         self._drawn_regions_sig = None
         self.view_start, self.view_end = 0.0, 1.0
         self._playhead_frac = 0.0
+        # A selection belongs to the previous song's timeline
+        self.is_selecting = False
+        self.selection_rect = None      # removed by ax.clear() below
+        self.selection_start = None
+        self.selection_end = None
         self._placeholder_text = "Loading waveform…"
         self.ax.clear()
         self._setup_axes()
@@ -721,12 +748,14 @@ class WaveformWidget:
         else:
             if self.on_seek and self.duration > 0:
                 frac = max(0.0, min(1.0, event.xdata))
-                
-                # Immediately update playhead visually
-                self._playhead_frac = frac
-                self._draw_overlay_playhead()
-                
-                self.on_seek(frac)
+
+                # The callback moves the playhead once the seek is accepted
+                # (update_playhead); a refused seek (Live Mode) returns False
+                # and the playhead stays where the engine is. Callbacks that
+                # return nothing get the old immediate move.
+                if self.on_seek(frac) is None:
+                    self._playhead_frac = frac
+                    self._draw_overlay_playhead()
 
     def _on_drag(self, event):
         if event.inaxes != self.ax or not self.is_selecting:

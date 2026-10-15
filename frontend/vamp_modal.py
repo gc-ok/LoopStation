@@ -21,19 +21,23 @@ when the content does not fit, the area above the button bar scrolls.
 """
 
 import logging
+import math
 import sys
 import tkinter as tk
 from typing import Callable, Optional, Tuple
 
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
+    COLOR_BORDER, COLOR_HOVER,
     COLOR_BG_DARK, COLOR_BG_MEDIUM, COLOR_BG_LIGHT,
     COLOR_BTN_SUCCESS, COLOR_BTN_DANGER,
     COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_LOOP_IN, COLOR_LOOP_OUT, COLOR_BTN_TEXT,
     PADDING_MEDIUM, PADDING_LARGE,
     LOOP_CROSSFADE_MS, LOOP_SWITCH_EARLY_MS, FADE_EXIT_DURATION_MS,
+    MIN_LOOP_DURATION,
 )
 from frontend.widgets import CollapsibleSection
 
@@ -133,10 +137,25 @@ class VampModal(ctk.CTkToplevel):
         # Keyboard: Enter in the name field saves, Escape cancels anywhere.
         self.entry_name.bind("<Return>", lambda _e: self._on_save_click())
         self.bind("<Escape>", lambda _e: self._on_cancel_click())
+        # The grab keeps keys away from the main window: hand GO /
+        # play-pause / stop to the app (ignored while typing in an entry).
+        self.bind("<KeyPress>", self._forward_show_key, add="+")
 
         # Size to content (capped to the screen), centre on parent, clamp.
         self._fit_to_screen(center_on=parent)
         self.entry_name.focus_set()
+
+    def _forward_show_key(self, event):
+        """Same rule as widgets.ModalDialog: show keys reach the app unless typing."""
+        handler = getattr(self.master, "handle_show_key", None)
+        if handler is None or self._closed:
+            return None
+        try:
+            if handler(event):
+                return "break"
+        except Exception:
+            logger.exception("show key forwarding failed")
+        return None
 
     # =========================================================================
     # WIDGETS
@@ -160,8 +179,8 @@ class VampModal(ctk.CTkToplevel):
 
         # Delete button (left)
         ctk.CTkButton(
-            actions, text="🗑 Delete Vamp", width=130, height=40,
-            font=("Segoe UI", 12, "bold"),
+            actions, text="Delete Vamp", width=130, height=40,
+            font=(FONT_UI, 12, "bold"),
             fg_color=COLOR_BTN_DANGER,
             text_color="#ffffff",
             command=self._on_delete_click
@@ -170,7 +189,7 @@ class VampModal(ctk.CTkToplevel):
         # Cancel button (right)
         ctk.CTkButton(
             actions, text="Cancel", width=100, height=40,
-            font=("Segoe UI", 12),
+            font=(FONT_UI, 12),
             fg_color=COLOR_BG_LIGHT,
             text_color=COLOR_TEXT,
             command=self._on_cancel_click
@@ -178,8 +197,8 @@ class VampModal(ctk.CTkToplevel):
 
         # Save button (right)
         ctk.CTkButton(
-            actions, text="💾 Save", width=120, height=40,
-            font=("Segoe UI", 12, "bold"),
+            actions, text="Save", width=120, height=40,
+            font=(FONT_UI, 12, "bold"),
             fg_color=COLOR_BTN_SUCCESS,
             text_color=COLOR_BTN_TEXT,
             command=self._on_save_click
@@ -191,8 +210,8 @@ class VampModal(ctk.CTkToplevel):
         self._scroll = ctk.CTkScrollableFrame(
             main,
             fg_color="transparent",
-            scrollbar_button_color="#5a5a5a",        # visible against the panel bg
-            scrollbar_button_hover_color="#7a7a7a",
+            scrollbar_button_color=COLOR_BORDER,        # visible against the panel bg
+            scrollbar_button_hover_color=COLOR_HOVER,
         )
         self._scroll.pack(side="top", fill="both", expand=True,
                           padx=(PADDING_LARGE, PADDING_MEDIUM), pady=PADDING_LARGE)
@@ -202,15 +221,15 @@ class VampModal(ctk.CTkToplevel):
         # SECTION 1: Vamp Name
         # =====================================================================
         ctk.CTkLabel(
-            scroll_frame, text="📝 Vamp Name",
-            font=("Segoe UI", 13, "bold"),
+            scroll_frame, text="Vamp Name",
+            font=(FONT_UI, 13, "bold"),
             text_color=COLOR_TEXT
         ).pack(anchor="w", pady=(0, 5))
 
         self.entry_name = ctk.CTkEntry(
             scroll_frame,
             height=40,
-            font=("Segoe UI", 13),
+            font=(FONT_UI, 13),
             fg_color=COLOR_BG_DARK,
             border_color=COLOR_BG_LIGHT
         )
@@ -220,8 +239,8 @@ class VampModal(ctk.CTkToplevel):
         # SECTION 2: Loop Range
         # =====================================================================
         ctk.CTkLabel(
-            scroll_frame, text="🎵 Loop Range",
-            font=("Segoe UI", 13, "bold"),
+            scroll_frame, text="Loop Range",
+            font=(FONT_UI, 13, "bold"),
             text_color=COLOR_TEXT
         ).pack(anchor="w", pady=(0, 5))
 
@@ -234,14 +253,14 @@ class VampModal(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             in_row, text="IN:",
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             text_color=COLOR_LOOP_IN,
             width=35
         ).pack(side="left")
 
         self.entry_in = ctk.CTkEntry(
             in_row, width=110,
-            font=("Consolas", 12),
+            font=(FONT_MONO, 12),
             fg_color=COLOR_BG_MEDIUM
         )
         self.entry_in.pack(side="left", padx=5)
@@ -264,7 +283,7 @@ class VampModal(ctk.CTkToplevel):
             in_row, text="⬇ SET", width=70, height=28,
             fg_color=COLOR_LOOP_IN,
             text_color="#000000",
-            font=("Segoe UI", 10, "bold"),
+            font=(FONT_UI, 10, "bold"),
             command=self._set_in_current
         ).pack(side="left", padx=5)
 
@@ -274,14 +293,14 @@ class VampModal(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             out_row, text="OUT:",
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             text_color=COLOR_LOOP_OUT,
             width=35
         ).pack(side="left")
 
         self.entry_out = ctk.CTkEntry(
             out_row, width=110,
-            font=("Consolas", 12),
+            font=(FONT_MONO, 12),
             fg_color=COLOR_BG_MEDIUM
         )
         self.entry_out.pack(side="left", padx=5)
@@ -304,7 +323,7 @@ class VampModal(ctk.CTkToplevel):
             out_row, text="⬇ SET", width=70, height=28,
             fg_color=COLOR_LOOP_OUT,
             text_color="#000000",
-            font=("Segoe UI", 10, "bold"),
+            font=(FONT_UI, 10, "bold"),
             command=self._set_out_current
         ).pack(side="left", padx=5)
 
@@ -312,10 +331,17 @@ class VampModal(ctk.CTkToplevel):
         self.lbl_duration = ctk.CTkLabel(
             range_frame,
             text="Duration: 0.000s",
-            font=("Consolas", 11),
+            font=(FONT_MONO, 11),
             text_color=COLOR_TEXT_DIM
         )
         self.lbl_duration.pack(anchor="e", pady=(5, 5), padx=PADDING_MEDIUM)
+
+        # Why typed IN/OUT values were not accepted (empty when they were)
+        self.lbl_range_error = ctk.CTkLabel(
+            range_frame, text="", font=(FONT_UI, 11, "bold"),
+            text_color="#ff7b72", wraplength=440, justify="left", anchor="w"
+        )
+        self.lbl_range_error.pack(fill="x", padx=PADDING_MEDIUM)
 
         # =====================================================================
         # SECTION 3: Repeat
@@ -325,7 +351,7 @@ class VampModal(ctk.CTkToplevel):
         # =====================================================================
         # SECTION 4: Advanced Settings (Collapsible)
         # =====================================================================
-        self.advanced_section = CollapsibleSection(scroll_frame, "🛠️ Advanced Timing")
+        self.advanced_section = CollapsibleSection(scroll_frame, "Advanced Timing")
         self.advanced_section.pack(fill="x", pady=(0, PADDING_MEDIUM))
 
         # Grow/shrink the window (within the screen) when the section toggles.
@@ -373,8 +399,8 @@ class VampModal(ctk.CTkToplevel):
     def _create_repeat_section(self, parent):
         """Repeat mode: until GO, or a stepper for the total number of plays."""
         ctk.CTkLabel(
-            parent, text="🔂 Repeat",
-            font=("Segoe UI", 13, "bold"),
+            parent, text="Repeat",
+            font=(FONT_UI, 13, "bold"),
             text_color=COLOR_TEXT
         ).pack(anchor="w", pady=(0, 5))
 
@@ -388,7 +414,7 @@ class VampModal(ctk.CTkToplevel):
         self.repeat_mode = ctk.CTkSegmentedButton(
             row, values=[REPEAT_UNTIL_GO, REPEAT_COUNT],
             width=180, height=30,
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             command=self._on_repeat_mode
         )
         self.repeat_mode.pack(side="left")
@@ -403,7 +429,7 @@ class VampModal(ctk.CTkToplevel):
         self._btn_repeat_minus.pack(side="left", padx=(14, 2))
         self.lbl_repeat_n = ctk.CTkLabel(
             self._repeat_stepper, text=str(self._repeat_n), width=34,
-            font=("Consolas", 14, "bold"), text_color="#88aaff"
+            font=(FONT_MONO, 14, "bold"), text_color="#88aaff"
         )
         self.lbl_repeat_n.pack(side="left")
         self._btn_repeat_plus = ctk.CTkButton(
@@ -413,13 +439,13 @@ class VampModal(ctk.CTkToplevel):
         )
         self._btn_repeat_plus.pack(side="left", padx=(2, 8))
         self.lbl_repeat_desc = ctk.CTkLabel(
-            self._repeat_stepper, text="", font=("Segoe UI", 11),
+            self._repeat_stepper, text="", font=(FONT_UI, 11),
             text_color=COLOR_TEXT
         )
         self.lbl_repeat_desc.pack(side="left")
 
         self.lbl_repeat_hint = ctk.CTkLabel(
-            box, text="", font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM,
+            box, text="", font=(FONT_UI, 9), text_color=COLOR_TEXT_DIM,
             wraplength=440, justify="left", anchor="w"
         )
         self.lbl_repeat_hint.pack(fill="x", padx=PADDING_MEDIUM, pady=(0, 8))
@@ -466,7 +492,7 @@ class VampModal(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             lbl_frame, text=label_text,
-            font=("Segoe UI", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             text_color=COLOR_TEXT
         ).pack(side="left")
 
@@ -474,7 +500,7 @@ class VampModal(ctk.CTkToplevel):
         val_lbl = ctk.CTkLabel(
             lbl_frame,
             text=f"{int(default)} {unit}",
-            font=("Consolas", 11),
+            font=(FONT_MONO, 11),
             text_color="#88aaff"
         )
         val_lbl.pack(side="right")
@@ -484,7 +510,7 @@ class VampModal(ctk.CTkToplevel):
             ctk.CTkLabel(
                 frame,
                 text=tooltip,
-                font=("Segoe UI", 9),
+                font=(FONT_UI, 9),
                 text_color=COLOR_TEXT_DIM,
                 wraplength=380,
                 justify="left"
@@ -699,6 +725,7 @@ class VampModal(ctk.CTkToplevel):
 
         duration = self.loop.end - self.loop.start
         self.lbl_duration.configure(text=f"Duration: {duration:.3f}s")
+        self._show_range_error("")
 
     # =========================================================================
     # LOOP RANGE
@@ -732,22 +759,60 @@ class VampModal(ctk.CTkToplevel):
             self._apply(end=pos)
         self._update_range_display()
 
-    def _on_manual_change(self, event=None):
-        """Handle manual entry of IN/OUT times."""
-        if self._closed:
-            return
-        try:
-            in_val = float(self.entry_in.get().strip())
-            out_val = float(self.entry_out.get().strip())
-        except ValueError:
-            # Invalid input, revert to current values
-            self._update_range_display()
-            return
+    def _range_error(self, in_val, out_val) -> Optional[str]:
+        """Why an IN/OUT pair cannot be used, or None if it is valid."""
+        length = float(self.app_state.song_length or 0.0)
+        if not (math.isfinite(in_val) and math.isfinite(out_val)):
+            return "IN and OUT must be numbers of seconds."
+        if in_val < 0:
+            return "IN cannot be before the start of the song."
+        if in_val >= out_val:
+            return "IN must be before OUT."
+        if out_val > length + 1e-6:
+            return f"OUT is past the end of the song ({length:.3f}s)."
+        if out_val - in_val < MIN_LOOP_DURATION:
+            return f"The vamp must be at least {MIN_LOOP_DURATION:g}s long."
+        return None
 
-        if 0 <= in_val < out_val <= self.app_state.song_length:
-            if (in_val, out_val) != (self.loop.start, self.loop.end):
-                self._apply(start=in_val, end=out_val)
+    def _show_range_error(self, message: str):
+        try:
+            self.lbl_range_error.configure(text=f"⚠ {message}" if message else "")
+        except tk.TclError:
+            pass
+
+    def _on_manual_change(self, event=None) -> bool:
+        """
+        Apply typed IN/OUT times. Returns True when they are in effect (or
+        unchanged). Invalid input is NOT silently reverted: the entries keep
+        the typed text and a message says what is wrong.
+        """
+        if self._closed:
+            return False
+        in_text = self.entry_in.get().strip()
+        out_text = self.entry_out.get().strip()
+        try:
+            in_val = float(in_text)
+            out_val = float(out_text)
+        except ValueError:
+            self._show_range_error("IN and OUT must be numbers of seconds (e.g. 12.5).")
+            return False
+
+        # Unchanged text (as displayed, 3 decimals) means "keep as is"
+        if (in_text, out_text) == (f"{self.loop.start:.3f}", f"{self.loop.end:.3f}"):
+            self._show_range_error("")
+            return True
+
+        error = self._range_error(in_val, out_val)
+        if error:
+            self._show_range_error(error)
+            return False
+        if (in_val, out_val) != (self.loop.start, self.loop.end):
+            if not self._apply(start=in_val, end=out_val):
+                self._show_range_error("These IN/OUT points were not accepted.")
+                return False
+        self._show_range_error("")
         self._update_range_display()
+        return True
 
     # =========================================================================
     # ACTIONS
@@ -764,8 +829,15 @@ class VampModal(ctk.CTkToplevel):
         self.destroy()
 
     def _on_save_click(self):
-        """Save changes and close."""
+        """Save changes and close (stays open if the typed IN/OUT are invalid)."""
         if self._closed:
+            return
+        # Typed IN/OUT count even if Return / FocusOut never fired.
+        if not self._on_manual_change():
+            try:
+                self.entry_in.focus_set()
+            except tk.TclError:
+                pass
             return
         # Push anything still waiting on the slider debounce.
         if self._slider_after_id is not None:
@@ -781,6 +853,18 @@ class VampModal(ctk.CTkToplevel):
         if pending:
             self._apply(**pending)
 
+        self._close()
+
+    def close_for_live(self):
+        """Live Mode came on while open: vamp edits are locked, so close
+        without pushing anything (changes already applied stay)."""
+        if self._closed:
+            return
+        self._cancel_pending_slider()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self._close()
 
     def _on_delete_click(self):

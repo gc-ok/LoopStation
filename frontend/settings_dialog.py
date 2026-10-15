@@ -9,6 +9,8 @@ Sections:
 - Keyboard: action -> key rows with "Set key" capture; persisted in user
   preferences under "keys" and applied to the app's bindings immediately.
 - OSC output: enabled, host, port, scheme (loopstation / qlab), Send test.
+- Main / Backup: mirror this machine with a second Loop Station
+  (``state.mirror``, backend/mirror.py; hidden when not available).
 - Foot pedals: how AirTurn / PageFlip style pedals are used (they type keys).
 
 Also home of the key-map helpers the app uses (KEY_ACTIONS, load_key_map...).
@@ -20,6 +22,7 @@ from typing import Callable, Dict, List, Optional
 import tkinter as tk
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
     COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, COLOR_BTN_TEXT,
@@ -69,6 +72,21 @@ MIDI_ACTION_LABELS = {
     "next_cue": "Next cue", "prev_cue": "Previous cue", "add_marker": "Add marker",
     "toggle_live": "Toggle Live Mode",
 }
+
+
+def midi_key_display(key: Optional[str]) -> str:
+    """
+    Readable MIDI mapping key ("note_on:<ch>:<n>" with ch 1-16, or the
+    legacy any-channel "note_on:<n>"); midi_control.describe_key does the
+    formatting for both forms.
+    """
+    if not key:
+        return ""
+    try:
+        from backend.midi_control import describe_key
+    except ImportError:
+        return str(key)
+    return describe_key(key) or str(key)
 
 
 def key_display(keysym: str) -> str:
@@ -136,13 +154,16 @@ class SettingsDialog(ModalDialog):
         self._midi_rows: Dict[str, dict] = {}
         self._key_rows: Dict[str, dict] = {}
         self._destructive: List[ctk.CTkButton] = []
+        # Everything else that changes the control setup (locked while live)
+        self._live_locked: List[object] = []
 
         self._build_midi()
         self._build_keys()
         self._build_osc()
+        self._build_mirror()
         self._build_pedal_hint()
 
-        self.lbl_status = ctk.CTkLabel(self.actions, text="", font=("Segoe UI", 11),
+        self.lbl_status = ctk.CTkLabel(self.actions, text="", font=(FONT_UI, 11),
                                        text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(self.actions, text="Close", width=100, height=36,
@@ -157,7 +178,7 @@ class SettingsDialog(ModalDialog):
     # ----------------------------------------------------------------- MIDI
 
     def _build_midi(self):
-        box = self.section("🎹 MIDI control")
+        box = self.section("MIDI control")
         if self.midi is None:
             ctk.CTkLabel(box, text="MIDI is not available.", text_color=COLOR_TEXT_DIM).pack(anchor="w")
             return
@@ -168,9 +189,10 @@ class SettingsDialog(ModalDialog):
         self.port_menu = ctk.CTkOptionMenu(row, values=["(none)"], width=300,
                                            command=self._on_port_select)
         self.port_menu.pack(side="left", padx=(0, 6))
+        self._live_locked.append(self.port_menu)
         ctk.CTkButton(row, text="↻", width=32, height=28, **SECONDARY_BTN,
                       text_color=COLOR_TEXT, command=self._refresh_ports).pack(side="left")
-        self.lbl_port = ctk.CTkLabel(box, text="", font=("Segoe UI", 10),
+        self.lbl_port = ctk.CTkLabel(box, text="", font=(FONT_UI, 10),
                                      text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_port.pack(fill="x")
         self._refresh_ports()
@@ -182,7 +204,7 @@ class SettingsDialog(ModalDialog):
             ctk.CTkLabel(r, text=MIDI_ACTION_LABELS.get(action, action), width=150,
                          anchor="w", text_color=COLOR_TEXT).pack(side="left")
             lbl = ctk.CTkLabel(r, text="", width=170, anchor="w",
-                               font=("Consolas", 11), text_color="#58a6ff")
+                               font=(FONT_MONO, 11), text_color="#58a6ff")
             lbl.pack(side="left")
             btn_clear = ctk.CTkButton(r, text="Clear", width=60, height=26,
                                       **SECONDARY_BTN, text_color=COLOR_TEXT,
@@ -193,6 +215,7 @@ class SettingsDialog(ModalDialog):
                                       command=lambda a=action: self._learn_midi(a))
             btn_learn.pack(side="right", padx=(0, 6))
             self._destructive.append(btn_clear)
+            self._live_locked.append(btn_learn)
             self._midi_rows[action] = {"label": lbl, "learn": btn_learn}
         self._refresh_midi_rows()
 
@@ -215,6 +238,9 @@ class SettingsDialog(ModalDialog):
             self.lbl_port.configure(text="Choose an input port to enable MIDI control.")
 
     def _on_port_select(self, name):
+        if self._live:
+            self.port_menu.set(self.midi.port_name or "(none)")
+            return
         if name == "(none)":
             self.midi.close()
             self.lbl_port.configure(text="MIDI input closed.")
@@ -242,11 +268,13 @@ class SettingsDialog(ModalDialog):
                 row["learn"].configure(text="Cancel")
             else:
                 key = self.midi.key_for(action)
-                row["label"].configure(text=key or "—",
+                row["label"].configure(text=midi_key_display(key) or "—",
                                        text_color="#58a6ff" if key else COLOR_TEXT_DIM)
                 row["learn"].configure(text="Learn")
 
     def _learn_midi(self, action):
+        if self._live:
+            return
         if self.midi.learning == action:
             self.midi.cancel_learn()
             self._refresh_midi_rows()
@@ -268,7 +296,8 @@ class SettingsDialog(ModalDialog):
             return
         self.midi.save_mappings()
         self._refresh_midi_rows()
-        self.lbl_status.configure(text=f"MIDI {key} → {MIDI_ACTION_LABELS.get(action, action)}")
+        self.lbl_status.configure(
+            text=f"MIDI {midi_key_display(key)} → {MIDI_ACTION_LABELS.get(action, action)}")
 
     def _clear_midi(self, action):
         if self._live:
@@ -287,13 +316,14 @@ class SettingsDialog(ModalDialog):
             ctk.CTkLabel(r, text=label, width=170, anchor="w",
                          text_color=COLOR_TEXT).pack(side="left")
             lbl = ctk.CTkLabel(r, text="", width=170, anchor="w",
-                               font=("Consolas", 11, "bold"), text_color="#58a6ff")
+                               font=(FONT_MONO, 11, "bold"), text_color="#58a6ff")
             lbl.pack(side="left")
             btn = ctk.CTkButton(r, text="Set key", width=90, height=26,
                                 fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
                                 command=lambda a=action: self._start_capture(a))
             btn.pack(side="right")
             self._key_rows[action] = {"label": lbl, "button": btn}
+            self._live_locked.append(btn)
         bottom = ctk.CTkFrame(box, fg_color="transparent")
         bottom.pack(fill="x", pady=(6, 0))
         self.btn_reset_keys = ctk.CTkButton(bottom, text="Reset to defaults", width=140, height=26,
@@ -302,7 +332,7 @@ class SettingsDialog(ModalDialog):
         self.btn_reset_keys.pack(side="right")
         self._destructive.append(self.btn_reset_keys)
         ctk.CTkLabel(bottom, text="Fixed: I / O set loop, S save, N notes, ← → nudge.",
-                     font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM).pack(side="left")
+                     font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM).pack(side="left")
         self._refresh_key_rows()
 
     def _refresh_key_rows(self):
@@ -316,6 +346,8 @@ class SettingsDialog(ModalDialog):
                 row["button"].configure(text="Set key")
 
     def _start_capture(self, action):
+        if self._live:
+            return
         self._capture_action = None if self._capture_action == action else action
         self._refresh_key_rows()
         self.focus_set()
@@ -325,6 +357,9 @@ class SettingsDialog(ModalDialog):
         if action is None or event.keysym in MODIFIER_KEYSYMS:
             return None
         self._capture_action = None
+        if self._live:
+            self._refresh_key_rows()
+            return "break"
         self.key_map = assign_key(self.key_map, action, event.keysym)
         self._apply_keys()
         self.lbl_status.configure(
@@ -358,7 +393,7 @@ class SettingsDialog(ModalDialog):
     # ------------------------------------------------------------------ OSC
 
     def _build_osc(self):
-        box = self.section("📤 OSC output (QLab / lighting / show control)")
+        box = self.section("OSC output (QLab / lighting / show control)")
         osc = getattr(self.app_state, "osc", None)
         cfg = osc.settings() if osc is not None else {
             "enabled": False, "host": "127.0.0.1", "port": 53000, "scheme": "loopstation"}
@@ -383,13 +418,16 @@ class SettingsDialog(ModalDialog):
         self.osc_port = ctk.CTkEntry(r2, width=80)
         self.osc_port.insert(0, str(cfg.get("port", "")))
         self.osc_port.pack(side="left")
-        ctk.CTkButton(r2, text="Send test", width=90, height=28, **SECONDARY_BTN,
-                      text_color=COLOR_TEXT, command=self._osc_test).pack(side="right")
-        ctk.CTkButton(r2, text="Save", width=70, height=28, fg_color=COLOR_BTN_SUCCESS,
-                      text_color=COLOR_BTN_TEXT, command=self._osc_save).pack(side="right", padx=6)
+        self.btn_osc_test = ctk.CTkButton(r2, text="Send test", width=90, height=28, **SECONDARY_BTN,
+                                          text_color=COLOR_TEXT, command=self._osc_test)
+        self.btn_osc_test.pack(side="right")
+        self.btn_osc_save = ctk.CTkButton(r2, text="Save", width=70, height=28, fg_color=COLOR_BTN_SUCCESS,
+                                          text_color=COLOR_BTN_TEXT, command=self._osc_save)
+        self.btn_osc_save.pack(side="right", padx=6)
+        self._live_locked += [self.btn_osc_test, self.btn_osc_save]
         self.lbl_osc = ctk.CTkLabel(box, text="QLab scheme sends /cue/<osc cue>/start; "
                                     "loopstation sends /loopstation/<event>.",
-                                    font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM,
+                                    font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM,
                                     anchor="w", wraplength=520, justify="left")
         self.lbl_osc.pack(fill="x")
 
@@ -404,6 +442,9 @@ class SettingsDialog(ModalDialog):
         return bool(self.osc_enabled.get()), host, port, self.osc_scheme.get() or "loopstation"
 
     def _osc_save(self) -> bool:
+        if self._live:
+            self.lbl_osc.configure(text="Locked in Live Mode", text_color="#ff7b72")
+            return False
         try:
             enabled, host, port, scheme = self._osc_values()
         except ValueError as e:
@@ -443,14 +484,259 @@ class SettingsDialog(ModalDialog):
         if osc.last_error:
             self.lbl_osc.configure(text=f"Send failed: {osc.last_error}", text_color="#ff7b72")
         else:
-            self.lbl_osc.configure(text=f"Test sent to {osc.host}:{osc.port}", text_color="#4cd38a")
+            # UDP: "sent" is all that can be known
+            self.lbl_osc.configure(
+                text=f"Test sent to {osc.host}:{osc.port} (UDP: delivery not confirmed)",
+                text_color="#4cd38a")
+
+    # ------------------------------------------------------- main / backup
+
+    MIRROR_PREF = "mirror"
+    MIRROR_ROLES = {"Off": None, "Main": "main", "Backup": "backup"}
+    DEFAULT_MIRROR_PORT = 53100
+
+    def _build_mirror(self):
+        box = self.section("Main / Backup (a second machine follows this one)")
+        self.mirror = getattr(self.app_state, "mirror", None)
+        self._mirror_widgets = []
+        if self.mirror is None:
+            ctk.CTkLabel(box, text="Main / Backup mirroring is not available in this version.",
+                         text_color=COLOR_TEXT_DIM, anchor="w").pack(fill="x")
+            return
+        saved = self._mirror_saved_settings()
+        try:
+            status = dict(self.mirror.status() or {})
+        except Exception:
+            status = {}
+        role = status.get("role") or saved.get("role")
+        label = {"main": "Main", "backup": "Backup"}.get(role, "Off")
+
+        r1 = ctk.CTkFrame(box, fg_color="transparent")
+        r1.pack(fill="x", pady=2)
+        ctk.CTkLabel(r1, text="This machine is", anchor="w",
+                     text_color=COLOR_TEXT).pack(side="left", padx=(0, 8))
+        self.mirror_role = ctk.CTkSegmentedButton(r1, values=list(self.MIRROR_ROLES),
+                                                  command=lambda _v: self._mirror_role_changed())
+        self.mirror_role.set(label)
+        self.mirror_role.pack(side="left")
+        self.btn_mirror_start = ctk.CTkButton(r1, text="Start", width=80, height=28,
+                                              fg_color=COLOR_BTN_SUCCESS, text_color=COLOR_BTN_TEXT,
+                                              command=self._mirror_start)
+        self.btn_mirror_start.pack(side="right")
+        self.btn_mirror_stop = ctk.CTkButton(r1, text="Stop", width=70, height=28, **SECONDARY_BTN,
+                                             text_color=COLOR_TEXT, command=self._mirror_stop)
+        self.btn_mirror_stop.pack(side="right", padx=6)
+
+        r2 = ctk.CTkFrame(box, fg_color="transparent")
+        r2.pack(fill="x", pady=2)
+        self.lbl_mirror_host = ctk.CTkLabel(r2, text="Main's IP", width=70, anchor="w",
+                                            text_color=COLOR_TEXT)
+        self.lbl_mirror_host.pack(side="left")
+        self.mirror_host = ctk.CTkEntry(r2, width=150, placeholder_text="192.168.1.20")
+        host = saved.get("peer_host") or ""
+        if host:
+            self.mirror_host.insert(0, str(host))
+        self.mirror_host.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(r2, text="Port", width=34, anchor="w", text_color=COLOR_TEXT).pack(side="left")
+        self.mirror_port = ctk.CTkEntry(r2, width=70)
+        self.mirror_port.insert(0, str(saved.get("port") or self.DEFAULT_MIRROR_PORT))
+        self.mirror_port.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(r2, text="PIN", width=28, anchor="w", text_color=COLOR_TEXT).pack(side="left")
+        self.mirror_pin = ctk.CTkEntry(r2, width=70, show="•")
+        if saved.get("pin"):
+            self.mirror_pin.insert(0, str(saved["pin"]))
+        self.mirror_pin.pack(side="left")
+
+        self.mirror_auto = ctk.CTkCheckBox(box, text="Auto-start on launch", text_color=COLOR_TEXT)
+        if saved.get("auto_start"):
+            self.mirror_auto.select()
+        self.mirror_auto.pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(box, text="On the backup, turn OSC output off (or point it at the backup "
+                     "console) so both machines do not fire the same cues.",
+                     font=(FONT_UI, 10), text_color="#f0a020", anchor="w",
+                     justify="left", wraplength=520).pack(fill="x")
+
+        self.lbl_mirror_ips = ctk.CTkLabel(box, text="", font=(FONT_UI, 11),
+                                           text_color=COLOR_TEXT_DIM, anchor="w",
+                                           justify="left", wraplength=520)
+        self.lbl_mirror_ips.pack(fill="x")
+        self.lbl_mirror = ctk.CTkLabel(box, text="", font=(FONT_UI, 11),
+                                       text_color=COLOR_TEXT_DIM, anchor="w",
+                                       justify="left", wraplength=520)
+        self.lbl_mirror.pack(fill="x")
+        self._mirror_widgets = [self.mirror_role, self.btn_mirror_start, self.btn_mirror_stop,
+                                self.mirror_host, self.mirror_port, self.mirror_pin,
+                                self.mirror_auto]
+        self._live_locked += self._mirror_widgets
+        self._mirror_role_changed()
+        if status:
+            self.on_mirror_status(status)
+
+    @staticmethod
+    def _mirror_module():
+        try:
+            from backend import mirror as mirror_module
+            return mirror_module
+        except Exception:
+            return None
+
+    def _mirror_saved_settings(self) -> dict:
+        module = self._mirror_module()
+        if module is not None and hasattr(module, "load_settings"):
+            try:
+                return dict(module.load_settings())
+            except Exception:
+                logger.exception("Could not read the mirror settings")
+        saved = preferences.load_preferences().get(self.MIRROR_PREF)
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def _mirror_save_settings(self, **values):
+        module = self._mirror_module()
+        try:
+            if module is not None and hasattr(module, "save_settings"):
+                module.save_settings(**values)
+            else:
+                preferences.save_preferences({self.MIRROR_PREF: values})
+        except Exception:
+            logger.exception("Could not save the mirror settings")
+
+    @staticmethod
+    def local_ips() -> List[str]:
+        try:
+            from backend.web_server import get_local_ips
+            return list(get_local_ips())
+        except Exception:
+            return []
+
+    def _mirror_role_changed(self):
+        role = self.MIRROR_ROLES.get(self.mirror_role.get())
+        backup = role == "backup"
+        if not self._live:
+            try:
+                self.mirror_host.configure(state="normal" if backup else "disabled")
+            except (tk.TclError, ValueError):
+                pass
+        if role == "main":
+            ips = self.local_ips()
+            self.lbl_mirror_ips.configure(
+                text="Type this machine's IP on the backup: " + (", ".join(ips) if ips
+                                                                 else "(no network found)"))
+        elif backup:
+            self.lbl_mirror_ips.configure(text="Enter the main machine's IP, port and PIN, then Start.")
+        else:
+            self.lbl_mirror_ips.configure(text="Off: this machine runs on its own.")
+
+    def _mirror_values(self):
+        role = self.MIRROR_ROLES.get(self.mirror_role.get())
+        try:
+            port = int(self.mirror_port.get().strip())
+        except ValueError:
+            raise ValueError("Port must be a number")
+        if not (1 <= port <= 65535):
+            raise ValueError("Port must be 1-65535")
+        host = self.mirror_host.get().strip()
+        if role == "backup" and not host:
+            raise ValueError("Enter the main machine's IP address")
+        return role, host, port, self.mirror_pin.get().strip()
+
+    def _mirror_start(self) -> bool:
+        if self._live:
+            self.lbl_mirror.configure(text="Locked in Live Mode", text_color="#ff7b72")
+            return False
+        try:
+            role, host, port, pin = self._mirror_values()
+        except ValueError as e:
+            self.lbl_mirror.configure(text=str(e), text_color="#ff7b72")
+            return False
+        ok = True
+        try:
+            if role is None:
+                self.mirror.stop()
+            else:
+                ok = self.mirror.start(role, peer_host=host if role == "backup" else None,
+                                       port=port, pin=pin) is not False
+        except Exception as e:
+            logger.exception("Mirror start failed")
+            self.lbl_mirror.configure(text=f"Could not start: {e}", text_color="#ff7b72")
+            return False
+        self._mirror_save_settings(role=role or "off", peer_host=host, port=port, pin=pin,
+                                   auto_start=bool(self.mirror_auto.get()))
+        if not ok:
+            try:
+                message = (self.mirror.status() or {}).get("message") or "Could not start"
+            except Exception:
+                message = "Could not start"
+            self.lbl_mirror.configure(text=message, text_color="#ff7b72")
+            self._push_mirror_status()
+            return False
+        if role and not pin:
+            self.lbl_mirror.configure(
+                text="Started without a PIN - any computer on the network can follow the main.",
+                text_color="#f0a020")
+        else:
+            self.lbl_mirror.configure(text="Starting…" if role else "Mirroring off",
+                                      text_color=COLOR_TEXT_DIM)
+        self._push_mirror_status()
+        return True
+
+    def _mirror_stop(self) -> bool:
+        if self._live:
+            self.lbl_mirror.configure(text="Locked in Live Mode", text_color="#ff7b72")
+            return False
+        try:
+            self.mirror.stop()
+        except Exception as e:
+            logger.exception("Mirror stop failed")
+            self.lbl_mirror.configure(text=f"Could not stop: {e}", text_color="#ff7b72")
+            return False
+        self.lbl_mirror.configure(text="Mirroring off", text_color=COLOR_TEXT_DIM)
+        self._push_mirror_status()
+        return True
+
+    def _push_mirror_status(self):
+        """Refresh the header badge right away (status callbacks may lag)."""
+        handler = getattr(self._parent, "_on_mirror_status", None)
+        if handler is None:
+            return
+        try:
+            handler(self.mirror.status())
+        except Exception:
+            logger.debug("mirror.status() failed", exc_info=True)
+
+    def on_mirror_status(self, status):
+        """Status dict from the app (Tk thread)."""
+        if getattr(self, "mirror", None) is None:
+            return
+        status = status or {}
+        role = status.get("role")
+        parts = []
+        if role in ("main", "backup"):
+            parts.append(("Main" if role == "main" else "Backup")
+                         + (" · connected" if status.get("connected") else " · not connected"))
+            if status.get("show_match") == "differs":
+                parts.append("show differs from main")
+            if status.get("peer"):
+                peer = status["peer"]
+                parts.append("peer " + (", ".join(map(str, peer)) if isinstance(peer, (list, tuple))
+                                        else str(peer)))
+            if role == "backup":
+                parts.append("following" if status.get("following") else "on its own")
+                if status.get("drift_ms") is not None:
+                    try:
+                        parts.append(f"drift {float(status['drift_ms']):.0f} ms")
+                    except (TypeError, ValueError):
+                        pass
+        if status.get("message"):
+            parts.append(str(status["message"]))
+        self.lbl_mirror.configure(text=" · ".join(parts) or "Mirroring off",
+                                  text_color=COLOR_TEXT_DIM)
 
     # ---------------------------------------------------------- pedal hint
 
     def _build_pedal_hint(self):
-        box = self.section("🦶 Foot pedals")
+        box = self.section("Foot pedals")
         ctk.CTkLabel(
-            box, wraplength=520, justify="left", anchor="w", font=("Segoe UI", 11),
+            box, wraplength=520, justify="left", anchor="w", font=(FONT_UI, 11),
             text_color=COLOR_TEXT_DIM,
             text=("Bluetooth page-turner pedals (AirTurn, PageFlip and similar) act as a "
                   "keyboard. Put the pedal in a keyboard mode, then use \"Set key\" above "
@@ -463,15 +749,26 @@ class SettingsDialog(ModalDialog):
     def set_live_mode(self, live: bool):
         self._live = bool(live)
         state = "disabled" if self._live else "normal"
-        for btn in self._destructive:
+        if self._live:
+            # Stop a key capture / MIDI learn that was in progress
+            if self._capture_action is not None:
+                self._capture_action = None
+                self._refresh_key_rows()
+            if self.midi is not None and self.midi.learning:
+                self.midi.cancel_learn()
+                self._refresh_midi_rows()
+        for btn in self._destructive + self._live_locked:
             try:
                 btn.configure(state=state)
-            except tk.TclError:
+            except (tk.TclError, ValueError):
                 pass
         if self._live:
-            self.lbl_status.configure(text="🔒 Live Mode: clearing / resetting is locked")
+            self.lbl_status.configure(
+                text="Live Mode: MIDI, key, OSC and main / backup settings are locked")
         else:
             self.lbl_status.configure(text="")
+        if getattr(self, "mirror", None) is not None and not self._live:
+            self._mirror_role_changed()
 
     def close(self):
         if self.midi is not None and self.midi.learning:

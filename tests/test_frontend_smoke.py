@@ -269,6 +269,26 @@ class _Key:
         self.keysym = keysym
 
 
+def send_key(app, dlg, keysym):
+    """
+    Press ``keysym`` in ``dlg``. Tk only delivers synthetic key events to the
+    window holding keyboard focus; when the test process cannot take focus
+    (e.g. macOS, not the frontmost app) the event is dropped or lands in
+    whichever window does hold focus. Generate a real event only when focus
+    is inside ``dlg``; otherwise run the dialog's <KeyPress> handlers in
+    their binding order instead.
+    """
+    focused = app.focus_get()
+    if focused is not None and str(focused).startswith(str(dlg)):
+        dlg.event_generate(f"<KeyPress-{keysym}>")
+        return
+    event = _Key(keysym)
+    if dlg._forward_show_key(event) == "break":
+        return
+    if hasattr(dlg, "_on_keypress"):
+        dlg._on_keypress(event)
+
+
 def test_leaving_live_mode_asks_and_defaults_to_staying(ui, monkeypatch):
     st = ui.app_state
     asked = []
@@ -402,12 +422,14 @@ def test_song_settings_is_modeless_and_forwards_go(ui, monkeypatch):
     monkeypatch.setattr(st, "go", lambda source="ui": calls.append(source) or True)
     dlg.focus_force()
     pump(ui, 0.1)
-    dlg.event_generate("<KeyPress-Return>")
+    send_key(ui, dlg, "Return")
     pump(ui, 0.1)
     assert calls == ["key"]
     # typing in an entry does not fire GO
     dlg.entry_bpm.focus_force()
     pump(ui, 0.1)
+    if not ui._is_typing():                      # focus did not land (see send_key)
+        monkeypatch.setattr(ui, "focus_get", lambda: dlg.entry_bpm)
     assert ui.handle_show_key(_Key("Return")) is False
     assert calls == ["key"]
     dlg.close()
@@ -424,12 +446,12 @@ def test_settings_dialog_forwards_show_keys(ui, monkeypatch):
     monkeypatch.setattr(st, "stop", lambda: calls.append("stop"))
     dlg.focus_force()
     pump(ui, 0.1)
-    dlg.event_generate("<KeyPress-Return>")
+    send_key(ui, dlg, "Return")
     pump(ui, 0.1)
     assert calls == ["go"]
     # while capturing a new key, the key is NOT forwarded
     dlg._start_capture("stop")
-    dlg.event_generate("<KeyPress-F9>")
+    send_key(ui, dlg, "F9")
     pump(ui, 0.1)
     assert calls == ["go"] and ui._key_map["stop"] == ["F9"]
     dlg._reset_keys()

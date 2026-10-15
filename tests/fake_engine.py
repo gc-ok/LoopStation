@@ -20,6 +20,14 @@ stream (frames freeze), ``replug()`` makes the device available again and
 (``device_error``) like the real engine. ``fail_device_change = True`` makes
 ``set_routing`` / ``set_output_device`` revert and raise RuntimeError.
 
+Preload: ``preload_file`` is synchronous by default (it fires
+``preload_ready`` / ``preload_failed`` before returning). Set
+``preload_sync = False`` to leave it running until the test calls
+``finish_preload(ok=True, error=None)``. ``load_file`` adopts a matching
+preload like the real engine (a running one is finished first, as the real
+engine waits for it) and sets ``loaded_from_preload``; with a matching
+rendered ``tempo_pitch`` the song loads at that tempo/key (no render events).
+
 Cycle semantics: entering a loop fires ``loop_cycle`` 1; each later arrival
 at ``loop_out`` either exits (count reached / cut queued) or fires the next
 cycle number. ``count=N`` therefore plays the region N extra times.
@@ -83,6 +91,11 @@ class FakeEngine:
         self._stream_alive = True
         self.restart_ok_names = None      # None = any present device restarts
         self.fail_device_change = False
+
+        # Preload slot: None | dict(path, key, sig, tempo, state, error)
+        self._preload = None
+        self.preload_sync = True
+        self.loaded_from_preload = False
 
     # ------------------------------------------------------------ helpers --
 
@@ -169,23 +182,120 @@ class FakeEngine:
 
     # ------------------------------------------------------------ loading --
 
-    def load_file(self, path, stem_paths=None):
-        self._rec("load_file", path, stem_paths)
+    # ------------------------------------------------------------ preload --
+
+    @staticmethod
+    def _preload_key(path, stem_paths):
+        norm = lambda p: os.path.normcase(os.path.abspath(p))   # noqa: E731
+        return (norm(path), tuple((n, norm(p)) for n, p in (stem_paths or {}).items()
+                                  if n != "mix" and p))
+
+    @staticmethod
+    def _sig(path, stem_paths):
+        try:
+            return tuple((os.stat(p).st_size, os.stat(p).st_mtime_ns)
+                         for p in [path] + [sp for n, sp in (stem_paths or {}).items()
+                                            if n != "mix" and sp])
+        except OSError:
+            return None
+
+    @staticmethod
+    def _tp(tp):
+        return (float(tp[0]), float(tp[1]))
+
+    def preload_file(self, path, stem_paths=None, tempo_pitch=(1.0, 0.0)):
+        self._rec("preload_file", path, stem_paths, tempo_pitch=tempo_pitch)
+        tp = self._tp(tempo_pitch if tempo_pitch is not None else (1.0, 0.0))
+        key, sig = self._preload_key(path, stem_paths), self._sig(path, stem_paths)
+        old = self._preload
+        if old and old["key"] == key and old["sig"] == sig and sig is not None \
+                and old["tempo"] == tp:
+            return old["state"] != "failed"
+        self._preload = None
+        if sig is None:
+            self._fire("preload_failed", {"path": path, "error": "file not found"})
+            return False
+        self._preload = {"path": path, "stem_paths": dict(stem_paths or {}), "key": key,
+                         "sig": sig, "tempo": tp, "state": "running", "error": None}
+        if self.preload_sync:
+            self.finish_preload()
+        return True
+
+    def finish_preload(self, ok=True, error=None):
+        """Complete a running preload (``preload_sync = False``)."""
+        pre = self._preload
+        if pre is None or pre["state"] != "running":
+            return
+        if ok and not pre["path"].lower().endswith(".wav"):
+            ok, error = False, f"cannot decode {pre['path']}"
+        pre["state"] = "ready" if ok else "failed"
+        pre["error"] = None if ok else (error or "decode failed")
+        if ok and error is None:
+            self._fire("preload_ready", {"path": pre["path"]})
+        else:
+            self._fire("preload_failed", {"path": pre["path"], "error": pre["error"] or error})
+
+    def cancel_preload(self):
+        self._rec("cancel_preload")
+        self._preload = None
+
+    def is_preloaded(self, path, stem_paths=None, tempo_pitch=None):
+        pre = self._preload
+        if not pre or pre["state"] != "ready" or pre["key"] != self._preload_key(path, stem_paths):
+            return False
+        if self._sig(path, stem_paths) != pre["sig"]:
+            return False
+        if tempo_pitch is None:
+            return True
+        tp = self._tp(tempo_pitch)
+        return tp == (1.0, 0.0) or tp == pre["tempo"]
+
+    def get_preloaded_audio(self, path):
+        pre = self._preload
+        if not pre or pre["state"] != "ready" or \
+                pre["key"][0] != self._preload_key(path, None)[0]:
+            return None
+        data = self._read_wav(pre["path"])[0].copy()
+        data.flags.writeable = False
+        return data
+
+    @staticmethod
+    def _read_wav(path):
+        try:
+            with wave.open(path, "rb") as wf:
+                channels = wf.getnchannels()
+                rate = wf.getframerate()
+                frames = wf.getnframes()
+                raw = wf.readframes(frames)
+        except Exception as e:
+            raise ValueError(f"cannot decode {path}: {e}")
+        data = np.frombuffer(raw, dtype=np.int16).reshape(-1, channels)
+        if channels == 1:
+            data = np.repeat(data, 2, axis=1)
+        return data, rate, frames
+
+    # ------------------------------------------------------------ loading --
+
+    def load_file(self, path, stem_paths=None, tempo_pitch=None):
+        if tempo_pitch is None:
+            self._rec("load_file", path, stem_paths)
+        else:
+            self._rec("load_file", path, stem_paths, tempo_pitch=tempo_pitch)
         if not os.path.exists(path):
             raise FileNotFoundError(path)
         self.stop()
+        pre = self._preload
+        adopted = None
+        if pre and pre["key"] == self._preload_key(path, stem_paths) \
+                and pre["sig"] == self._sig(path, stem_paths):
+            if pre["state"] == "running":
+                self.finish_preload()
+            if pre["state"] == "ready":
+                adopted = pre
+                self._preload = None
+        self.loaded_from_preload = adopted is not None
         if path.lower().endswith(".wav"):
-            try:
-                with wave.open(path, "rb") as wf:
-                    channels = wf.getnchannels()
-                    rate = wf.getframerate()
-                    frames = wf.getnframes()
-                    raw = wf.readframes(frames)
-            except Exception as e:
-                raise ValueError(f"cannot decode {path}: {e}")
-            data = np.frombuffer(raw, dtype=np.int16).reshape(-1, channels)
-            if channels == 1:
-                data = np.repeat(data, 2, axis=1)
+            data, rate, frames = self._read_wav(path)
             self._raw = data
             self.sample_rate = self.SAMPLE_RATE = rate
             self.song_length = frames / float(rate)
@@ -197,6 +307,9 @@ class FakeEngine:
             self._stems.append({"name": name, "gain_db": 0.0,
                                 "muted": 'click' not in name.lower(), "solo": False})
         self._tempo = (1.0, 0.0)
+        if adopted is not None and tempo_pitch is not None \
+                and self._tp(tempo_pitch) == adopted["tempo"]:
+            self._tempo = adopted["tempo"]
         self._armed = None
         self._hold = None
         self._skips = []
@@ -411,6 +524,7 @@ class FakeEngine:
     def cleanup(self):
         self._rec("cleanup")
         self.stop()
+        self._preload = None
         self._raw = None
 
     def sweep_stale_temp_files(self):

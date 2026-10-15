@@ -9,6 +9,7 @@ Provides UI for the loop detection feature:
 
 import customtkinter as ctk
 
+from utils.fonts import FONT_MONO
 from config import (
     COLOR_BTN_PRIMARY, COLOR_BTN_WARNING, COLOR_BTN_SUCCESS,
     COLOR_BTN_DANGER, COLOR_BG_MEDIUM,
@@ -99,7 +100,7 @@ class DetectorPanel(ctk.CTkFrame):
             except Exception:
                 pass
         self.btn_find.configure(state="normal" if self._find_enabled and not self._live else "disabled")
-        self.status_lbl.configure(text="🔒 Locked in Live Mode" if self._live else "")
+        self.status_lbl.configure(text="Locked in Live Mode" if self._live else "")
 
     def show_loading(self):
         self.status_lbl.configure(text="Analyzing audio...")
@@ -116,7 +117,7 @@ class DetectorPanel(ctk.CTkFrame):
         self.btn_select.configure(text="① Select Range", fg_color=COLOR_BTN_PRIMARY)
         self._find_enabled = False
         self.btn_find.configure(state="disabled")
-        self.status_lbl.configure(text="🔒 Locked in Live Mode" if self._live else "")
+        self.status_lbl.configure(text="Locked in Live Mode" if self._live else "")
 
         # Clear results
         self._result_buttons = []
@@ -142,7 +143,7 @@ class DetectorPanel(ctk.CTkFrame):
             row.pack(fill="x", pady=2)
 
             txt = f"{c.confidence}% | {c.duration:.2f}s"
-            ctk.CTkLabel(row, text=txt, font=("Consolas", 11)).pack(side="left", padx=5)
+            ctk.CTkLabel(row, text=txt, font=(FONT_MONO, 11)).pack(side="left", padx=5)
 
             btn_use = ctk.CTkButton(
                 row, text="Use", width=40, height=20, fg_color=COLOR_BTN_SUCCESS,

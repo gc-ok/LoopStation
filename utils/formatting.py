@@ -2,6 +2,7 @@
 Formatting utilities for Loop Station.
 """
 
+import math
 from typing import Optional
 
 
@@ -16,16 +17,17 @@ def format_time(seconds: float, include_ms: bool = True) -> str:
     Returns:
         Formatted string like "1:23.45" or "1:23"
     """
-    if seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         seconds = 0
     
-    minutes = int(seconds // 60)
-    secs = seconds % 60
-    
     if include_ms:
-        return f"{minutes}:{secs:05.2f}"
+        # Round to centiseconds first so 59.996 reads "1:00.00", not "0:60.00"
+        centis = int(round(seconds * 100))
+        minutes, centis = divmod(centis, 6000)
+        return f"{minutes}:{centis / 100:05.2f}"
     else:
-        return f"{minutes}:{int(secs):02d}"
+        minutes = int(seconds // 60)
+        return f"{minutes}:{int(seconds % 60):02d}"
 
 
 def parse_time(text: str) -> Optional[float]:
@@ -42,26 +44,38 @@ def parse_time(text: str) -> Optional[float]:
         text: Time string to parse
         
     Returns:
-        Time in seconds, or None if parsing failed
+        Time in seconds, or None if parsing failed (also for negative
+        parts and for "nan" / "inf")
     """
     text = text.strip()
     
     try:
         if ':' in text:
             parts = text.split(':')
+            if any(part.strip().startswith('-') for part in parts):
+                return None   # "-0:05", "1:-5"
             if len(parts) == 2:
                 minutes = int(parts[0])
                 seconds = float(parts[1])
-                return minutes * 60 + seconds
+                if minutes < 0:
+                    return None
+                result = minutes * 60 + seconds
             elif len(parts) == 3:
                 hours = int(parts[0])
                 minutes = int(parts[1])
                 seconds = float(parts[2])
-                return hours * 3600 + minutes * 60 + seconds
+                if hours < 0 or minutes < 0:
+                    return None
+                result = hours * 3600 + minutes * 60 + seconds
+            else:
+                return None
         else:
-            return float(text)
-    except (ValueError, IndexError):
+            seconds = result = float(text)
+    except (ValueError, IndexError, AttributeError):
         return None
+    if not math.isfinite(seconds) or seconds < 0 or not math.isfinite(result):
+        return None
+    return result
 
 
 def format_duration(seconds: float) -> str:

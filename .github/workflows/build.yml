@@ -128,6 +128,9 @@ jobs:
           --collect-all customtkinter `
           --collect-all matplotlib `
           --collect-all sounddevice `
+          --collect-all tkinterdnd2 `
+          --hidden-import rtmidi `
+          --hidden-import mido.backends.rtmidi `
           --hidden-import pygame `
           --hidden-import pygame.midi `
           --hidden-import mido `
@@ -161,6 +164,9 @@ jobs:
           --collect-all customtkinter \
           --collect-all matplotlib \
           --collect-all sounddevice \
+          --collect-all tkinterdnd2 \
+          --hidden-import rtmidi \
+          --hidden-import mido.backends.rtmidi \
           --hidden-import pygame \
           --hidden-import pygame.midi \
           --hidden-import mido \

@@ -8,12 +8,14 @@ phones or tablets backstage.
 
 Usage:
     The server is started/stopped from the main app UI.
-    It binds to 0.0.0.0 on an available port (default 8080).
+    It binds to 0.0.0.0 on an available port (default 8080; when busy,
+    8081..8090 are tried).
 
     Devices on the same WiFi network can access the monitor at:
         http://<your-local-ip>:<port>/?k=<token>
 
-    Every start() generates a fresh random token. Requests without the
+    A random token is generated once per process (kept across Share
+    off/on; CueWebServer.revoke_token() issues a new one). Requests without the
     token (as the ``k`` query parameter, or the cookie that the first
     tokenised hit sets) are rejected with 403, so other people on the
     venue Wi-Fi cannot read director/tech notes without the share link
@@ -43,6 +45,7 @@ from typing import Optional, Dict, Any, List
 logger = logging.getLogger("LoopStation.WebServer")
 
 from flask import Flask, jsonify, Response, request, g, abort
+from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
 
 try:
     import qrcode
@@ -97,6 +100,20 @@ def _hostname_candidates() -> List[str]:
     return [info[4][0] for info in infos if info[4]]
 
 
+# Host-only / NAT adapters of VirtualBox, Parallels, VMware Fusion, UTM,
+# Docker and libvirt. Phones cannot reach these; only a tiebreak, since a
+# real venue network could in principle use the same range.
+_VIRTUAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "192.168.56.0/24",   # VirtualBox host-only
+    "10.211.55.0/24",    # Parallels shared
+    "10.37.129.0/24",    # Parallels host-only
+    "192.168.64.0/24",   # macOS vmnet (UTM, Docker Desktop, Lima)
+    "192.168.99.0/24",   # docker-machine
+    "192.168.122.0/24",  # libvirt
+    "172.17.0.0/16",     # Docker bridge
+))
+
+
 def _ip_rank(ip: str) -> int:
     """Lower is better. Typical venue Wi-Fi is 192.168.x / 10.x."""
     try:
@@ -118,20 +135,36 @@ def _ip_rank(ip: str) -> int:
     return 5
 
 
+def _is_virtual(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _VIRTUAL_NETS)
+
+
 def get_local_ips() -> List[str]:
     """
     Candidate LAN IPv4 addresses for this machine, best first.
 
-    Never raises. Returns an empty list when no usable (non-loopback)
-    address is found, so the caller can fall back to 127.0.0.1.
+    The interface holding the default route comes first (that is the
+    network the operator's Wi-Fi / show network is on); the remaining
+    addresses follow by private range, with link-local and known virtual
+    machine adapters last. Never raises. Returns an empty list when no
+    usable (non-loopback) address is found, so the caller can fall back
+    to 127.0.0.1.
     """
     route_ip = _udp_route_candidate()
     seen = []
     for ip in ([route_ip] if route_ip else []) + _hostname_candidates():
         if ip and ip not in seen and _ip_rank(ip) < 99:
             seen.append(ip)
-    # Stable sort: rank first, default-route interface wins ties.
-    return sorted(seen, key=lambda ip: (_ip_rank(ip), ip != route_ip))
+    if route_ip and _ip_rank(route_ip) == 4:
+        route_ip = None      # link-local "route" (no DHCP): rank it normally
+    rest = [ip for ip in seen if ip != route_ip]
+    # Stable sort: physical before virtual, then rank, then OS order.
+    rest.sort(key=lambda ip: (_ip_rank(ip) == 4, _is_virtual(ip), _ip_rank(ip)))
+    return ([route_ip] if route_ip in seen else []) + rest
 
 
 def get_local_ip() -> str:
@@ -270,10 +303,24 @@ class SharedCueState:
             "next_id": None,
             "current": None,   # {id, name, type, time|start/end, tag_notes}
             "next": None,      # {id, name, type, ..., tag_notes, countdown}
+            "ack_epoch": "",   # acks belong to this epoch (see new_ack_epoch)
         }
         # cue_id -> [{device, ts}]; insertion-ordered so the oldest cue id
         # can be dropped once ACK_CUE_LIMIT ids are remembered.
         self._acks: "OrderedDict[str, List[dict]]" = OrderedDict()
+        # Ack epochs. Cue ids are persistent UUIDs, so an ack is only valid
+        # for one pass over the cue: the epoch changes (and the acks are
+        # cleared) when the song changes, on stop, and when a cue that was
+        # already passed comes up again as current/next (rewind, second
+        # night in the same session). The random prefix differs per process,
+        # so phones holding acks from yesterday's run never match.
+        self._epoch_prefix = secrets.token_hex(4)
+        self._epoch_n = 0
+        self._state["ack_epoch"] = f"{self._epoch_prefix}-0"
+        self._seen_song = None       # (song key,) once the first update arrived
+        self._seen_state = None
+        self._seen_current = None
+        self._passed: set = set()    # cue ids that were current and then left
 
     def update(self, **kwargs):
         with self._lock:
@@ -321,8 +368,52 @@ class SharedCueState:
         return self.acks_snapshot()
 
     def clear_acks(self) -> None:
+        """Forget every ack and start a new ack epoch (phones reset too)."""
         with self._lock:
-            self._acks.clear()
+            self._new_epoch_locked()
+
+    def new_ack_epoch(self) -> str:
+        """Start a new ack epoch (clears acks); returns the new epoch id."""
+        with self._lock:
+            return self._new_epoch_locked()
+
+    @property
+    def ack_epoch(self) -> str:
+        with self._lock:
+            return self._state["ack_epoch"]
+
+    def _new_epoch_locked(self) -> str:
+        self._acks.clear()
+        self._passed = set()
+        self._epoch_n += 1
+        epoch = f"{self._epoch_prefix}-{self._epoch_n}"
+        self._state["ack_epoch"] = epoch
+        return epoch
+
+    def _track_epoch(self, song_key, state_name, current_id, next_id) -> None:
+        """
+        (update_from_app) Start a new ack epoch on a song change, on the
+        transition to stopped, or when an already-passed cue comes up again.
+        """
+        with self._lock:
+            first = self._seen_song is None
+            bump = False
+            if not first:
+                if song_key != self._seen_song[0]:
+                    bump = True
+                elif state_name == 'stopped' and self._seen_state not in (None, 'stopped'):
+                    bump = True
+                elif current_id != self._seen_current:
+                    if self._seen_current is not None:
+                        self._passed.add(self._seen_current)
+                    if ((current_id is not None and current_id in self._passed)
+                            or (next_id is not None and next_id in self._passed)):
+                        bump = True
+            self._seen_song = (song_key,)
+            self._seen_state = state_name
+            self._seen_current = current_id
+            if bump:
+                self._new_epoch_locked()
 
     def public_state(self) -> dict:
         """
@@ -365,9 +456,14 @@ class SharedCueState:
         end_countdown = (countdown(duration, position) if callable(countdown)
                          else max(0.0, duration - position) / rate)
 
+        current_id = current_dict["id"] if current_dict else None
+        next_id = next_dict["id"] if next_dict else None
         if app_state is not None:
             state_obj = getattr(app_state, 'state', None)
             state_name = str(getattr(state_obj, 'name', '') or '').lower() or 'stopped'
+            song_key = (getattr(app_state, 'current_song_id', None)
+                        or getattr(app_state, 'current_song_name', '') or '')
+            self._track_epoch(str(song_key), state_name, current_id, next_id)
             holds = []
             for h in (getattr(app_state, 'holds', None) or []):
                 holds.append({
@@ -394,6 +490,7 @@ class SharedCueState:
                 next=next_dict,
             )
         else:
+            self._track_epoch("", "stopped", current_id, next_id)
             self.update(
                 playback_rate=1.0, end_countdown=None,
                 song_name="",
@@ -893,7 +990,8 @@ function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
 let dept = 'All';                 // department filter
 let deviceName = '';              // who is pressing ACK
-let ackedIds = [];                // cue ids this device acked (newest last)
+let ackedIds = [];                // "<epoch>|<cue id>" this device acked (newest last)
+let ackEpoch = '';                // server ack epoch; acks from older epochs do not count
 let lastAcks = {};                // acks for current/next cue ids from the server
 let cardSig = { currentCard: '', nextCard: '' };   // re-render cards only on change
 let ackInFlight = false;
@@ -962,7 +1060,7 @@ document.getElementById('deviceChange').addEventListener('click', () => {
 
 function isAcked(cueId) {
   if (!cueId) return false;
-  if (ackedIds.indexOf(cueId) >= 0) return true;
+  if (ackEpoch && ackedIds.indexOf(ackEpoch + '|' + cueId) >= 0) return true;
   const list = lastAcks[cueId] || [];
   return !!deviceName && list.some(a => a.device === deviceName);
 }
@@ -975,15 +1073,19 @@ async function sendAck(cueId) {
     return;
   }
   ackInFlight = true;
+  const epoch = ackEpoch;
   try {
     const res = await fetch(ACK_URL, {
       method: 'POST', cache: 'no-store', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ device: deviceName, cue_id: cueId }),
+      body: JSON.stringify(epoch ? { device: deviceName, cue_id: cueId, epoch: epoch }
+                                 : { device: deviceName, cue_id: cueId }),
     });
     if (res.status === 403) throw new Error('Not authorised - rescan the QR code or reopen the share link');
+    if (res.status === 409) throw new Error('the show moved on - ACK again if still needed');
     if (!res.ok && res.status !== 204) throw new Error('HTTP ' + res.status);
-    ackedIds = ackedIds.filter(x => x !== cueId).concat([cueId]).slice(-50);
+    const ackKey = epoch + '|' + cueId;
+    ackedIds = ackedIds.filter(x => x !== ackKey).concat([ackKey]).slice(-50);
     lsSet(LS_ACKED, JSON.stringify(ackedIds));
     // optimistic count until the next poll confirms
     const list = (lastAcks[cueId] || []).filter(a => a.device !== deviceName);
@@ -1098,6 +1200,7 @@ const ACTION_TEXT = {
   play: 'GO will PLAY',
   release_hold: 'GO will RELEASE the hold',
   exit_vamp: 'GO will EXIT the vamp',
+  next_song: 'GO will start the NEXT SONG',
   none: 'Nothing armed',
 };
 
@@ -1274,7 +1377,9 @@ async function poll() {
       }
     }
     
-    // Current / next cards (+ ACK state); only rewritten when changed
+    // Current / next cards (+ ACK state); only rewritten when changed.
+    // A new ack epoch (song change, stop, cue reached again) voids old acks.
+    ackEpoch = typeof data.ack_epoch === 'string' ? data.ack_epoch : '';
     lastAcks = (data.acks && typeof data.acks === 'object') ? data.acks : {};
     lastCurrent = data.current || null;
     lastNext = data.next || null;
@@ -1404,7 +1509,11 @@ def create_flask_app(shared_state: SharedCueState, token: Optional[str] = None,
 
     @app.route('/api/ack', methods=['POST'])
     def api_ack():
-        """A backstage device acknowledges a cue: {device, cue_id} -> 204."""
+        """
+        A backstage device acknowledges a cue: {device, cue_id[, epoch]} -> 204.
+        An ``epoch`` that is no longer current (the show moved on, or was
+        stopped, while the ACK was in flight) is refused with 409.
+        """
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return Response("expected a JSON object", status=400, mimetype='text/plain')
@@ -1419,6 +1528,9 @@ def create_flask_app(shared_state: SharedCueState, token: Optional[str] = None,
                 or len(cue_id) > ACK_CUE_ID_MAX):
             return Response("device and cue_id must be non-empty and short",
                             status=400, mimetype='text/plain')
+        epoch = body.get('epoch')
+        if epoch is not None and epoch != shared_state.ack_epoch:
+            return Response("stale ack epoch", status=409, mimetype='text/plain')
         shared_state.add_ack(cue_id, device)
         return Response(status=204)
 
@@ -1438,10 +1550,103 @@ def create_flask_app(shared_state: SharedCueState, token: Optional[str] = None,
 # SERVER MANAGER
 # =========================================================================
 
+DEFAULT_PORT = 8080
+PORT_FALLBACK = 10          # 8080 busy -> try 8081 ... 8090
+REQUEST_TIMEOUT_S = 10.0    # idle / half-open connections are dropped after this
+MAX_CONNECTIONS = 64        # concurrent connections (each one a thread)
+MAX_CONNECTIONS_PER_IP = 16  # browsers open up to ~6 per host
+SHUTDOWN_TIMEOUT_S = 2.0    # stop() never waits longer than this for shutdown()
+
+
+class _ShareRequestHandler(WSGIRequestHandler):
+    """werkzeug handler with a socket timeout (slow / half-open clients)."""
+    timeout = REQUEST_TIMEOUT_S
+
+
+class _ShareServer(ThreadedWSGIServer):
+    """
+    Threaded werkzeug server with a bounded number of connections (extra
+    ones get an immediate 503 instead of a thread) and a way to drop every
+    open connection on stop(). On Windows SO_REUSEADDR would let a second
+    server bind the same port, so it is only used elsewhere (where it just
+    allows rebinding over TIME_WAIT); Windows' default bind is exclusive
+    against a live listener.
+    """
+    allow_reuse_address = os.name != "nt"
+
+    def __init__(self, host, port, app):
+        self._conn_lock = threading.Lock()
+        self._conns: set = set()
+        self._per_ip: Dict[str, int] = {}
+        self._closing = False
+        super().__init__(host, port, app, handler=_ShareRequestHandler)
+
+    def process_request(self, request, client_address):
+        ip = client_address[0] if client_address else ""
+        with self._conn_lock:
+            reject = (self._closing or len(self._conns) >= MAX_CONNECTIONS
+                      or self._per_ip.get(ip, 0) >= MAX_CONNECTIONS_PER_IP)
+            if not reject:
+                self._conns.add(request)
+                self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        if reject:
+            self._reject(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._forget(request, ip)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._forget(request, client_address[0] if client_address else "")
+
+    def _forget(self, request, ip) -> None:
+        with self._conn_lock:
+            if request in self._conns:
+                self._conns.discard(request)
+                left = self._per_ip.get(ip, 0) - 1
+                if left > 0:
+                    self._per_ip[ip] = left
+                else:
+                    self._per_ip.pop(ip, None)
+
+    def _reject(self, request) -> None:
+        body = b"Too many connections"
+        try:
+            request.settimeout(1.0)
+            request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                            b"Content-Type: text/plain\r\nRetry-After: 2\r\n"
+                            b"Connection: close\r\nContent-Length: "
+                            + str(len(body)).encode() + b"\r\n\r\n" + body)
+        except OSError:
+            pass
+        self.shutdown_request(request)
+
+    @property
+    def connection_count(self) -> int:
+        with self._conn_lock:
+            return len(self._conns)
+
+    def close_connections(self) -> None:
+        """Refuse new connections and unblock every handler thread."""
+        with self._conn_lock:
+            self._closing = True
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
 class CueWebServer:
     """
     Manages the Flask web server lifecycle.
-    
+
     Usage:
         shared = SharedCueState()
         server = CueWebServer(shared)
@@ -1449,27 +1654,106 @@ class CueWebServer:
         server.get_urls()     # same URL for every candidate LAN address
         ...
         server.stop()         # closes the socket and joins the thread
+
+    The access token lives for the whole process (shared by every
+    CueWebServer), so stopping and restarting sharing keeps phones
+    connected; ``revoke_token()`` deliberately issues a new one. With the
+    default port, a busy 8080 falls back to 8081..8090 (the port that
+    worked is tried first next time); ``port`` / ``url`` hold the result.
     """
-    
-    def __init__(self, shared_state: SharedCueState, port: int = 8080):
+
+    _token_lock = threading.Lock()
+    _process_token: Optional[str] = None
+    _last_port: Optional[int] = None
+
+    def __init__(self, shared_state: SharedCueState, port: int = DEFAULT_PORT,
+                 port_fallback: Optional[int] = None):
+        """
+        port_fallback: how many following ports to try when ``port`` is
+                       busy. Default: PORT_FALLBACK for DEFAULT_PORT, else 0.
+        """
         self.shared_state = shared_state
         self.port = port
+        self._requested_port = port
+        if port_fallback is None:
+            port_fallback = PORT_FALLBACK if port == DEFAULT_PORT else 0
+        self._port_fallback = max(0, int(port_fallback))
         self._thread: Optional[threading.Thread] = None
         self._server = None
+        self._app = None
         self._lock = threading.Lock()
         self.running = False
         self.url = ""          # best share URL, includes the access token
         self.urls: List[str] = []   # one share URL per candidate LAN address
         self.ip = ""           # address used in ``url``
         self.ips: List[str] = []    # all candidate LAN addresses, best first
-        self.token = ""        # access token for the current session
+        self.token = ""        # access token (same for the whole process)
+
+    # ---- token -------------------------------------------------------------
+
+    @classmethod
+    def _shared_token(cls) -> str:
+        with cls._token_lock:
+            if not cls._process_token:
+                cls._process_token = secrets.token_urlsafe(16)
+            return cls._process_token
+
+    def revoke_token(self) -> str:
+        """
+        Issue a new access token: every phone must rescan the QR code. A
+        running server switches immediately. Returns the new share URL
+        ("" when not running).
+        """
+        with CueWebServer._token_lock:
+            CueWebServer._process_token = secrets.token_urlsafe(16)
+            token = CueWebServer._process_token
+        with self._lock:
+            self.token = token
+            if not self.running or self._app is None:
+                return ""
+            self._app.config['CUE_TOKEN'] = token
+            self.urls = [self._share_url(ip) for ip in self.ips]
+            self.url = self.urls[0]
+            self._app.config['SHARE_URL'] = self.url
+            logger.info("Cue monitor access token revoked")
+            return self.url
+
+    regenerate_token = revoke_token
+
+    # ---- lifecycle ---------------------------------------------------------
+
+    def _candidate_ports(self) -> List[int]:
+        base = self._requested_port
+        ports = [base + i for i in range(self._port_fallback + 1)]
+        last = CueWebServer._last_port
+        if self._port_fallback and last in ports:
+            ports.remove(last)
+            ports.insert(0, last)   # phones already have this URL
+        return [p for p in ports if 0 <= p <= 65535] or [base]
+
+    def _bind(self, port: int, app):
+        """Bind ``port``; returns the server or raises WebServerStartError."""
+        # Binding is the only thing that can fail at start; everything after
+        # is in-process. NOTE: werkzeug prints the bind error and calls
+        # sys.exit(1) instead of raising OSError, so catch SystemExit too
+        # and keep its stderr chatter out of the console.
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(captured):
+                return _ShareServer('0.0.0.0', port, app)
+        except (OSError, SystemExit) as e:
+            self.port = port
+            msg, in_use = self._describe_bind_failure(e, captured.getvalue())
+            err = WebServerStartError(msg)
+            err.in_use = in_use
+            raise err from e
 
     def start(self) -> str:
         """
         Start the web server. Returns the share URL (with access token).
 
-        Raises WebServerStartError if the listener cannot be bound, e.g.
-        because the port is already in use. A failed start leaves the
+        Raises WebServerStartError if no listener can be bound, e.g.
+        because every candidate port is in use. A failed start leaves the
         server stopped; it is safe to call start() again later.
         """
         with self._lock:
@@ -1479,39 +1763,50 @@ class CueWebServer:
             # Detect the LAN address once; /qr.png reuses this URL.
             self.ips = get_local_ips() or ["127.0.0.1"]
             self.ip = self.ips[0]
-            self.token = secrets.token_urlsafe(16)
+            self.token = self._shared_token()
 
             app = create_flask_app(self.shared_state, token=self.token)
 
-            # Use werkzeug's make_server for clean shutdown. Binding is the
-            # only thing that can fail at start; everything after is in-process.
-            # NOTE: werkzeug prints the bind error and calls sys.exit(1)
-            # instead of raising OSError, so catch SystemExit too and keep
-            # its stderr chatter out of the console.
-            from werkzeug.serving import make_server
-            captured = io.StringIO()
-            try:
-                with contextlib.redirect_stderr(captured):
-                    server = make_server('0.0.0.0', self.port, app, threaded=True)
-            except (OSError, SystemExit) as e:
-                msg = self._describe_bind_failure(e, captured.getvalue())
-                logger.error(msg)
-                raise WebServerStartError(msg) from e
+            candidates = self._candidate_ports()
+            server = None
+            for n, port in enumerate(candidates):
+                try:
+                    server = self._bind(port, app)
+                    break
+                except WebServerStartError as e:
+                    if getattr(e, "in_use", False) and n + 1 < len(candidates):
+                        logger.info(f"Port {port} busy; trying the next one")
+                        continue
+                    if getattr(e, "in_use", False) and len(candidates) > 1:
+                        msg = (f"Ports {min(candidates)}-{max(candidates)} are all in use "
+                               f"(is another Loop Station window sharing?)")
+                        logger.error(msg)
+                        raise WebServerStartError(msg) from e
+                    logger.error(str(e))
+                    raise
 
             self._server = server
+            self._app = app
             self.port = server.server_port   # resolves port=0 to the real port
+            if self._port_fallback:
+                CueWebServer._last_port = self.port
             self.urls = [self._share_url(ip) for ip in self.ips]
             self.url = self.urls[0]
             app.config['SHARE_URL'] = self.url
+            stop_requested = threading.Event()
+            server._ls_stop_requested = stop_requested
 
             def _run():
                 logger.info(f"Web server starting on {self.url}")
                 try:
-                    server.serve_forever()
+                    if not stop_requested.is_set():
+                        server.serve_forever()
                 except Exception:
-                    logger.exception("Web server crashed")
+                    if not stop_requested.is_set():
+                        logger.exception("Web server crashed")
                 finally:
-                    self.running = False
+                    if self._server is server or self._server is None:
+                        self.running = False
                     logger.info("Web server stopped")
 
             # Set running before the thread starts so the flag can never be
@@ -1525,18 +1820,35 @@ class CueWebServer:
             return self.url
 
     def stop(self, timeout: float = 5.0):
-        """Stop the web server, release the port, and wait for the thread."""
+        """
+        Stop the web server, drop open connections, release the port and
+        wait (bounded) for the thread. Never blocks the caller indefinitely,
+        even if the serve thread never reached serve_forever().
+        """
         with self._lock:
             server, thread = self._server, self._thread
-            self._server, self._thread = None, None
+            self._server, self._thread, self._app = None, None, None
             self.running = False
             if server is None:
                 return
             logger.info("Web server shutdown requested")
+            stop_requested = getattr(server, '_ls_stop_requested', None)
+            if stop_requested is not None:
+                stop_requested.set()
             try:
-                server.shutdown()          # stop serve_forever() loop
+                server.close_connections()
             except Exception:
-                logger.exception("Error while shutting down web server")
+                logger.exception("Error while closing web server connections")
+            if thread is not None and thread.is_alive():
+                # shutdown() waits for serve_forever() to acknowledge; run it
+                # on a helper so a serve thread that never started the loop
+                # cannot hang the Tk thread.
+                helper = threading.Thread(target=self._shutdown_quietly, args=(server,),
+                                          name="LoopStation-WebServer-stop", daemon=True)
+                helper.start()
+                helper.join(min(timeout, SHUTDOWN_TIMEOUT_S))
+                if helper.is_alive():
+                    logger.warning("Web server did not acknowledge shutdown; closing anyway")
             try:
                 server.server_close()      # close the listening socket
             except Exception:
@@ -1546,6 +1858,13 @@ class CueWebServer:
                 if thread.is_alive():
                     logger.warning("Web server thread did not exit within "
                                    f"{timeout}s")
+
+    @staticmethod
+    def _shutdown_quietly(server) -> None:
+        try:
+            server.shutdown()          # stop serve_forever() loop
+        except Exception:
+            logger.exception("Error while shutting down web server")
 
     def get_url(self) -> str:
         """Best share URL (with token), or "" when not running."""
@@ -1559,6 +1878,10 @@ class CueWebServer:
         """All candidate LAN addresses, best first."""
         return list(self.ips) if self.running else []
 
+    def get_port(self) -> int:
+        """Port actually bound (may differ from the requested one after a fallback)."""
+        return self.port
+
     def get_qr_png(self, url: Optional[str] = None) -> bytes:
         """PNG bytes of a QR code for the share URL (or any given URL)."""
         return make_qr_png(url or self.url)
@@ -1566,13 +1889,15 @@ class CueWebServer:
     def _share_url(self, ip: str) -> str:
         return f"http://{ip}:{self.port}/?{TOKEN_PARAM}={self.token}"
 
-    def _describe_bind_failure(self, exc: BaseException, stderr_text: str) -> str:
-        """Human-readable reason make_server() could not bind self.port."""
+    def _describe_bind_failure(self, exc: BaseException, stderr_text: str):
+        """(message, in_use) for why make_server() could not bind self.port."""
         err: Optional[OSError] = exc if isinstance(exc, OSError) else None
         if err is None:
             # werkzeug swallowed the OSError; probe the port to classify it.
             probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
+                if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 probe.bind(('0.0.0.0', self.port))
             except OSError as probe_err:
                 err = probe_err
@@ -1583,8 +1908,10 @@ class CueWebServer:
                       or getattr(err, 'winerror', None) in (10048, 10013))
             if in_use:
                 return (f"Port {self.port} is already in use (is another Loop "
-                        f"Station window sharing, or another app on that port?)")
-            return f"Could not open port {self.port}: {err}"
+                        f"Station window sharing, or another app on that port?)"), True
+            return f"Could not open port {self.port}: {err}", False
         detail = stderr_text.strip().splitlines()
+        # The probe could bind, so the failure was transient / a race; let
+        # the caller try the next port.
         return (f"Could not open port {self.port}"
-                + (f": {detail[0]}" if detail else ""))
+                + (f": {detail[0]}" if detail else "")), True

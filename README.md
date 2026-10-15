@@ -21,7 +21,7 @@ See [Known Issues and Performance Readiness](#known-issues-and-performance-readi
 - **Unified Cue Sheet** — Single timeline view of all markers, vamps, and skip regions sorted chronologically
 
 ### Show Control
-- **GO Button** — One big GO (Enter / keypad Enter) performs whatever the STANDBY line shows: play, release a hold, or exit the current vamp. A double press within 300 ms is ignored (and says so)
+- **GO Button** — One big GO (Enter / keypad Enter) performs whatever the STANDBY line shows: play, release a hold, exit the current vamp, or — once a song has ended — load and start the next song in the library (Play replays the song that just ended). A double press within 300 ms is ignored (and says so)
 - **Hold Cues (Caesuras)** — Drop a hold (**H**) and playback stops exactly there until GO. The GO panel turns amber with a HELD banner
 - **Vamp Pass Counter** — "Pass 2 of 3" while a counted vamp repeats
 - **Live Mode** — **L** or the header button locks song switching, cue/vamp/hold editing, theme and tempo changes during a show (red LIVE badge); blocked actions are reported in the status line

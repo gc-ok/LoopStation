@@ -33,12 +33,15 @@ Threading notes:
 
 import os
 import json
+import inspect
+import math
 import time
 import logging
 import threading
 import uuid
 import hashlib
-from contextlib import nullcontext
+import unicodedata
+from contextlib import contextmanager, nullcontext
 from enum import Enum, auto
 from typing import Callable, Optional, Dict, List, Any, Tuple
 
@@ -50,13 +53,18 @@ from config import (
     LOOP_SWITCH_EARLY_MS, SAVE_DEBOUNCE_MS,
     DEFAULT_VAMP_NAME, DEFAULT_MARKER_NAME,
     FADE_EXIT_DURATION_MS, LOOP_CROSSFADE_MS,
-    GO_DEBOUNCE_MS,
+    GO_DEBOUNCE_MS, MIN_LOOP_DURATION,
 )
 from utils.formatting import format_time as _format_time
 from utils import preferences
+from utils.fileio import (
+    read_bytes_with_retry, write_text_atomic, backup_copy,
+    replace_with_retry, unique_backup_path,
+)
 from .loop_detector import LoopDetector
 from .midi_control import MidiController
 from .osc_output import OscOutput
+from .show import Show, ShowFileError, norm_path
 
 logger = logging.getLogger("LoopStation.StateManager")
 
@@ -78,8 +86,9 @@ DEVICE_STALL_S = 0.3
 DEVICE_RETRY_S = 2.0
 DEVICE_LOST_LABEL = "Audio device lost - check interface"
 
-# A GO / exit within this long after a counted vamp ended on its own is
-# treated as a late "exit" press and ignored (not "skip the next vamp").
+# A GO / exit within this long after a vamp ended (on its own count, or by a
+# cut / fade exit) is treated as a late or duplicate "exit" press and ignored
+# (not "skip the next vamp").
 LATE_EXIT_GRACE_S = 1.5
 
 # MIDI toggle_live: leaving Live Mode needs a second press within this window.
@@ -105,12 +114,61 @@ def _compute_tempo(samples, sr: int) -> Tuple[float, float]:
     return bpm, offset
 
 
+# Song-entry key holding saved items that could not be parsed. They are kept
+# verbatim (and carried through later saves) instead of being overwritten.
+UNREADABLE_KEY = '_unreadable'
+# Song-entry key holding edits made while the data file could not be read
+# (see _retry_blocked_read); kept so they are not lost.
+SESSION_COPY_KEY = '_unsaved_session_copy'
+PRESERVED_ENTRY_KEYS = (UNREADABLE_KEY, SESSION_COPY_KEY)
+
+# Attempts (with short sleeps) to read the loop data file when it is
+# locked by another process (antivirus, cloud sync) before giving up.
+LOAD_READ_ATTEMPTS = 8
+
+# Characters an OSC cue number must not contain (it becomes part of an OSC
+# address). Fallback for backend.osc_output.sanitize_osc_cue.
+_OSC_CUE_BAD_CHARS = frozenset('/*?[]{}#,')
+
+
+def _sanitize_osc(value) -> str:
+    """Clean an OSC cue number with osc_output.sanitize_osc_cue (lazy import)."""
+    text = str(value or "")
+    try:
+        from .osc_output import sanitize_osc_cue
+    except ImportError:
+        sanitize_osc_cue = None
+    if sanitize_osc_cue is not None:
+        return str(sanitize_osc_cue(text) or "")
+    return "".join(ch for ch in text.strip()
+                   if ch not in _OSC_CUE_BAD_CHARS and not ch.isspace())
+
+
+def _finite(value, what: str = "value") -> float:
+    """float(value), raising ValueError for nan / inf / non-numbers."""
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{what} is not a finite number: {value!r}")
+    return result
+
+
+def _int_or(value, default: int) -> int:
+    """int(value) for a finite number, else ``default`` (lenient load of optional fields)."""
+    try:
+        return int(_finite(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _migrate_tag_notes(obj, data: dict) -> None:
     """Fill obj.tag_notes from 'tag_notes' or the legacy separate tags/notes fields."""
     if 'tag_notes' in data:
-        obj.tag_notes = dict(data['tag_notes'] or {})
+        notes = data['tag_notes']
+        obj.tag_notes = dict(notes) if isinstance(notes, dict) else {}
         return
     old_tags = data.get('tags', [])
+    if not isinstance(old_tags, list):
+        old_tags = []
     old_notes = data.get('notes', '')
     obj.tag_notes = {}
     for tag in old_tags:
@@ -147,11 +205,15 @@ class SkipRegion:
 
     @classmethod
     def from_dict(cls, data):
-        skip = cls(data['start'], data['end'], name=data.get('name', 'Skip'))
+        start = _finite(data['start'], "skip start")
+        end = _finite(data['end'], "skip end")
+        if end <= start:
+            raise ValueError(f"skip end {end} is not after start {start}")
+        skip = cls(start, end, name=data.get('name', 'Skip'))
         skip.id = data.get('id', str(uuid.uuid4()))
-        skip.active = data.get('active', True)
+        skip.active = bool(data.get('active', True))
         skip.method = data.get('method', 'cut')
-        skip.fade_ms = data.get('fade_ms', 500)
+        skip.fade_ms = _int_or(data.get('fade_ms', 500), 500)
         return skip
 
 
@@ -161,6 +223,12 @@ class PlaybackState(Enum):
     PLAYING = auto()
     PAUSED = auto()
     HELD = auto()       # parked on a hold cue (caesura), waiting for GO
+
+
+def _long_enough(start: float, end: float) -> bool:
+    """A vamp must be finite and at least MIN_LOOP_DURATION long (the core enforces it too)."""
+    return (math.isfinite(start) and math.isfinite(end)
+            and end - start >= MIN_LOOP_DURATION - 1e-9)
 
 
 def _engine_count(repeat_count):
@@ -247,23 +315,29 @@ class LoopRegion:
             'early_switch_ms': self.early_switch_ms,
             'exit_fade_ms': self.exit_fade_ms,
             'repeat_count': self.repeat_count,
-            'tag_notes': self.tag_notes,
+            'tag_notes': dict(self.tag_notes),   # copy: the UI edits in place
             'osc_cue': self.osc_cue,
         }
 
     @classmethod
     def from_dict(cls, data):
         """Deserialize from JSON storage."""
-        loop = cls(data['start'], data['end'], name=data.get('name', DEFAULT_VAMP_NAME))
+        start = _finite(data['start'], "vamp start")
+        end = _finite(data['end'], "vamp end")
+        if end <= start:
+            raise ValueError(f"vamp end {end} is not after start {start}")
+        loop = cls(start, end, name=data.get('name', DEFAULT_VAMP_NAME))
         loop.id = data.get('id', str(uuid.uuid4()))
-        loop.active = data.get('active', True)
-        loop.entry_fade_ms = data.get('entry_fade_ms', 15)
-        loop.crossfade_ms = data.get('crossfade_ms', LOOP_CROSSFADE_MS)
-        loop.early_switch_ms = data.get('early_switch_ms', LOOP_SWITCH_EARLY_MS)
-        loop.exit_fade_ms = data.get('exit_fade_ms', FADE_EXIT_DURATION_MS)
-        count = data.get('repeat_count')
-        loop.repeat_count = int(count) if count and int(count) >= 2 else None
-        loop.osc_cue = str(data.get('osc_cue') or "")
+        loop.active = bool(data.get('active', True))
+        loop.entry_fade_ms = max(0, _int_or(data.get('entry_fade_ms', 15), 15))
+        loop.crossfade_ms = max(0, _int_or(data.get('crossfade_ms', LOOP_CROSSFADE_MS), LOOP_CROSSFADE_MS))
+        loop.early_switch_ms = max(0, _int_or(data.get('early_switch_ms', LOOP_SWITCH_EARLY_MS),
+                                              LOOP_SWITCH_EARLY_MS))
+        loop.exit_fade_ms = max(0, _int_or(data.get('exit_fade_ms', FADE_EXIT_DURATION_MS),
+                                           FADE_EXIT_DURATION_MS))
+        count = _int_or(data.get('repeat_count'), 0)
+        loop.repeat_count = count if count >= 2 else None
+        loop.osc_cue = _sanitize_osc(data.get('osc_cue'))
         _migrate_tag_notes(loop, data)
         return loop
 
@@ -301,16 +375,17 @@ class Marker:
             'name': self.name,
             'time': self.time,
             'color': self.color,
-            'tag_notes': self.tag_notes,
+            'tag_notes': dict(self.tag_notes),   # copy: the UI edits in place
             'osc_cue': self.osc_cue,
         }
 
     @classmethod
     def from_dict(cls, data):
         """Deserialize from JSON storage."""
-        marker = cls(data['time'], name=data.get('name', DEFAULT_MARKER_NAME), color=data.get('color'))
+        marker = cls(_finite(data['time'], "marker time"),
+                     name=data.get('name', DEFAULT_MARKER_NAME), color=data.get('color'))
         marker.id = data.get('id', str(uuid.uuid4()))
-        marker.osc_cue = str(data.get('osc_cue') or "")
+        marker.osc_cue = _sanitize_osc(data.get('osc_cue'))
         _migrate_tag_notes(marker, data)
         return marker
 
@@ -338,15 +413,15 @@ class HoldCue:
             'id': self.id,
             'name': self.name,
             'time': self.time,
-            'tag_notes': self.tag_notes,
+            'tag_notes': dict(self.tag_notes),   # copy: the UI edits in place
             'osc_cue': self.osc_cue,
         }
 
     @classmethod
     def from_dict(cls, data):
-        hold = cls(data['time'], name=data.get('name', DEFAULT_HOLD_NAME))
+        hold = cls(_finite(data['time'], "hold time"), name=data.get('name', DEFAULT_HOLD_NAME))
         hold.id = data.get('id', str(uuid.uuid4()))
-        hold.osc_cue = str(data.get('osc_cue') or "")
+        hold.osc_cue = _sanitize_osc(data.get('osc_cue'))
         _migrate_tag_notes(hold, data)
         return hold
 
@@ -374,12 +449,12 @@ class SongSettings:
         for name, cfg in (stems or {}).items():
             cfg = cfg or {}
             self.stems[str(name)] = {
-                'gain_db': float(cfg.get('gain_db', 0.0)),
+                'gain_db': _finite(cfg.get('gain_db', 0.0), "stem gain"),
                 'muted': bool(cfg.get('muted', False)),
                 'solo': bool(cfg.get('solo', False)),
             }
         self.routing_mode = routing_mode if routing_mode in ROUTING_MODES else "stereo"
-        self.osc_cue = str(osc_cue or "")
+        self.osc_cue = _sanitize_osc(osc_cue)
 
     def to_dict(self) -> dict:
         return {
@@ -394,10 +469,40 @@ class SongSettings:
         }
 
     @classmethod
-    def from_dict(cls, data) -> "SongSettings":
+    def from_dict(cls, data, problems: Optional[List[str]] = None) -> "SongSettings":
+        """
+        Build from saved data. Each field is validated on its own: an
+        invalid one (null / nan / wrong type) falls back to its default and
+        is reported in ``problems`` instead of discarding the whole block.
+        """
         if not isinstance(data, dict):
+            if data is not None and problems is not None:
+                problems.append("settings: not an object")
             return cls()
-        return cls(**{k: data[k] for k in cls.FIELDS if k in data})
+        kwargs: Dict[str, Any] = {}
+        for key in cls.FIELDS:
+            if key not in data:
+                continue
+            value = data[key]
+            try:
+                if key in ('tempo_ratio', 'semitones', 'bpm', 'downbeat_offset'):
+                    value = _finite(value, key)
+                    if key == 'tempo_ratio' and value <= 0:
+                        raise ValueError("tempo_ratio must be positive")
+                    if key == 'bpm':
+                        value = max(0.0, value)
+                elif key == 'beats_per_bar':
+                    value = max(1, int(_finite(value, key)))
+                elif key == 'stems':
+                    value = {name: cfg for name, cfg in (value or {}).items()}
+                cls(**{key: value})   # validates the field in isolation
+            except (TypeError, ValueError, AttributeError) as e:
+                logger.warning(f"Ignoring invalid song setting {key}={data[key]!r}: {e}")
+                if problems is not None:
+                    problems.append(f"settings.{key}: {data[key]!r}")
+                continue
+            kwargs[key] = value
+        return cls(**kwargs)
 
     def copy(self) -> "SongSettings":
         return SongSettings.from_dict(self.to_dict())
@@ -459,6 +564,19 @@ class StateManager:
     - 'hold_released': ()
     - 'standby_changed': (standby: dict)
     - 'go_fired': (entry: dict)
+    - 'go_next_song': (path: str)  -- GO at the end of a song: the UI loads
+        ``path`` with load_song(path, from_go=True), then calls play_after_go_load()
+    - 'go_next_entry': (entry_id: str)  -- emitted right after 'go_next_song'
+        when the target came from the show; a show-aware UI handles THIS one
+        (load_entry(entry_id, from_go=True), then play_after_go_load()) and
+        ignores 'go_next_song'. Never emitted for next_song_provider targets.
+    - 'show_changed': (snapshot: dict)  -- see show_snapshot()
+    - 'current_entry_changed': (entry_id: str | None)
+    - 'next_up_changed': (entry_id: str | None)  -- the EFFECTIVE next-up
+        entry (operator choice, else computed); None = end of show
+    - 'show_save_failed': (message: str)
+    - 'preload_ready': (path: str)   -- engine pre-decoded/rendered ``path``
+    - 'preload_failed': (path: str, message: str)
     - 'live_mode_changed': (enabled: bool)
     - 'settings_changed': (settings: SongSettings)   -- a copy
     - 'render_state': (state: "rendering"|"done"|"failed", message: str)
@@ -481,9 +599,11 @@ class StateManager:
         'cut_detection_complete', 'loop_skip_queued', 'loop_skip_cleared',
         'data_load_failed', 'save_failed', 'save_succeeded', 'preview_changed',
         'hold_reached', 'hold_released', 'standby_changed', 'go_fired',
-        'live_mode_changed', 'settings_changed', 'render_state', 'stems_changed',
+        'go_next_song', 'live_mode_changed', 'settings_changed', 'render_state', 'stems_changed',
         'tempo_estimated', 'blocked_in_live_mode', 'device_error',
         'device_lost', 'device_restored',
+        'go_next_entry', 'show_changed', 'current_entry_changed', 'next_up_changed',
+        'show_save_failed', 'preload_ready', 'preload_failed',
     )
 
     def __init__(self, ffmpeg_path: str = "ffmpeg", data_file: Optional[str] = None,
@@ -588,6 +708,18 @@ class StateManager:
         self._save_dirty: bool = False
         self.last_save_error: Optional[str] = None
         self.pending_tempo_pitch: Optional[Tuple[float, float]] = None
+        # Tempo/key the song was saved with while its load-time render is
+        # still pending: saves keep persisting these, not the engine's 1.0/0.
+        self._saved_tempo_pitch: Optional[Tuple[float, float]] = None
+        # Set when the data file exists but could not be read (locked, or
+        # corrupt and impossible to back up): nothing is written until a
+        # later read succeeds, so the file is never overwritten blindly.
+        self._data_read_blocked: Optional[str] = None
+        # Songs saved during this session (merged back after a blocked read)
+        self._session_song_ids: set = set()
+        # Songs whose disk entry turned up after edits were made on an empty
+        # load: saves go to the entry's SESSION_COPY_KEY until it is reloaded.
+        self._conflicted_song_ids: set = set()
 
         # GO / standby / live mode
         self.live_mode: bool = False
@@ -598,8 +730,34 @@ class StateManager:
         self._standby_lock = threading.Lock()
         self._live_exit_armed_at: float = -1e9   # MIDI two-press confirmation
 
-        # Late exit after a counted vamp ended by itself (monotonic time)
+        # Late exit after a vamp ended (its count ran out, or a cut / fade
+        # exit completed) -- monotonic time; see LATE_EXIT_GRACE_S
         self._count_exit_time: float = -1e9
+
+        # True after the song played to its end or a fade exit stopped it:
+        # GO advances to the next song (never restarts this one from 0:00);
+        # Play replays it.
+        self._ended_at_rest: bool = False
+
+        # () -> path of the song after the current one in the running order,
+        # or None at the end of the list. Set by the UI (library order).
+        self.next_song_provider: Optional[Callable[[], Optional[str]]] = None
+
+        # Show (running order). Always a Show; empty = fall back to
+        # next_song_provider. See the SHOW section below.
+        self._show_lock = threading.RLock()
+        self.show: Show = Show()
+        self.current_entry_id: Optional[str] = None
+        self.next_up_override: Optional[str] = None   # operator's explicit choice
+        self._show_anchor_index: Optional[int] = None  # where a removed current entry was
+        self._pending_go_entry_id: Optional[str] = None
+        self._last_next_up: Any = object()             # dedupe 'next_up_changed'
+        self._show_save_timer: Optional[threading.Timer] = None
+        # Preload worker (one request at a time; stale requests drop out)
+        self._preload_lock = threading.Lock()
+        self._preload_generation: int = 0
+        self._preload_requested: Any = None
+        self._preload_thread: Optional[threading.Thread] = None
 
         # Device-loss watchdog (see _watchdog_tick)
         self._clock = time.monotonic             # tests substitute a fake clock
@@ -618,6 +776,15 @@ class StateManager:
 
         # Callbacks for UI updates (event-driven architecture)
         self._callbacks: Dict[str, List[Callable]] = {name: [] for name in self.EVENTS}
+
+        # Main/backup mirroring (backend/mirror.py). The link is idle until
+        # mirror.start(); as main it sets _mirror_sink to receive discrete
+        # actions (see _mirror_emit). _mirror_quiet() suppresses emits for
+        # internal calls and for actions a backup applies from its main.
+        self._mirror_sink: Optional[Callable[[str, dict], None]] = None
+        self._mirror_tls = threading.local()
+        from .mirror import MirrorLink
+        self.mirror = MirrorLink(self)
 
         # Control surfaces
         self.osc = OscOutput()
@@ -690,6 +857,42 @@ class StateManager:
         self._refresh_standby()
 
     # =========================================================================
+    # MIRRORING HOOKS (backend/mirror.py; internal -- never call from the UI)
+    # =========================================================================
+
+    def _mirror_emit(self, kind: str, **data) -> None:
+        """Hand a discrete action to the mirror main (non-blocking), unless quiet."""
+        sink = self._mirror_sink
+        if sink is None or getattr(self._mirror_tls, 'quiet', 0):
+            return
+        try:
+            sink(kind, data)
+        except Exception:
+            logger.exception(f"Mirror hook failed for {kind}")
+
+    @contextmanager
+    def _mirror_quiet(self):
+        """Calls inside this block (this thread) are not sent to mirror backups."""
+        tls = self._mirror_tls
+        tls.quiet = getattr(tls, 'quiet', 0) + 1
+        try:
+            yield
+        finally:
+            tls.quiet -= 1
+
+    def _mirror_load(self, entry_id: Optional[str], path: str) -> bool:
+        """Backup: load what the main loaded (the GO path, so Live Mode allows it)."""
+        with self._mirror_quiet():
+            if entry_id:
+                return self.load_entry(entry_id, from_go=True)
+            return self.load_song(path, from_go=True)
+
+    def _mirror_set_tempo_pitch(self, tempo_ratio: float, semitones: float) -> bool:
+        """Backup: apply the main's tempo/key change (bypasses the Live Mode lock)."""
+        with self._mirror_quiet():
+            return self._set_tempo_pitch(tempo_ratio, semitones)
+
+    # =========================================================================
     # LIVE MODE
     # =========================================================================
 
@@ -699,6 +902,7 @@ class StateManager:
             return
         self.live_mode = enabled
         logger.info(f"Live mode {'ON' if enabled else 'OFF'}")
+        self._mirror_emit("live_mode", enabled=enabled)
         self._emit('live_mode_changed', enabled)
         self._refresh_standby()
 
@@ -771,15 +975,16 @@ class StateManager:
                     _add(name[len(prefix):], os.path.join(folder, entry))
         return found
 
-    def load_song(self, path: str) -> bool:
+    def load_song(self, path: str, from_go: bool = False) -> bool:
         """
         Load a song and its associated loop data.
 
         Safe to call from several threads: loads are serialised and a load
         that was superseded by a newer call drops its events and returns False.
-        Returns False (and emits 'blocked_in_live_mode') in live mode.
+        Returns False (and emits 'blocked_in_live_mode') in live mode, except
+        for the GO-driven advance to the next song (``from_go``).
         """
-        if self._blocked("load_song"):
+        if not from_go and self._blocked("load_song"):
             return False
         logger.info(f"=== UI: Loading song: {os.path.basename(path)} ===")
 
@@ -795,7 +1000,8 @@ class StateManager:
                 return False
 
             self.flush_save()
-            self.stop()
+            with self._mirror_quiet():   # the mirrored "load" stops the backup
+                self.stop()
             self._detection_generation += 1  # cancel in-flight detection
 
             try:
@@ -804,8 +1010,10 @@ class StateManager:
                 logger.warning(f"Stem discovery failed: {e}")
                 stem_paths = {}
 
+            song_id = self._get_file_fingerprint(path)
+            tempo_pitch = self._saved_tempo_pitch_for(song_id)
             try:
-                song_length, sync_ratio = self.audio.load_file(path, stem_paths or None)
+                song_length, sync_ratio = self._engine_load_file(path, stem_paths or None, tempo_pitch)
             except Exception as e:
                 logger.error(f"Error loading song: {e}")
                 # The engine has already released the previous song, so
@@ -822,8 +1030,8 @@ class StateManager:
             self.current_song_path = path
             self.current_song_name = os.path.basename(path)
 
-            # GENERATE UNIQUE ID
-            self.current_song_id = self._get_file_fingerprint(path)
+            # UNIQUE ID (content fingerprint, computed before the load)
+            self.current_song_id = song_id
             if self.current_song_id is None:
                 msg = (f"Could not fingerprint '{self.current_song_name}'; "
                        "vamps and markers for this song cannot be saved")
@@ -837,18 +1045,37 @@ class StateManager:
             self._clear_song_lists()
             self.loop_end = self.song_length
 
+            if self._data_read_blocked:
+                self._retry_blocked_read()   # the file may be readable now
+            if self.current_song_id:
+                # Reloading shows the disk entry again: saves may replace it
+                self._conflicted_song_ids.discard(self.current_song_id)
+                if self.current_song_id not in self.loop_data:
+                    self._adopt_moved_entry(path, self.current_song_id)
+
             saved = self.loop_data.get(self.current_song_id) if self.current_song_id else None
             if saved is not None:
                 logger.info("Found saved data for this audio file.")
                 try:
-                    self._load_song_data(saved)
+                    problems = self._load_song_data(saved)
                 except Exception as e:
-                    msg = f"Saved data for '{self.current_song_name}' is unreadable ({e}); starting empty"
+                    msg = (f"Saved data for '{self.current_song_name}' is unreadable ({e}); "
+                           "starting empty (the original entry is kept in the data file)")
                     logger.error(msg)
                     self._clear_song_lists()
                     self.loop_end = self.song_length
+                    self._keep_unreadable(self.current_song_id, {'entry': [saved]}, replace_entry=True)
                     self.last_load_error = msg
                     self._emit('data_load_failed', msg)
+                else:
+                    if problems:
+                        msg = (f"{len(problems)} saved item(s) for '{self.current_song_name}' could not "
+                               f"be read and were skipped ({'; '.join(problems[:3])}"
+                               f"{'; ...' if len(problems) > 3 else ''}). "
+                               "The originals are kept in the data file.")
+                        logger.error(msg)
+                        self.last_load_error = msg
+                        self._emit('data_load_failed', msg)
             else:
                 logger.info("No saved data found for this specific audio file.")
 
@@ -869,7 +1096,40 @@ class StateManager:
             self._emit('stems_changed', list(self.stems))
             self.osc.send_event("song_loaded", name=self.current_song_name,
                                 duration=self.song_length)
+            self._after_song_loaded(path)
             return True
+
+    def _engine_load_file(self, path: str, stem_paths, tempo_pitch: Tuple[float, float]):
+        """
+        audio.load_file(), passing the song's saved ``tempo_pitch`` when the
+        engine supports it (a matching preload is then installed already
+        rendered). Older engines get the two-argument call.
+        """
+        load = self.audio.load_file
+        try:
+            params = inspect.signature(load).parameters
+            supported = 'tempo_pitch' in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            supported = False
+        if supported:
+            return load(path, stem_paths, tempo_pitch=tempo_pitch)
+        return load(path, stem_paths)
+
+    def _saved_tempo_pitch_for(self, song_id: Optional[str]) -> Tuple[float, float]:
+        """The (tempo_ratio, semitones) saved in loop_data for a fingerprint ((1.0, 0.0) if none)."""
+        entry = self.loop_data.get(song_id) if song_id else None
+        settings = entry.get('settings') if isinstance(entry, dict) else None
+        if not isinstance(settings, dict):
+            return (1.0, 0.0)
+        try:
+            ratio = _finite(settings.get('tempo_ratio', 1.0), "tempo_ratio")
+            semis = _finite(settings.get('semitones', 0.0), "semitones")
+        except (TypeError, ValueError):
+            return (1.0, 0.0)
+        if ratio <= 0:
+            return (1.0, 0.0)
+        return (max(0.5, min(2.0, ratio)), max(-12.0, min(12.0, semis)))
 
     def _clear_song_lists(self) -> None:
         self.loops = []
@@ -878,6 +1138,8 @@ class StateManager:
         self.skips = []
         self.settings = SongSettings()
         self.pending_tempo_pitch = None
+        self._saved_tempo_pitch = None
+        self._ended_at_rest = False
         self.selected_loop_index = -1
         self.temp_skip_loop_id = None
         self._armed_loop_id = None
@@ -904,22 +1166,49 @@ class StateManager:
         self._emit_settings_update()
         self._emit('stems_changed', [])
 
-    def _load_song_data(self, saved: dict) -> None:
+    def _load_song_data(self, saved: dict) -> List[str]:
         """
         Load saved song data (loops, markers, holds, skips, settings).
         Handles both old format (just start/end) and new format (loops + markers).
-        Raises on malformed data; the caller falls back to "no saved data".
+
+        Every item is parsed on its own: a malformed vamp / marker / hold /
+        skip (missing time, null or nan values) is skipped and kept verbatim
+        under UNREADABLE_KEY so the next save does not lose it; an invalid
+        setting falls back to its default. Returns the problems found (empty
+        when clean). Raises only when the entry as a whole is unusable.
         """
         if not isinstance(saved, dict):
             raise ValueError("song entry is not an object")
 
+        problems: List[str] = []
+        unreadable: Dict[str, list] = {}
+
+        def _parse(kind: str, factory) -> list:
+            raw_items = saved.get(kind)
+            if raw_items is None:
+                return []
+            if not isinstance(raw_items, list):
+                problems.append(f"{kind}: not a list")
+                unreadable.setdefault(kind, []).append(raw_items)
+                return []
+            items = []
+            for index, raw in enumerate(raw_items):
+                try:
+                    if not isinstance(raw, dict):
+                        raise ValueError("not an object")
+                    items.append(factory(raw))
+                except Exception as e:
+                    logger.warning(f"Skipping unreadable saved {kind}[{index}] {raw!r}: {e}")
+                    problems.append(f"{kind}[{index}]: {e}")
+                    unreadable.setdefault(kind, []).append(raw)
+            return items
+
         if 'loops' in saved:
-            loops = [LoopRegion.from_dict(d) for d in saved['loops']]
-            markers = [Marker.from_dict(d) for d in saved.get('markers', [])]
-            holds = sorted((HoldCue.from_dict(d) for d in saved.get('holds', [])),
-                           key=lambda h: h.time)
-            skips = [SkipRegion.from_dict(d) for d in saved.get('skips', [])]
-            settings = SongSettings.from_dict(saved.get('settings'))
+            loops = _parse('loops', LoopRegion.from_dict)
+            markers = sorted(_parse('markers', Marker.from_dict), key=lambda m: m.time)
+            holds = sorted(_parse('holds', HoldCue.from_dict), key=lambda h: h.time)
+            skips = sorted(_parse('skips', SkipRegion.from_dict), key=lambda x: x.start)
+            settings = SongSettings.from_dict(saved.get('settings'), problems)
             self.loops = loops
             self.markers = markers
             self.holds = holds
@@ -933,13 +1222,45 @@ class StateManager:
                         f"{len(self.holds)} holds, {len(self.skips)} skips")
 
         elif 'start' in saved and 'end' in saved:
-            start = float(saved['start'])
-            end = float(saved['end'])
+            start = _finite(saved['start'], "start")
+            end = _finite(saved['end'], "end")
+            if end <= start:
+                raise ValueError(f"legacy loop end {end} is not after start {start}")
             logger.info(f"Loaded legacy loop points: IN={start:.3f}s OUT={end:.3f}s")
             self.loops = [LoopRegion(start, end, name="Vamp 1")]
             self.selected_loop_index = 0
             self.loop_start = start
             self.loop_end = end
+
+        if unreadable and self.current_song_id:
+            self._keep_unreadable(self.current_song_id, unreadable)
+        return problems
+
+    def _keep_unreadable(self, song_id: str, items: Dict[str, list],
+                         replace_entry: bool = False) -> None:
+        """
+        Record raw items that failed to load under the song entry's
+        UNREADABLE_KEY (save_loop carries the key forward), so a later save
+        never silently discards them. ``replace_entry``: the entry itself
+        was unusable; keep only the preserved copy.
+        """
+        with self._save_lock:
+            entry = self.loop_data.get(song_id)
+            if replace_entry or not isinstance(entry, dict):
+                old = entry if isinstance(entry, dict) else {}
+                entry = {k: old[k] for k in PRESERVED_ENTRY_KEYS if k in old}
+            else:
+                entry = dict(entry)
+            kept = entry.get(UNREADABLE_KEY)
+            kept = {k: list(v) for k, v in kept.items() if isinstance(v, list)} \
+                if isinstance(kept, dict) else {}
+            for kind, raws in items.items():
+                bucket = kept.setdefault(kind, [])
+                for raw in raws:
+                    if raw not in bucket:
+                        bucket.append(raw)
+            entry[UNREADABLE_KEY] = kept
+            self.loop_data[song_id] = entry
 
     def _engine_stems(self) -> list:
         try:
@@ -953,10 +1274,19 @@ class StateManager:
         s = self.settings
         audio = self.audio
         try:
-            if s.tempo_ratio != 1.0 or s.semitones != 0.0:
+            current = tuple(audio.get_tempo_pitch()) \
+                if (s.tempo_ratio != 1.0 or s.semitones != 0.0) else None
+            if current is not None and abs(current[0] - s.tempo_ratio) < 1e-6 \
+                    and abs(current[1] - s.semitones) < 1e-6:
+                # The engine installed a preload rendered at the saved
+                # tempo/key: no load-time render needed.
+                logger.info("Saved tempo/key already rendered (preload); no render")
+            elif current is not None:
                 requested = (s.tempo_ratio, s.semitones)
-                s.tempo_ratio, s.semitones = audio.get_tempo_pitch()
+                s.tempo_ratio, s.semitones = current
                 self.pending_tempo_pitch = requested
+                # Until the render finishes, saves keep the song's saved values
+                self._saved_tempo_pitch = requested
                 audio.set_tempo_pitch(*requested)
         except Exception as e:
             logger.error(f"set_tempo_pitch failed: {e}")
@@ -998,11 +1328,19 @@ class StateManager:
             logger.warning("Play ignored: audio device still lost")
             return
 
+        self._ended_at_rest = False
         if self.state == PlaybackState.HELD:
             self._release_hold()
             return
         if self.state == PlaybackState.PAUSED and self.audio.is_playing:
             self.audio.unpause_transport()
+            if getattr(self.audio, 'is_held', False):
+                # The engine reached a hold just as we paused (its
+                # hold_reached was ignored while PAUSED): resume onto the
+                # hold, so the next GO releases it.
+                self._enter_held()
+                self._mirror_emit("play", position=self.audio.get_position())
+                return
         elif self.state == PlaybackState.PAUSED:
             # Paused by a seek while stopped: the engine is idle, start it here
             pos = self.audio.get_position()
@@ -1016,21 +1354,36 @@ class StateManager:
         self._invalidate_arm()
         self._arm_engine(self.audio.get_position())
         self._start_monitor()
+        self._mirror_emit("play", position=self.audio.get_position())
         self._emit('state_change', self.state)
         self._refresh_standby()
 
-    def play_from(self, position: float) -> None:
+    def play_from(self, position: float) -> bool:
         """
-        Start playback from a specific timestamp.
+        Start playback from a specific timestamp (a user jump, e.g. to a
+        vamp's start). Returns False (and emits 'blocked_in_live_mode') in
+        live mode.
+        """
+        if self._blocked("play_from"):
+            return False
+        self._play_from(position)
+        return True
+
+    def _play_from(self, position: float) -> None:
+        """
+        Start playback from a specific timestamp (no Live Mode check).
         Used for previewing loop candidates and jumping to markers.
         """
-        self.stop()
+        with self._mirror_quiet():
+            self.stop()
+        self._ended_at_rest = False
         self._last_cue_pos = position
         self.audio.play_transport(start_pos=position)
         self.state = PlaybackState.PLAYING
         self._invalidate_arm()
         self._arm_engine(position)
         self._start_monitor()
+        self._mirror_emit("play_from", position=float(position))
         self._emit('state_change', self.state)
         self._refresh_standby()
 
@@ -1042,6 +1395,7 @@ class StateManager:
             # not see PLAYING + inactive transport and declare the song ended.
             self.state = PlaybackState.PAUSED
             self.audio.pause_transport()
+            self._mirror_emit("pause", position=self.audio.get_position())
             self._emit('state_change', self.state)
             self._refresh_standby()
 
@@ -1064,6 +1418,7 @@ class StateManager:
         self.state = PlaybackState.STOPPED
         self._invalidate_arm()
         self.flush_save()
+        self._mirror_emit("stop")
         self._emit('state_change', self.state)
         self._refresh_standby()
 
@@ -1088,6 +1443,7 @@ class StateManager:
         position = max(0.0, min(position, self.song_length - 0.01))
         previous_pos = self.audio.get_position()
         cleared = False
+        self._ended_at_rest = False
 
         if self.temp_skip_loop_id:
             skipped = self._find_loop(self.temp_skip_loop_id)
@@ -1109,6 +1465,7 @@ class StateManager:
         # The engine exits loop/hold itself and reports 'loop_exited' (seek)
         self.audio.seek_transport(position)
         self._looping_loop_id = None
+        self._mirror_emit("seek", position=float(position))
 
         if cleared:
             self._emit('loop_skip_cleared')
@@ -1155,7 +1512,7 @@ class StateManager:
         """Audition from ``position`` (detector cut preview). Blocked in live mode."""
         if self._blocked("preview"):
             return False
-        self.play_from(position)
+        self._play_from(position)
         return True
 
     # =========================================================================
@@ -1173,13 +1530,20 @@ class StateManager:
             if kind == 'vamp' and (not obj.active or obj.id == self.temp_skip_loop_id):
                 continue
             when = self._trigger_time(kind, obj)
-            if when <= pos + CUE_EPSILON_S:
+            if when <= pos + CUE_EPSILON_S or self._in_active_skip(when):
                 continue
             if best is None or when < best[0]:
                 best = (when, obj, kind)
         if best is None:
             return None, None
         return best[1], best[2]
+
+    def _in_active_skip(self, when: float) -> bool:
+        """True if playback jumps over ``when`` (it lies inside an active skip region)."""
+        for skip in self.skips:
+            if skip.active and skip.start <= when < skip.end:
+                return True
+        return False
 
     def _current_hold(self) -> Optional[HoldCue]:
         hold = self._find_hold(self._armed_hold_id)
@@ -1237,6 +1601,16 @@ class StateManager:
                     "next_item": loop, "next_type": "vamp"}
 
         if state == PlaybackState.STOPPED:
+            if self._ended_at_rest:
+                # Song ended / faded out: GO moves on to the next song (it
+                # never restarts this one from 0:00); Play replays it.
+                target = self._next_song_target()
+                if target is not None:
+                    return {"action": "next_song", "label": f"GO: next song - {target[2]}",
+                            "next_item": None, "next_type": None}
+                end = "End of show" if self._show_active() else "End of song list"
+                return {"action": "none", "label": f"{end} - Play replays this song",
+                        "next_item": None, "next_type": None}
             return {"action": "play", "label": "GO: play",
                     "next_item": next_item, "next_type": next_type}
 
@@ -1247,6 +1621,43 @@ class StateManager:
             label = "Playing"
         return {"action": "none", "label": label,
                 "next_item": next_item, "next_type": next_type}
+
+    def _next_song_target(self) -> Optional[Tuple[str, Optional[str], str]]:
+        """
+        Where GO at the end of a song goes: (path, entry_id, title), or None.
+        With a non-empty show it is the next-up entry (entry_id set); with an
+        empty show it is next_song_provider's path (entry_id None).
+        """
+        if self._show_active():
+            entry = self.show.get(self.next_up_entry_id)
+            if entry is None:
+                return None
+            return entry.path, entry.id, entry.title
+        path = self._next_song_path()
+        if not path:
+            return None
+        return path, None, os.path.splitext(os.path.basename(path))[0]
+
+    def _next_song_path(self) -> Optional[str]:
+        """next_song_provider's song after this one (None = last song / no provider)."""
+        provider = self.next_song_provider
+        if provider is None:
+            return None
+        try:
+            return provider() or None
+        except Exception as e:
+            logger.error(f"next_song_provider failed: {e}")
+            return None
+
+    def play_after_go_load(self) -> None:
+        """Start the song that a 'go_next_song' GO just loaded (sends its OSC cue)."""
+        self.play()
+        if self.settings.osc_cue:
+            self.osc.send_cue(self.settings.osc_cue)
+
+    def refresh_standby(self) -> None:
+        """Recompute GO's standby (e.g. after the song running order changed)."""
+        self._refresh_standby()
 
     def _refresh_standby(self) -> None:
         """Recompute standby(); emit 'standby_changed' when it differs from last time."""
@@ -1264,8 +1675,10 @@ class StateManager:
     def go(self, source: str = "ui") -> bool:
         """
         Perform the standby action. Returns False if nothing was done
-        (no action, or a second GO within GO_DEBOUNCE_MS).
+        (no action, or a second GO within GO_DEBOUNCE_MS). ``source`` is
+        recorded in the GO log ("ui", "midi", "web", "segue", ...).
         """
+        next_entry_id = None
         now = time.monotonic()
         with self._go_lock:
             if (now - self._last_go_time) * 1000.0 < GO_DEBOUNCE_MS:
@@ -1289,11 +1702,23 @@ class StateManager:
             self.play()
             if self.settings.osc_cue:
                 self.osc.send_cue(self.settings.osc_cue)
+        elif action == "next_song":
+            # The UI owns loading (overlay, waveform); it calls
+            # load_song(path, from_go=True) / load_entry(id, from_go=True)
+            # then play_after_go_load().
+            target = self._next_song_target()
+            if target is None:
+                return False
+            next_entry_id = target[1]
+            self._request_next_song(target)
 
         entry = {"ts": time.time(), "source": source, "action": action,
                  "position": position, "label": sb["label"]}
+        if action == "next_song" and next_entry_id:
+            entry["entry_id"] = next_entry_id
         self.go_log.append(entry)
         self._append_go_log(entry)
+        self._mirror_emit("go", action=action, position=position, entry_id=next_entry_id)
         self._emit('go_fired', dict(entry))
         self.osc.send_event("go", action=action, position=position,
                             source=source, label=sb["label"])
@@ -1312,7 +1737,12 @@ class StateManager:
         """Resume from a hold (engine resumes from the held sample)."""
         if self.state != PlaybackState.HELD:
             return
+        self._mirror_emit("release_hold")
         self.audio.release_hold()
+        if getattr(self.audio, 'is_paused', False):
+            # Paused while parked (or the pause raced the hold): resume the
+            # engine too, or we would report PLAYING over silence.
+            self.audio.unpause_transport()
         if self.state == PlaybackState.HELD:   # engine event may be async
             self._set_state(PlaybackState.PLAYING)
 
@@ -1358,7 +1788,7 @@ class StateManager:
         return False
 
     def _clamp_time(self, value: float) -> float:
-        value = float(value)
+        value = _finite(value, "time")   # nan / inf would poison sorting and the engine
         if self.song_length > 0:
             return max(0.0, min(value, self.song_length))
         return max(0.0, value)
@@ -1399,8 +1829,9 @@ class StateManager:
 
         new_start = loop.start if start is None else self._clamp_time(start)
         new_end = loop.end if end is None else self._clamp_time(end)
-        if new_end <= new_start:
-            logger.warning(f"Rejected loop points IN={new_start:.3f} OUT={new_end:.3f}")
+        if not _long_enough(new_start, new_end):
+            logger.warning(f"Rejected loop points IN={new_start:.3f} OUT={new_end:.3f} "
+                           f"(minimum {MIN_LOOP_DURATION}s)")
             return False
 
         points_changed = (new_start != loop.start) or (new_end != loop.end)
@@ -1485,7 +1916,7 @@ class StateManager:
             return False
         start = self._clamp_time(start)
         end = self._clamp_time(end)
-        if end <= start:
+        if not _long_enough(start, end):
             logger.warning(f"preview_loop: invalid region {start:.3f}-{end:.3f}")
             return False
 
@@ -1587,6 +2018,9 @@ class StateManager:
                     logger.info("Fade exit ignored: no longer in loop mode")
             else:
                 self.audio.queue_loop_exit("cut")
+            if self.exit_queue_active:
+                self._mirror_emit("queue_exit", fade=bool(fade_mode),
+                                  fade_ms=int(self.exit_fade_ms) if fade_mode else None)
             self._refresh_standby()
 
         elif self.state in (PlaybackState.PLAYING, PlaybackState.HELD) and not self._previewing:
@@ -1604,6 +2038,7 @@ class StateManager:
                 self.temp_skip_loop_id = target_loop.id
                 logger.info(f"UI: SKIP VAMP queued - Skipping loop '{target_loop.name}' (id={target_loop.id})")
                 self._arm_engine(pos)   # disarm it right away
+                self._mirror_emit("queue_exit", fade=False, fade_ms=None)
                 self._emit('loop_skip_queued', target_loop.name)
                 self._refresh_standby()
 
@@ -1625,6 +2060,7 @@ class StateManager:
             return None
         if time_pos is None:
             time_pos = self.audio.get_position()
+        time_pos = _finite(time_pos, "marker time")
         if name is None:
             name = f"{DEFAULT_MARKER_NAME} {len(self.markers) + 1}"
 
@@ -1658,34 +2094,45 @@ class StateManager:
         return True
 
     def jump_to_marker(self, marker_id):
-        """Seek to a marker's position and start playing."""
+        """
+        Seek to a marker's position and start playing (cue-sheet click: an
+        arbitrary jump). Blocked in live mode; next/prev cue stay allowed.
+        """
+        if self._blocked("jump_to_marker"):
+            return False
         for marker in self.markers:
             if marker.id == marker_id:
                 logger.info(f"Jumping to marker '{marker.name}' at {marker.time:.3f}s")
-                self.play_from(marker.time)
+                self._play_from(marker.time)
                 return True
         return False
 
     def jump_to_next_marker(self):
-        """Jump to the next marker after current position."""
+        """
+        Jump to the next marker after current position. Allowed in
+        live mode (key / MIDI next_cue walk the cue list in order).
+        """
         pos = self.audio.get_position()
-        for marker in self.markers:
+        for marker in sorted(self.markers, key=lambda m: m.time):
             if marker.time > pos + 0.1:
-                self.play_from(marker.time)
+                self._play_from(marker.time)
                 return True
         return False
 
     def jump_to_prev_marker(self):
-        """Jump to the previous marker before current position."""
+        """
+        Jump to the previous marker before current position. Allowed in
+        live mode (key / MIDI prev_cue walk the cue list in order).
+        """
         pos = self.audio.get_position()
         prev_marker = None
-        for marker in self.markers:
+        for marker in sorted(self.markers, key=lambda m: m.time):
             if marker.time < pos - 0.5:
                 prev_marker = marker
             else:
                 break
         if prev_marker:
-            self.play_from(prev_marker.time)
+            self._play_from(prev_marker.time)
             return True
         return False
 
@@ -1801,7 +2248,7 @@ class StateManager:
         obj, kind = self._find_item(item_id)
         if obj is None:
             return False
-        obj.osc_cue = str(osc_cue or "")
+        obj.osc_cue = _sanitize_osc(osc_cue)
         self._emit_item_update(kind)
         self.save_loop()
         return True
@@ -1856,6 +2303,7 @@ class StateManager:
         """Add a new skip region."""
         if self._blocked("add_skip"):
             return None
+        start, end = _finite(start, "skip start"), _finite(end, "skip end")
         if end <= start:
             return None
         new_skip = SkipRegion(start, end, method=method)
@@ -1891,9 +2339,13 @@ class StateManager:
         """Request a render; applied values are persisted only on completion."""
         if self._blocked("set_tempo_pitch"):
             return False
+        return self._set_tempo_pitch(tempo_ratio, semitones)
+
+    def _set_tempo_pitch(self, tempo_ratio: float, semitones: float) -> bool:
         tempo_ratio = max(0.5, min(2.0, float(tempo_ratio)))
         semitones = max(-12.0, min(12.0, float(semitones)))
         self.pending_tempo_pitch = (tempo_ratio, semitones)
+        self._mirror_emit("tempo", tempo_ratio=tempo_ratio, semitones=semitones)
         try:
             self.audio.set_tempo_pitch(tempo_ratio, semitones)
         except Exception as e:
@@ -1914,12 +2366,20 @@ class StateManager:
         pos = self.audio.get_position() if position is None else position
         if target <= pos:
             return 0.0
-        if self.is_held() or any(pos < h.time < target for h in self.holds):
+        # Holds / vamps inside an active skip region are jumped over
+        if self.is_held() or any(pos < h.time < target and not self._in_active_skip(h.time)
+                                 for h in self.holds):
             return None
         remaining = target - pos
+        for skip in self.skips:
+            if skip.active and skip.end > skip.start:
+                remaining -= max(0.0, min(skip.end, target) - max(skip.start, pos))
+        remaining = max(0.0, remaining)
         current = self._current_loop() if self.is_in_loop_mode() else None
         for loop in self.loops:
             if not loop.active or loop.id == self.temp_skip_loop_id or not pos < loop.end < target:
+                continue
+            if self._in_active_skip(loop.end):
                 continue
             if loop.repeat_count is None:
                 return None
@@ -2086,7 +2546,7 @@ class StateManager:
     def set_song_osc_cue(self, osc_cue: str) -> bool:
         if self._blocked("set_song_osc_cue"):
             return False
-        self.settings.osc_cue = str(osc_cue or "")
+        self.settings.osc_cue = _sanitize_osc(osc_cue)
         self._emit_settings_update()
         self.save_loop()
         return True
@@ -2100,11 +2560,19 @@ class StateManager:
 
     def set_song_tempo_map(self, bpm: float, beats_per_bar: int = 4,
                            downbeat_offset: float = 0.0) -> bool:
+        """
+        Set the song's tempo map. Raises ValueError for values that are not
+        numbers or not finite (nan / inf); nothing is changed then.
+        """
         if self._blocked("set_song_tempo_map"):
             return False
-        self.settings.bpm = max(0.0, float(bpm))
-        self.settings.beats_per_bar = max(1, int(beats_per_bar))
-        self.settings.downbeat_offset = float(downbeat_offset)
+        # Validate everything before touching the settings (no partial update)
+        bpm = max(0.0, _finite(bpm, "bpm"))
+        beats_per_bar = max(1, int(_finite(beats_per_bar, "beats_per_bar")))
+        downbeat_offset = _finite(downbeat_offset, "downbeat_offset")
+        self.settings.bpm = bpm
+        self.settings.beats_per_bar = beats_per_bar
+        self.settings.downbeat_offset = downbeat_offset
         self._emit_settings_update()
         self.save_loop()
         return True
@@ -2115,12 +2583,16 @@ class StateManager:
         song's tempo map. (0, 0, 0.0) when no BPM is set.
         """
         s = self.settings
-        if s.bpm <= 0:
+        if not (s.bpm > 0 and math.isfinite(s.bpm) and math.isfinite(s.downbeat_offset)):
             return (0, 0, 0.0)
         bpb = max(1, int(s.beats_per_bar))
         total_beats = (float(position) - s.downbeat_offset) * s.bpm / 60.0
-        whole = int(np.floor(total_beats))
-        fraction = total_beats - whole
+        if not math.isfinite(total_beats):
+            return (0, 0, 0.0)
+        # A position exactly on a beat must read as that beat even when the
+        # float product lands a hair below it (4.1 s @120, offset 0.1 -> 7.9999...)
+        whole = int(np.floor(total_beats + 1e-6))
+        fraction = max(0.0, total_beats - whole)
         bar = whole // bpb + 1
         beat = whole % bpb + 1
         return (int(bar), int(beat), float(fraction))
@@ -2212,6 +2684,415 @@ class StateManager:
         threading.Thread(target=_worker, name=f"detect-{kind}", daemon=True).start()
 
     # =========================================================================
+    # SHOW (running order / setlist)
+    # =========================================================================
+    #
+    # self.show is always a Show (backend/show.py); empty by default, and an
+    # empty show means GO at the end of a song falls back to
+    # next_song_provider (library order). Cue data stays per song in
+    # loop_data.json; the show only holds the order and cut/segue flags.
+    #
+    # Live Mode: opening/creating shows and every order edit are blocked
+    # (_blocked); set_next_up, GO advance, segue and saving are allowed.
+
+    def _show_active(self) -> bool:
+        return len(self.show.entries) > 0
+
+    @property
+    def next_up_entry_id(self) -> Optional[str]:
+        """
+        The entry GO advances to at the end of the current song: the
+        operator's set_next_up() choice if still valid, else the next
+        playable entry after the current one (from the start when no show
+        entry is loaded). None at the end of the show.
+        """
+        with self._show_lock:
+            show = self.show
+            chosen = show.get(self.next_up_override)
+            if chosen is not None and chosen.kind == "song" and not show.is_missing(chosen) \
+                    and chosen.id != self.current_entry_id:
+                return chosen.id
+            if show.get(self.current_entry_id) is not None:
+                entry = show.next_playable_after(self.current_entry_id)
+            else:
+                entry = show.next_playable_from(self._show_anchor_index or 0)
+            return entry.id if entry is not None else None
+
+    def show_snapshot(self) -> dict:
+        """
+        Plain-data copy of the show for the UI / mirroring (never live objects):
+        {"name", "file_path", "folder", "is_folder_derived", "dirty",
+         "entries": [{"id", "kind", "path", "title", "cut", "segue",
+                      "index", "missing", "playable"}],
+         "current_entry_id", "next_up_entry_id", "next_up_override"}
+        """
+        with self._show_lock:
+            show = self.show
+            return {
+                "name": show.name, "file_path": show.file_path, "folder": show.folder,
+                "is_folder_derived": show.is_folder_derived, "dirty": show.dirty,
+                "entries": show.snapshot(),
+                "current_entry_id": self.current_entry_id,
+                "next_up_entry_id": self.next_up_entry_id,
+                "next_up_override": self.next_up_override,
+            }
+
+    def _show_dir(self) -> str:
+        """App data dir holding folder-derived show autosaves (next to loop_data.json)."""
+        return self.data_dir
+
+    def _install_show(self, show: Show) -> None:
+        """Make ``show`` current: re-match the loaded song, reset next-up, notify."""
+        self.flush_show_autosave()
+        with self._show_lock:
+            self.show = show
+            self.next_up_override = None
+            self._show_anchor_index = None
+            self._pending_go_entry_id = None
+            entry = show.find_by_path(self.current_song_path) if self.current_song_path else None
+            self.current_entry_id = entry.id if entry else None
+        with self._preload_lock:
+            self._preload_requested = None
+        self._emit('current_entry_changed', self.current_entry_id)
+        self._after_show_change(edited=False)
+
+    def open_show(self, path: str) -> bool:
+        """
+        Open a ``.loopshow`` file. Blocked in Live Mode. On failure emits
+        'data_load_failed' (message) and keeps the current show.
+        Unreadable entries are reported the same way (and kept in the file).
+        """
+        if self._blocked("open_show"):
+            return False
+        try:
+            show = Show.load(path)
+        except (OSError, ShowFileError) as e:
+            msg = f"Could not open show '{os.path.basename(path)}': {e}"
+            logger.error(msg)
+            self.last_load_error = msg
+            self._emit('data_load_failed', msg)
+            return False
+        if show.load_problems:
+            msg = (f"{len(show.load_problems)} entry(ies) of show '{show.name}' could not be read "
+                   "and were skipped (they are kept in the file)")
+            logger.error(msg)
+            self.last_load_error = msg
+            self._emit('data_load_failed', msg)
+        self._install_show(show)
+        preferences.add_recent_show("file", show.file_path)
+        preferences.set_last_show("file", show.file_path)
+        return True
+
+    def open_folder(self, folder: str) -> bool:
+        """
+        Folder-derived show for ``folder`` (its remembered order, with new
+        files appended and deleted ones shown missing). Blocked in Live Mode.
+        """
+        if self._blocked("open_folder"):
+            return False
+        if not folder or not os.path.isdir(folder):
+            logger.error(f"open_folder: not a folder: {folder!r}")
+            return False
+        show = Show.from_folder(folder, data_dir=self._show_dir())
+        self._install_show(show)
+        if show.dirty:
+            self._schedule_show_autosave()
+        preferences.add_recent_show("folder", show.folder)
+        preferences.set_last_show("folder", show.folder)
+        return True
+
+    def new_show(self, name: str = "Untitled show") -> bool:
+        """Start an empty, unsaved show. Blocked in Live Mode."""
+        if self._blocked("new_show"):
+            return False
+        self._install_show(Show(name=name or "Untitled show"))
+        preferences.set_last_show(None, None)
+        return True
+
+    def save_show(self, path: Optional[str] = None) -> bool:
+        """
+        Save the show to ``path`` (Save As) or its own file. A folder-derived
+        or new show without ``path`` returns False (the UI should ask for a
+        file name). Allowed in Live Mode. Failure emits 'show_save_failed'.
+        """
+        with self._show_lock:
+            show = self.show
+            if path is None and show.file_path is None:
+                return False
+            try:
+                saved = show.save(path)
+            except (OSError, ValueError) as e:
+                msg = f"Could not save show: {e}"
+                logger.error(msg)
+                self._emit('show_save_failed', msg)
+                return False
+        self._cancel_show_autosave()
+        preferences.add_recent_show("file", saved)
+        preferences.set_last_show("file", saved)
+        self._emit('show_changed', self.show_snapshot())
+        return True
+
+    # ------------------------------------------------------------ editing --
+
+    def _show_edit(self, what: str, func, changed=bool):
+        """Run a Show edit unless Live Mode blocks it; notify when ``changed(result)``."""
+        if self._blocked(what):
+            return None
+        with self._show_lock:
+            result = func(self.show)
+        if changed(result):
+            self._after_show_change(edited=True)
+        return result
+
+    def add_songs(self, paths, index: Optional[int] = None) -> List[str]:
+        """Insert audio files (non-audio / missing ones ignored). Returns the new entry ids."""
+        return self._show_edit("add_songs", lambda s: s.add_songs(list(paths or []), index)) or []
+
+    def add_divider(self, title: str = "", index: Optional[int] = None) -> Optional[str]:
+        return self._show_edit("add_divider", lambda s: s.add_divider(title, index))
+
+    def move_entry(self, entry_id: str, new_index: int) -> bool:
+        return bool(self._show_edit("move_entry", lambda s: s.move(entry_id, new_index)))
+
+    def remove_entry(self, entry_id: str) -> bool:
+        def _remove(show):
+            index = show.index_of(entry_id)
+            ok = show.remove(entry_id)
+            if ok and entry_id == self.current_entry_id:
+                # Keep GO's place: the next-up is what followed the removed entry
+                self.current_entry_id = None
+                self._show_anchor_index = index
+                self._emit('current_entry_changed', None)
+            return ok
+        return bool(self._show_edit("remove_entry", _remove))
+
+    def duplicate_entry(self, entry_id: str) -> Optional[str]:
+        return self._show_edit("duplicate_entry", lambda s: s.duplicate(entry_id))
+
+    def rename_entry(self, entry_id: str, title: str) -> bool:
+        return bool(self._show_edit("rename_entry", lambda s: s.rename(entry_id, title)))
+
+    def set_entry_cut(self, entry_id: str, cut: bool) -> bool:
+        return bool(self._show_edit("set_entry_cut", lambda s: s.set_cut(entry_id, cut)))
+
+    def set_entry_segue(self, entry_id: str, segue: bool) -> bool:
+        return bool(self._show_edit("set_entry_segue", lambda s: s.set_segue(entry_id, segue)))
+
+    def relink_entry(self, entry_id: str, new_path: str) -> List[str]:
+        """Relink a (missing) entry; other missing files found in that folder too. Returns relinked ids."""
+        return self._show_edit("relink_entry", lambda s: s.relink(entry_id, new_path)) or []
+
+    def _after_show_change(self, edited: bool) -> None:
+        """Validate ids, autosave a folder-derived show, emit 'show_changed', update next-up."""
+        with self._show_lock:
+            show = self.show
+            if self.next_up_override and show.get(self.next_up_override) is None:
+                self.next_up_override = None
+            if self.current_entry_id and show.get(self.current_entry_id) is None:
+                self.current_entry_id = None
+            if self.current_entry_id:
+                self._show_anchor_index = None
+        if edited and show.is_folder_derived and show.dirty:
+            self._schedule_show_autosave()
+        self._emit('show_changed', self.show_snapshot())
+        self._notify_next_up()
+
+    def _notify_next_up(self, force: bool = False) -> None:
+        """Emit 'next_up_changed' if the effective next-up changed; refresh standby; preload."""
+        next_id = self.next_up_entry_id
+        if force or next_id != self._last_next_up:
+            self._last_next_up = next_id
+            self._emit('next_up_changed', next_id)
+        self._refresh_standby()
+        self._schedule_preload()
+
+    # ----------------------------------------------------- show autosave --
+
+    def _schedule_show_autosave(self) -> None:
+        with self._show_lock:
+            if self._show_save_timer is not None:
+                self._show_save_timer.cancel()
+            timer = threading.Timer(SAVE_DEBOUNCE_MS / 1000.0, self.flush_show_autosave)
+            timer.daemon = True
+            self._show_save_timer = timer
+            timer.start()
+
+    def _cancel_show_autosave(self) -> None:
+        with self._show_lock:
+            if self._show_save_timer is not None:
+                self._show_save_timer.cancel()
+                self._show_save_timer = None
+
+    def flush_show_autosave(self) -> bool:
+        """Write a pending folder-derived show autosave now. Never raises."""
+        with self._show_lock:
+            self._cancel_show_autosave()
+            show = self.show
+            if not (show.is_folder_derived and show.dirty):
+                return True
+            try:
+                show.autosave(self._show_dir())
+                return True
+            except OSError as e:
+                msg = f"Could not remember the show order: {e}"
+                logger.error(msg)
+                self._emit('show_save_failed', msg)
+                return False
+
+    # ---------------------------------------------- next-up / loading ----
+
+    def set_next_up(self, entry_id: Optional[str]) -> bool:
+        """
+        Choose the song GO goes to next (going off-script). ALLOWED in Live
+        Mode. ``entry_id`` must be a song entry whose file exists (a cut song
+        may be chosen explicitly); None returns to the computed next.
+        Emits 'next_up_changed' and refreshes standby.
+        """
+        with self._show_lock:
+            if entry_id is not None:
+                entry = self.show.get(entry_id)
+                if entry is None or entry.kind != "song" or self.show.is_missing(entry):
+                    return False
+            self.next_up_override = entry_id
+            entry = self.show.get(entry_id)
+            file = os.path.basename(entry.path) if entry is not None and entry.path else ""
+        self._mirror_emit("next_up", entry_id=entry_id, file=file)
+        self._notify_next_up(force=True)
+        return True
+
+    def load_entry(self, entry_id: str, from_go: bool = False) -> bool:
+        """
+        Load the song of a show entry (via load_song: the Live Mode load lock
+        applies unless ``from_go``) and make it the current entry.
+        """
+        with self._show_lock:
+            entry = self.show.get(entry_id)
+            if entry is None or entry.kind != "song":
+                return False
+            path = entry.path
+        if not from_go and self.live_mode:
+            return self.load_song(path, from_go=False)   # emits the block
+        with self._show_lock:
+            self._pending_go_entry_id = entry_id
+        return self.load_song(path, from_go=from_go)
+
+    def _request_next_song(self, target: Tuple[str, Optional[str], str]) -> None:
+        """GO / segue to ``target``: emit 'go_next_song' (path) and, for a show entry, 'go_next_entry'."""
+        path, entry_id, _ = target
+        if entry_id:
+            with self._show_lock:
+                self._pending_go_entry_id = entry_id
+        self._emit('go_next_song', path)
+        if entry_id:
+            self._emit('go_next_entry', entry_id)
+
+    def _after_song_loaded(self, path: str) -> None:
+        """load_song succeeded: set the current entry, then update next-up and preload."""
+        with self._show_lock:
+            show = self.show
+            entry = show.get(self._pending_go_entry_id)
+            if entry is None or norm_path(entry.path) != norm_path(path):
+                entry = show.get(self.current_entry_id)
+                if entry is None or norm_path(entry.path) != norm_path(path):
+                    # Manual load: reloading the current entry keeps it;
+                    # otherwise the first match after it, else the first.
+                    entry = show.find_by_path(path, after_id=self.current_entry_id)
+            self._pending_go_entry_id = None
+            new_id = entry.id if entry is not None else None
+            changed = new_id != self.current_entry_id
+            self.current_entry_id = new_id
+            if new_id is not None:
+                self._show_anchor_index = None
+            if self.next_up_override and self.next_up_override == new_id:
+                self.next_up_override = None   # the operator's choice was taken
+        with self._preload_lock:
+            self._preload_requested = None   # the engine consumed / dropped its preload
+        self._mirror_emit("load", entry_id=new_id, file=os.path.basename(path))
+        if changed:
+            self._emit('current_entry_changed', new_id)
+        self._notify_next_up()
+
+    def _maybe_segue(self) -> None:
+        """Song ended naturally: if the current entry segues, advance like GO (source "segue")."""
+        with self._show_lock:
+            entry = self.show.get(self.current_entry_id)
+            if entry is None or not entry.segue:
+                return
+        mirror = getattr(self, 'mirror', None)
+        if mirror is not None and mirror.is_following():
+            logger.info("Segue left to the mirror main (backup is following)")
+            return
+        target = self._next_song_target()
+        if target is None or not target[1]:
+            return
+        with self._go_lock:
+            self._last_go_time = -1e9   # a segue is never debounced
+        logger.info(f"Segue: {entry.title} -> {target[2]}")
+        self.go(source="segue")
+
+    # ------------------------------------------------------------ preload --
+
+    def _schedule_preload(self) -> None:
+        """Ask the engine (on a worker thread) to preload the next-up entry's song."""
+        audio = self.audio
+        if getattr(audio, 'preload_file', None) is None:
+            return
+        with self._show_lock:
+            entry = self.show.get(self.next_up_entry_id) if self._show_active() else None
+            path = entry.path if entry is not None else None
+        with self._preload_lock:
+            if path == self._preload_requested:
+                return
+            self._preload_requested = path
+            self._preload_generation += 1
+            generation = self._preload_generation
+        if path is None:
+            cancel = getattr(audio, 'cancel_preload', None)
+            if cancel is not None:
+                threading.Thread(target=self._safe_call, args=(cancel,),
+                                 name="preload-cancel", daemon=True).start()
+            return
+        thread = threading.Thread(target=self._preload_worker, args=(generation, path),
+                                  name="preload-request", daemon=True)
+        self._preload_thread = thread
+        thread.start()
+
+    @staticmethod
+    def _safe_call(func, *args) -> None:
+        try:
+            func(*args)
+        except Exception as e:
+            logger.warning(f"{getattr(func, '__name__', func)} failed: {e}")
+
+    def _preload_worker(self, generation: int, path: str) -> None:
+        """Gather stems + the song's saved tempo/key (file I/O), then call preload_file."""
+        try:
+            stem_paths = self.discover_stems(path)
+        except Exception as e:
+            logger.warning(f"Stem discovery for preload failed: {e}")
+            stem_paths = {}
+        tempo_pitch = self._saved_tempo_pitch_for(self._get_file_fingerprint(path))
+        with self._preload_lock:
+            if generation != self._preload_generation:
+                return   # superseded
+        try:
+            self.audio.preload_file(path, stem_paths or None, tempo_pitch)
+        except Exception as e:
+            logger.warning(f"preload_file failed for {os.path.basename(path)}: {e}")
+            self._emit('preload_failed', path, str(e))
+
+    def get_preloaded_audio(self, path: str):
+        """The engine's preloaded mix (int16 memmap (frames, 2)) for ``path``, or None."""
+        getter = getattr(self.audio, 'get_preloaded_audio', None)
+        if getter is None:
+            return None
+        try:
+            return getter(path)
+        except Exception as e:
+            logger.warning(f"get_preloaded_audio failed: {e}")
+            return None
+
+    # =========================================================================
     # ENGINE EVENTS
     # =========================================================================
 
@@ -2273,7 +3154,9 @@ class StateManager:
         if loop is not None and reason in ("cut", "count", "fade"):
             # Do not re-enter the vamp we just left until well past its end
             self.temp_skip_loop_id = loop.id
-        if reason == "count":
+        if reason in ("count", "cut", "fade"):
+            # A second exit press arriving just after (double tap, key +
+            # pedal) must not skip the NEXT vamp; see queue_exit.
             self._count_exit_time = self._clock()
         self._invalidate_arm()
 
@@ -2282,6 +3165,7 @@ class StateManager:
             self._monitor_stop_event.set()
             self.temp_skip_loop_id = None
             self.state = PlaybackState.STOPPED
+            self._ended_at_rest = not self._previewing   # GO must not restart from 0:00
             if self._previewing:
                 self._end_preview(restore=True)
             self.flush_save()
@@ -2297,9 +3181,18 @@ class StateManager:
     def _ev_hold_reached(self, payload: dict) -> None:
         if self.state == PlaybackState.STOPPED:
             return  # stale event delivered after stop()
+        if self.state == PlaybackState.PAUSED:
+            # Paused just before this (queued) event was handled: stay
+            # PAUSED; play() notices the parked engine and enters HELD then.
+            logger.info("HOLD reached while paused; will park on it when resumed")
+            return
+        self._enter_held(payload.get('position'))
+
+    def _enter_held(self, position=None) -> None:
+        """Switch to HELD on the armed hold (or the one at ``position``) and announce it."""
         hold = self._find_hold(self._armed_hold_id)
         if hold is None:
-            pos = float(payload.get('position', self.audio.get_position()))
+            pos = float(self.audio.get_position() if position is None else position)
             hold = next((h for h in self.holds if abs(h.time - pos) <= 0.05), None)
         name = hold.name if hold else "hold"
         logger.info(f"HOLD reached: {name}")
@@ -2331,8 +3224,23 @@ class StateManager:
         if self.state == PlaybackState.STOPPED:
             return  # stale event delivered after stop()
         logger.info("Song ended")
-        self.stop()
+        with self._mirror_quiet():   # each machine's own engine ends its song
+            self.stop()
+        self._ended_at_rest = True   # GO must not restart from 0:00
+        self._refresh_standby()
         self._emit('song_ended')
+        self._maybe_segue()
+
+    def _ev_preload_ready(self, payload: dict) -> None:
+        path = str(payload.get('path') or "")
+        logger.info(f"Preload ready: {os.path.basename(path)}")
+        self._emit('preload_ready', path)
+
+    def _ev_preload_failed(self, payload: dict) -> None:
+        path = str(payload.get('path') or "")
+        message = str(payload.get('error') or payload.get('message') or "")
+        logger.warning(f"Preload failed for {os.path.basename(path)}: {message}")
+        self._emit('preload_failed', path, message)
 
     def _ev_render_started(self, payload: dict) -> None:
         self._emit('render_state', "rendering",
@@ -2340,6 +3248,7 @@ class StateManager:
 
     def _ev_render_done(self, payload: dict) -> None:
         self.pending_tempo_pitch = None
+        self._saved_tempo_pitch = None
         self.settings.tempo_ratio, self.settings.semitones = self.audio.get_tempo_pitch()
         self._emit_settings_update()
         self.save_loop()
@@ -2347,6 +3256,7 @@ class StateManager:
 
     def _ev_render_failed(self, payload: dict) -> None:
         self.pending_tempo_pitch = None
+        self._saved_tempo_pitch = None
         self.settings.tempo_ratio, self.settings.semitones = self.audio.get_tempo_pitch()
         self._emit_settings_update()
         self.save_loop()
@@ -2359,11 +3269,16 @@ class StateManager:
         logger.info(f"Engine stopped ({payload.get('reason', '?')})")
         self._monitor_stop_event.set()
         self._reset_transient_flags()
+        self._ended_at_rest = not self._previewing   # faded out: GO must not restart
         if self._previewing:
             self._end_preview(restore=True)
         self._invalidate_arm()
         self.flush_save()
         self._set_state(PlaybackState.STOPPED)
+        if payload.get('reason') == "error":
+            # The engine's safety guard stopped playback: tell the operator
+            self._emit('device_error', str(payload.get('message')
+                                           or "Playback stopped: audio engine error (see log)"))
 
     def _ev_device_error(self, payload: dict) -> None:
         msg = str(payload.get('message', ''))
@@ -2706,6 +3621,10 @@ class StateManager:
 
     def cleanup(self):
         """Flush pending saves, stop the monitor, close MIDI and release the audio engine."""
+        try:
+            self.mirror.cleanup()
+        except Exception:
+            logger.exception("Mirror cleanup failed")
         self._monitor_stop_event.set()
         self.cancel_detection()
         thread = self._monitor_thread
@@ -2720,14 +3639,49 @@ class StateManager:
             close()
         self.osc.close()
         self.flush_save()
+        self.flush_show_autosave()
+        with self._preload_lock:
+            self._preload_generation += 1   # drop any queued preload
+
+    def _read_data_file(self):
+        """
+        Read and parse the data file -> (status, value, raw):
+          "ok", dict, bytes | "missing", {}, None |
+          "unreadable", OSError, None (locked / no permission, after retries) |
+          "corrupt", error, bytes (not UTF-8 JSON, or not an object)
+        """
+        try:
+            raw = read_bytes_with_retry(self.data_file, attempts=LOAD_READ_ATTEMPTS)
+        except FileNotFoundError:
+            return "missing", {}, None
+        except OSError as e:
+            return "unreadable", e, None
+        try:
+            data = json.loads(raw.decode('utf-8-sig'))
+        except ValueError as e:   # JSONDecodeError and UnicodeDecodeError
+            return "corrupt", e, raw
+        if not isinstance(data, dict):
+            return "corrupt", ValueError("top-level JSON value is not an object"), raw
+        return "ok", data, raw
+
+    def _report_load_problem(self, msg: str) -> None:
+        logger.error(msg)
+        self.last_load_error = msg
+        self._emit('data_load_failed', msg)
 
     def _load_loop_data(self) -> dict:
         """
         Load saved loop data from disk.
 
-        A corrupt file is renamed to loop_data.json.corrupt-<timestamp>, the
-        error is logged, stored in ``last_load_error`` and emitted as
-        'data_load_failed'; an empty dict is returned.
+        A corrupt file (not JSON / not an object) is renamed to
+        loop_data.json.corrupt-<timestamp>; if it cannot be moved, a copy is
+        written under that name instead, and if even that fails the file is
+        left alone and saving is disabled. A file that exists but cannot be
+        read (locked by antivirus / cloud sync, permissions) is retried
+        briefly; then saving is disabled until a later read succeeds, so the
+        other songs' data is never overwritten. Problems are logged, stored
+        in ``last_load_error`` and emitted as 'data_load_failed'; an empty
+        dict is returned.
         """
         data_dir = self.data_dir
         try:
@@ -2735,28 +3689,141 @@ class StateManager:
         except OSError as e:
             logger.error(f"Could not create data directory {data_dir}: {e}")
 
-        if not os.path.exists(self.data_file):
+        status, value, raw = self._read_data_file()
+        if status in ("ok", "missing"):
+            return value
+        if status == "unreadable":
+            self._data_read_blocked = str(value)
+            self._report_load_problem(
+                f"Saved loop data could not be read ({value}). Nothing will be saved until it "
+                "can be read, so the existing file is not overwritten. Close programs that may "
+                "be using it (antivirus, cloud sync) and load the song again.")
             return {}
+        self._quarantine_corrupt(value, raw)
+        return {}
 
+    def _quarantine_corrupt(self, error, raw: bytes) -> None:
+        """Move a corrupt data file aside (or back it up); block saving if neither works."""
+        corrupt_path = unique_backup_path(self.data_file, "corrupt")
         try:
-            with open(self.data_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("top-level JSON value is not an object")
-            return data
-        except Exception as e:
-            stamp = time.strftime('%Y%m%d-%H%M%S')
-            corrupt_path = f"{self.data_file}.corrupt-{stamp}"
+            replace_with_retry(self.data_file, corrupt_path)
+            where = f"moved to {os.path.basename(corrupt_path)}"
+        except OSError as move_err:
+            backup = backup_copy(raw, self.data_file, "corrupt")
+            if backup is not None:
+                where = (f"could not be moved aside ({move_err}); a copy was saved as "
+                         f"{os.path.basename(backup)}")
+            else:
+                self._data_read_blocked = f"corrupt file could not be backed up ({move_err})"
+                where = ("could not be moved aside or backed up, so it will not be "
+                         "overwritten and nothing will be saved")
+        self._report_load_problem(
+            f"Saved loop data is unreadable ({error}); file {where}. Starting with no saved vamps.")
+
+    def _retry_blocked_read(self) -> bool:
+        """
+        While saving is disabled after a failed read, try reading the file
+        again. On success the disk data becomes the base: songs saved this
+        session that are not on disk are added; for songs that ARE on disk
+        the disk entry wins and the session's version is kept under
+        SESSION_COPY_KEY (the song was shown empty, so its edits must not
+        replace the real cues). Returns True when saving is possible again.
+        """
+        if not self._data_read_blocked:
+            return True
+        status, value, raw = self._read_data_file()
+        if status == "unreadable":
+            return False
+        if status == "corrupt":
+            self._data_read_blocked = None
+            self._quarantine_corrupt(value, raw)
+            if self._data_read_blocked:
+                return False
+            value = {}
+        conflicted = []
+        with self._save_lock:
+            merged = dict(value)
+            for song_id in self._session_song_ids:
+                entry = self.loop_data.get(song_id)
+                if entry is None:
+                    continue
+                if song_id in merged and isinstance(merged[song_id], dict):
+                    disk_entry = dict(merged[song_id])
+                    disk_entry[SESSION_COPY_KEY] = entry
+                    merged[song_id] = disk_entry
+                    self._conflicted_song_ids.add(song_id)
+                    conflicted.append(song_id)
+                else:
+                    merged[song_id] = entry
+            self.loop_data = merged
+            self._data_read_blocked = None
+            if self._session_song_ids:
+                self._save_dirty = True
+        logger.info("Saved loop data is readable again; saving resumed")
+        if self.current_song_id in conflicted:
+            self._report_load_problem(
+                f"Saved cues for '{self.current_song_name}' can be read again. Load the song "
+                "again to see them; changes made since are kept as a separate copy.")
+        return True
+
+    def _adopt_moved_entry(self, path: str, new_id: str) -> bool:
+        """
+        No entry for this fingerprint: the file may have been re-exported or
+        moved. Adopt (and migrate to ``new_id``) the single entry whose
+        last_known_path is this path, or else whose last_known_name is this
+        file name and whose saved duration matches -- but only if that
+        entry's old file no longer exists unchanged. Ambiguous -> no match.
+        """
+        def _norm(p):
+            # macOS hands out NFD file names, Windows NFC; case-insensitive on Windows
+            p = unicodedata.normalize('NFC', str(p))
+            return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+        def _duration_close(entry, tolerance):
+            """True/False when the entry has a saved duration, None when it has none."""
+            saved = entry.get('duration')
+            if saved is None:
+                return None
             try:
-                os.replace(self.data_file, corrupt_path)
-                where = f"moved to {os.path.basename(corrupt_path)}"
-            except OSError as move_err:
-                where = f"could not be moved aside ({move_err})"
-            msg = f"Saved loop data is unreadable ({e}); file {where}. Starting with no saved vamps."
-            logger.error(msg)
-            self.last_load_error = msg
-            self._emit('data_load_failed', msg)
-            return {}
+                return abs(float(saved) - self.song_length) <= tolerance
+            except (TypeError, ValueError):
+                return False
+
+        def _orphaned(old_id, entry):
+            old_path = entry.get('last_known_path')
+            if not old_path or not os.path.exists(old_path):
+                return True
+            return self._get_file_fingerprint(old_path) != old_id
+
+        with self._save_lock:
+            entries = [(k, v) for k, v in self.loop_data.items()
+                       if k != new_id and isinstance(v, dict)]
+            target = _norm(path)
+            name = os.path.basename(path)
+            by_path = [(k, v) for k, v in entries
+                       if v.get('last_known_path') and _norm(v['last_known_path']) == target
+                       and _duration_close(v, max(1.0, 0.05 * self.song_length)) is not False]
+            how = "path"
+            candidates = by_path
+            if not by_path:
+                how = "name and duration"
+                candidates = [(k, v) for k, v in entries
+                              if v.get('last_known_name') == name and _duration_close(v, 0.5)]
+            if len(candidates) != 1:
+                if len(candidates) > 1:
+                    logger.warning(f"{len(candidates)} saved entries match '{name}' by {how}; "
+                                   "not adopting any (ambiguous)")
+                return False
+            old_id, entry = candidates[0]
+            if not _orphaned(old_id, entry):
+                return False
+            self.loop_data[new_id] = self.loop_data.pop(old_id)
+            self._session_song_ids.add(new_id)
+            self._save_dirty = True
+        logger.warning(f"Audio file '{name}' changed (fingerprint {old_id} -> {new_id}); "
+                       f"migrated its saved cues (matched by {how})")
+        self._schedule_save()
+        return True
 
     def save_loop(self, immediate: bool = False) -> None:
         """
@@ -2770,15 +3837,43 @@ class StateManager:
             return
 
         with self._save_lock:
-            self.loop_data[self.current_song_id] = {
-                'last_known_name': self.current_song_name,
-                'last_known_path': self.current_song_path,
-                'loops': [loop.to_dict() for loop in self.loops],
-                'markers': [marker.to_dict() for marker in self.markers],
-                'holds': [hold.to_dict() for hold in self.holds],
-                'skips': [skip.to_dict() for skip in self.skips],
-                'settings': self.settings.to_dict(),
-            }
+            song_id = self.current_song_id
+            try:
+                settings = self.settings.to_dict()
+                if self.pending_tempo_pitch is not None and self._saved_tempo_pitch is not None:
+                    # Load-time render still running: the engine reports 1.0/0
+                    # meanwhile; keep the song's saved tempo/key on disk.
+                    settings['tempo_ratio'], settings['semitones'] = self._saved_tempo_pitch
+                entry = {
+                    'last_known_name': self.current_song_name,
+                    'last_known_path': self.current_song_path,
+                    'duration': self.song_length,
+                    'loops': [loop.to_dict() for loop in self.loops],
+                    'markers': [marker.to_dict() for marker in self.markers],
+                    'holds': [hold.to_dict() for hold in self.holds],
+                    'skips': [skip.to_dict() for skip in self.skips],
+                    'settings': settings,
+                }
+            except Exception as e:   # e.g. a dict edited on another thread mid-copy
+                logger.exception("Could not snapshot song data for saving")
+                self.last_save_error = str(e)
+                self._emit('save_failed', str(e))
+                self._schedule_save()   # retry shortly with a fresh snapshot
+                return
+            previous = self.loop_data.get(song_id)
+            if isinstance(previous, dict):
+                for key in PRESERVED_ENTRY_KEYS:
+                    if key in previous:
+                        entry[key] = previous[key]
+            if song_id in self._conflicted_song_ids and isinstance(previous, dict):
+                # Disk entry reappeared after this song was shown empty:
+                # keep it, store this session's version beside it.
+                kept = dict(previous)
+                entry.pop(SESSION_COPY_KEY, None)
+                kept[SESSION_COPY_KEY] = entry
+                entry = kept
+            self.loop_data[song_id] = entry
+            self._session_song_ids.add(song_id)
             self._save_dirty = True
 
         if immediate:
@@ -2796,14 +3891,21 @@ class StateManager:
             timer.start()
 
     def flush_save(self) -> bool:
-        """Write pending loop data to disk now (no-op if nothing changed)."""
+        """Write pending loop data to disk now (no-op if nothing changed). Never raises."""
         with self._save_lock:
             if self._save_timer is not None:
                 self._save_timer.cancel()
                 self._save_timer = None
             if not self._save_dirty:
                 return self.last_save_error is None
-            if self._save_loop_data():
+            try:
+                ok = self._save_loop_data()
+            except Exception as e:   # never let a save failure escape into stop()/load_song()
+                logger.exception("Unexpected error while saving loop data")
+                self.last_save_error = str(e)
+                self._emit('save_failed', str(e))
+                ok = False
+            if ok:
                 self._save_dirty = False
                 self.last_save_error = None
                 self._emit('save_succeeded')
@@ -2811,37 +3913,32 @@ class StateManager:
             return False
 
     def _save_loop_data(self) -> bool:
-        """Atomically write loop data: temp file in the same directory, then os.replace()."""
+        """Atomically write loop data: unique temp file in the same directory, then os.replace()."""
         with self._save_lock:
+            if self._data_read_blocked and not self._retry_blocked_read():
+                msg = (f"Not saved: the existing loop data file could not be read "
+                       f"({self._data_read_blocked}), so it is not overwritten")
+                logger.error(msg)
+                self.last_save_error = msg
+                self._emit('save_failed', msg)
+                return False
             try:
                 payload = json.dumps(self.loop_data, indent=2)
-            except (TypeError, ValueError) as e:
+            except Exception as e:   # TypeError/ValueError, or RuntimeError from a concurrent edit
                 logger.error(f"Could not serialise loop data: {e}")
                 self.last_save_error = str(e)
                 self._emit('save_failed', str(e))
                 return False
 
-        data_dir = os.path.dirname(self.data_file) or "."
-        tmp_path = f"{self.data_file}.tmp-{os.getpid()}-{threading.get_ident()}"
-        try:
-            os.makedirs(data_dir, exist_ok=True)
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self.data_file)
-            logger.info(f"Saved loop data ({len(self.loop_data)} songs) to {self.data_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Could not save loop data: {e}")
             try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except OSError:
-                pass
-            self.last_save_error = str(e)
-            self._emit('save_failed', str(e))
-            return False
+                write_text_atomic(self.data_file, payload)
+                logger.info(f"Saved loop data ({len(self.loop_data)} songs) to {self.data_file}")
+                return True
+            except Exception as e:
+                logger.error(f"Could not save loop data: {e}")
+                self.last_save_error = str(e)
+                self._emit('save_failed', str(e))
+                return False
 
     # =========================================================================
     # UTILITY
@@ -2874,8 +3971,9 @@ class StateManager:
             end = min(start + 5.0, self.song_length) if self.song_length > 0 else start + 5.0
         start = self._clamp_time(start)
         end = self._clamp_time(end)
-        if end <= start:
-            logger.warning(f"add_loop rejected zero-length region {start:.3f}-{end:.3f}")
+        if not _long_enough(start, end):
+            logger.warning(f"add_loop rejected region {start:.3f}-{end:.3f} "
+                           f"(minimum {MIN_LOOP_DURATION}s)")
             return None
         if name is None:
             name = f"{DEFAULT_VAMP_NAME} {len(self.loops) + 1}"

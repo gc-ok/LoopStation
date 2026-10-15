@@ -15,13 +15,16 @@ The panel is a pure view: the app calls its setters on the Tk thread.
 """
 
 import logging
+import math
 from typing import Callable, Optional
 
 import tkinter as tk
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
-    COLOR_BG_MEDIUM, COLOR_BG_DARK, COLOR_TEXT, COLOR_TEXT_DIM,
+    COLOR_BG_LIGHT, COLOR_BORDER, mix, COLOR_HOVER, COLOR_TEXT_DISABLED,
+    COLOR_BG_MEDIUM, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BTN_SUCCESS, COLOR_BTN_PRIMARY, COLOR_BTN_DISABLED,
 )
 from utils.formatting import format_time
@@ -34,6 +37,7 @@ ACTION_COLORS = {
     "play": (COLOR_BTN_SUCCESS, "#4cd38a"),
     "release_hold": ("#f0a020", "#ffc04d"),
     "exit_vamp": ("#2f80d0", "#6db3ff"),
+    "next_song": (COLOR_BTN_SUCCESS, "#4cd38a"),
     "none": (COLOR_BTN_DISABLED, COLOR_TEXT_DIM),
 }
 HELD_BG = "#6b4200"
@@ -42,6 +46,10 @@ DEVICE_LOST_BANNER = "#d63031"
 DEVICE_LOST_TEXT = "⚠  AUDIO DEVICE LOST — reconnecting…"
 LIVE_BORDER = "#d63031"
 FLASH_MS = 1200
+# HELD: the GO border breathes so the waiting cue is hard to miss
+PULSE_MS = 60
+PULSE_STEPS = 20          # one breath = PULSE_MS * PULSE_STEPS (1.2 s)
+HELD_GO = "#f0a020"
 
 TYPE_LABELS = {"marker": "Cue", "vamp": "Vamp", "hold": "Hold", "loop": "Vamp"}
 
@@ -71,6 +79,8 @@ class GoPanel(ctk.CTkFrame):
         self._next_text = ""
         self._pass_text = ""
         self._flash_after = None
+        self._pulse_after = None
+        self._pulse_phase = 0
         self._live = False
         self._device_lost = False
         self._previewing = False
@@ -79,13 +89,13 @@ class GoPanel(ctk.CTkFrame):
         # --- Device-lost banner (packed above everything only when shown)
         self.lbl_device = ctk.CTkLabel(
             self, text=DEVICE_LOST_TEXT, fg_color=DEVICE_LOST_BANNER, corner_radius=6,
-            text_color="#ffffff", font=("Segoe UI", 18, "bold"), height=40,
+            text_color="#ffffff", font=(FONT_UI, 18, "bold"), height=40,
         )
 
         # --- GO button (left)
         self.btn_go = ctk.CTkButton(
             self, text="GO", width=150, height=64,
-            font=("Segoe UI", 28, "bold"), corner_radius=10,
+            font=(FONT_UI, 28, "bold"), corner_radius=10,
             fg_color=ACTION_COLORS["none"][0], hover_color="#2a9a5e",
             text_color="#ffffff", command=self._on_go_click,
         )
@@ -97,25 +107,25 @@ class GoPanel(ctk.CTkFrame):
         tools.pack(side="right", padx=(6, 12), pady=6)
 
         self.btn_loop_sel = ctk.CTkButton(
-            tools, text="🔁 Loop selection", width=140, height=28,
-            font=("Segoe UI", 11), fg_color="transparent", border_width=1,
-            border_color=COLOR_TEXT_DIM, text_color=COLOR_TEXT,
-            hover_color=COLOR_BG_DARK, command=self._on_loop_sel_click,
+            tools, text="↻ Loop selection", width=140, height=28,
+            font=(FONT_UI, 11), fg_color=COLOR_BG_LIGHT, border_width=1,
+            border_color=COLOR_BORDER, text_color=COLOR_TEXT,
+            hover_color=COLOR_HOVER, command=self._on_loop_sel_click,
         )
         self.btn_loop_sel.pack(side="top", anchor="e", pady=(0, 4))
         ToolTip(self.btn_loop_sel,
                 "Rehearsal: loop the waveform selection (press again to stop)")
 
         self.goto_frame = ctk.CTkFrame(tools, fg_color="transparent")
-        ctk.CTkLabel(self.goto_frame, text="Go to bar", font=("Segoe UI", 11),
+        ctk.CTkLabel(self.goto_frame, text="Go to bar", font=(FONT_UI, 11),
                      text_color=COLOR_TEXT_DIM).pack(side="left", padx=(0, 4))
         self.entry_bar = ctk.CTkEntry(self.goto_frame, width=52, height=26,
-                                      font=("Consolas", 12), justify="center")
+                                      font=(FONT_MONO, 12), justify="center")
         self.entry_bar.pack(side="left")
         self.entry_bar.bind("<Return>", lambda _e: self._on_goto_click())
         self.entry_bar.bind("<KP_Enter>", lambda _e: self._on_goto_click())
         self.btn_goto = ctk.CTkButton(
-            self.goto_frame, text="Go", width=36, height=26, font=("Segoe UI", 11),
+            self.goto_frame, text="Go", width=36, height=26, font=(FONT_UI, 11),
             fg_color=COLOR_BTN_PRIMARY, command=self._on_goto_click,
         )
         self.btn_goto.pack(side="left", padx=(4, 0))
@@ -128,21 +138,21 @@ class GoPanel(ctk.CTkFrame):
 
         top = ctk.CTkFrame(mid, fg_color="transparent")
         top.pack(fill="x")
-        self.lbl_caption = ctk.CTkLabel(top, text="STANDBY", font=("Segoe UI", 10, "bold"),
+        self.lbl_caption = ctk.CTkLabel(top, text="STANDBY", font=(FONT_UI, 10, "bold"),
                                         text_color=COLOR_TEXT_DIM)
         self.lbl_caption.pack(side="left", padx=(0, 8))
-        self.lbl_pass = ctk.CTkLabel(top, text="", font=("Segoe UI", 12, "bold"),
+        self.lbl_pass = ctk.CTkLabel(top, text="", font=(FONT_UI, 12, "bold"),
                                      text_color="#66bb6a")
         self.lbl_pass.pack(side="left")
-        self.lbl_flash = ctk.CTkLabel(top, text="", font=("Segoe UI", 11, "bold"),
+        self.lbl_flash = ctk.CTkLabel(top, text="", font=(FONT_UI, 11, "bold"),
                                       text_color="#ff7b72")
         self.lbl_flash.pack(side="right", padx=(0, 6))
 
         self.lbl_standby = ctk.CTkLabel(mid, text="No song loaded", anchor="w",
-                                        font=("Segoe UI", 18, "bold"),
+                                        font=(FONT_UI, 18, "bold"),
                                         text_color=COLOR_TEXT_DIM)
         self.lbl_standby.pack(fill="x")
-        self.lbl_next = ctk.CTkLabel(mid, text="", anchor="w", font=("Segoe UI", 11),
+        self.lbl_next = ctk.CTkLabel(mid, text="", anchor="w", font=(FONT_UI, 11),
                                      text_color=COLOR_TEXT_DIM)
         self.lbl_next.pack(fill="x")
 
@@ -157,14 +167,19 @@ class GoPanel(ctk.CTkFrame):
             self.on_loop_selection()
 
     def _on_goto_click(self):
+        if self._live:
+            # Seeking is locked in Live Mode (Return in the entry included)
+            self.flash("locked (Live Mode)", "#ff7b72")
+            return "break"
         text = self.entry_bar.get().strip()
         try:
-            bar = int(float(text))
-        except ValueError:
+            bar = int(float(text))      # "inf" -> OverflowError, "nan" -> ValueError
+        except (ValueError, OverflowError):
             self.flash("Enter a bar number", "#ff7b72")
-            return
+            return "break"
         if self.on_goto_bar:
             self.on_goto_bar(bar)
+        return "break"
 
     # ---------------------------------------------------------------- setters
 
@@ -220,14 +235,30 @@ class GoPanel(ctk.CTkFrame):
         self._live = bool(live)
         self.configure(border_width=2 if self._live else 0)
         self._update_loop_sel_state()
+        # Go to bar seeks: locked while live
+        state = "disabled" if self._live else "normal"
+        for w in (self.entry_bar, self.btn_goto):
+            try:
+                w.configure(state=state)
+            except (tk.TclError, ValueError):
+                pass
+        if self._live:
+            # A focused (now disabled) entry would swallow Return: hand the
+            # keyboard back to the window so GO keeps working.
+            try:
+                focused = self.focus_get()
+                if focused is not None and str(focused).startswith(str(self.entry_bar)):
+                    self.winfo_toplevel().focus_set()
+            except (KeyError, tk.TclError):
+                pass
 
     def _update_loop_sel_state(self):
         locked = self._live and not self._previewing
         self.btn_loop_sel.configure(
             state="disabled" if locked else "normal",
-            text_color_disabled="#5a5a5a", border_color="#3a3a3a" if locked else COLOR_TEXT_DIM,
-            text="🔒 Loop selection" if locked else (
-                "⏹ Stop loop" if self._previewing else "🔁 Loop selection"))
+            text_color_disabled=COLOR_TEXT_DISABLED, border_color=COLOR_BORDER,
+            text="Loop selection (locked)" if locked else (
+                "⏹ Stop loop" if self._previewing else "↻ Loop selection"))
 
     def set_device_lost(self, lost: bool):
         """Show / clear the loud AUDIO DEVICE LOST banner."""
@@ -256,10 +287,10 @@ class GoPanel(ctk.CTkFrame):
 
     def set_previewing(self, previewing: bool):
         self._previewing = bool(previewing)
+        # Text comes from _update_loop_sel_state (keeps "🔒" while live)
         self._update_loop_sel_state()
         self.btn_loop_sel.configure(
-            text="⏹ Stop loop" if previewing else "🔁 Loop selection",
-            fg_color=COLOR_BTN_PRIMARY if previewing else "transparent",
+            fg_color=COLOR_BTN_PRIMARY if previewing else COLOR_BG_LIGHT,
         )
 
     def flash(self, text: str, color: str = "#ff7b72", ms: int = FLASH_MS):
@@ -291,9 +322,11 @@ class GoPanel(ctk.CTkFrame):
             self.lbl_standby.configure(text=f"HOLDING at {self._held_name}  —  press GO",
                                        text_color="#ffffff")
             self.lbl_next.configure(text=self._next_text, text_color="#f3d9a8")
-            self.btn_go.configure(fg_color="#f0a020", hover_color="#ffb840",
+            self.btn_go.configure(fg_color=HELD_GO, hover_color="#ffb840",
                                   text_color="#000000", text="GO ▶")
+            self._set_pulse(True)
             return
+        self._set_pulse(False)
         btn_color, text_color = ACTION_COLORS.get(self._action, ACTION_COLORS["none"])
         self.configure(fg_color=DEVICE_LOST_BG if self._device_lost else COLOR_BG_MEDIUM)
         self.lbl_caption.configure(text="STANDBY", text_color=COLOR_TEXT_DIM)
@@ -302,6 +335,42 @@ class GoPanel(ctk.CTkFrame):
         self.lbl_standby.configure(text=self._standby_label or "—", text_color=text_color)
         self.lbl_next.configure(text=self._next_text, text_color=COLOR_TEXT_DIM)
         dark_text = self._action == "release_hold"
+        idle = self._action not in ACTION_COLORS or self._action == "none"
         self.btn_go.configure(fg_color=btn_color, hover_color=btn_color,
-                              text_color="#000000" if dark_text else "#ffffff",
+                              text_color=(COLOR_TEXT_DISABLED if idle else
+                                          "#000000" if dark_text else "#ffffff"),
                               text="GO")
+
+    # ------------------------------------------------------------------ pulse
+
+    def _set_pulse(self, on: bool):
+        """Start / stop the HELD breathing border on the GO button."""
+        if on:
+            if self._pulse_after is None:
+                self._pulse_phase = 0
+                self._pulse_tick()
+            return
+        if self._pulse_after is not None:
+            try:
+                self.after_cancel(self._pulse_after)
+            except Exception:
+                pass
+            self._pulse_after = None
+            try:
+                self.btn_go.configure(border_width=0)
+            except tk.TclError:
+                pass
+
+    def _pulse_tick(self):
+        t = (1 - math.cos(2 * math.pi * self._pulse_phase / PULSE_STEPS)) / 2
+        self._pulse_phase = (self._pulse_phase + 1) % PULSE_STEPS
+        try:
+            self.btn_go.configure(border_width=3,
+                                  border_color=mix(HELD_GO, "#ffffff", 0.75 * t))
+            self._pulse_after = self.after(PULSE_MS, self._pulse_tick)
+        except tk.TclError:          # destroyed mid-animation
+            self._pulse_after = None
+
+    def destroy(self):
+        self._set_pulse(False)
+        super().destroy()

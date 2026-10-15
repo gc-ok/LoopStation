@@ -12,12 +12,21 @@ Usage:
 import os
 import sys
 
+# Windowed frozen builds (PyInstaller --windowed, pythonw.exe) have no
+# console: sys.stdout / sys.stderr are None and any library that writes to
+# them would crash. Point them at the null device instead.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
 # Must be done BEFORE importing pygame (which happens in backend imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
 
 import argparse
 import ctypes
 import logging
+import threading
 from logging.handlers import RotatingFileHandler
 import shutil
 
@@ -28,6 +37,7 @@ except Exception:  # pragma: no cover
 import tkinter as tk
 from tkinter import ttk
 
+from utils.fonts import FONT_UI
 from utils.paths import get_base_path, get_asset_path, get_log_dir
 from frontend import __version__
 
@@ -124,98 +134,93 @@ def show_fatal_error(title, message):
 # BOOTSTRAP SPLASH SCREEN
 # =============================================================================
 class BootstrapSplash(tk.Toplevel):
-    """Splash screen with determinate progress bar and step descriptions."""
+    """Compact startup card: app name, thin progress bar, current step."""
 
     STEPS = [
         ("Initializing Audio Engine...", 50),
         ("Loading User Interface...", 90),
         ("Ready!", 100),
     ]
+    CARD_WIDTH = 480
+    CARD_HEIGHT = 280
 
-    def __init__(self, parent, width, height):
+    def __init__(self, parent, width=None, height=None):
+        # width / height are the main window's size; the card is fixed-size
         super().__init__(parent)
         self.parent = parent
         self._current_progress = 0
         self._target_progress = 0
         self._step_index = 0
 
-        # 1. BORDERLESS
+        import config
+        bg = config.COLOR_BG_MEDIUM
+        accent = config.COLOR_BTN_PRIMARY
+        text = config.COLOR_TEXT
+        dim = config.COLOR_TEXT_DIM
+        faint = config.mix(bg, dim, 0.6)
+        track = config.COLOR_BG_LIGHT
+
         self.overrideredirect(True)
+        self.configure(bg=bg, highlightthickness=1,
+                       highlightbackground=config.COLOR_BORDER,
+                       highlightcolor=config.COLOR_BORDER)
+        center_window(self, self.CARD_WIDTH, self.CARD_HEIGHT)
 
-        # 2. STYLE
-        bg_color = "#111111"
-        self.configure(bg=bg_color)
+        # Accent strip along the top edge
+        tk.Frame(self, bg=accent, height=3).place(relx=0, rely=0, relwidth=1)
 
-        # 3. CENTER
-        center_window(self, width, height)
+        tk.Label(self, text="Loop Station", font=(FONT_UI, 30, "bold"),
+                 bg=bg, fg=text).place(relx=0.5, rely=0.30, anchor="center")
+        tk.Label(self, text="Seamless vamps for live theater", font=(FONT_UI, 12),
+                 bg=bg, fg=dim).place(relx=0.5, rely=0.45, anchor="center")
 
-        # --- CONTENT LAYOUT ---
+        style = ttk.Style(self)
+        style.theme_use('default')
+        style.configure("Splash.Horizontal.TProgressbar", background=accent,
+                        troughcolor=track, bordercolor=track,
+                        lightcolor=accent, darkcolor=accent, thickness=4)
+        self.progress = ttk.Progressbar(self, style="Splash.Horizontal.TProgressbar",
+                                        mode='determinate', maximum=100,
+                                        value=0, length=320)
+        self.progress.place(relx=0.5, rely=0.64, anchor="center")
 
-        # Defaults (if no logo found)
-        text_y_start = 0.40
+        self.status = tk.Label(self, text="Starting up...", font=(FONT_UI, 11),
+                               bg=bg, fg=dim)
+        self.status.place(relx=0.5, rely=0.74, anchor="center")
 
-        # A. LOGO
+        # Footer: maker's mark (dark themes only: the logo is white) + version
+        self._add_logo(bg, dark=self._is_dark(bg))
+        tk.Label(self, text=f"v{__version__}", font=(FONT_UI, 9),
+                 bg=bg, fg=faint).place(relx=0.96, rely=0.93, anchor="se")
+
+    @staticmethod
+    def _is_dark(color):
+        return sum(int(color[i:i + 2], 16) for i in (1, 3, 5)) < 382
+
+    def _add_logo(self, bg, dark):
+        if not dark:
+            return
         try:
             from PIL import Image, ImageTk
             logo_path = get_asset_path("logo.png")
-
-            if os.path.exists(logo_path):
-                original = Image.open(logo_path)
-
-                target_width = 500
-                target_height = 250
-
-                ratio = min(target_width / original.width, target_height / original.height)
-                new_width = int(original.width * ratio)
-                new_height = int(original.height * ratio)
-
-                resized = original.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                self.logo_img = ImageTk.PhotoImage(resized)
-
-                logo_lbl = tk.Label(self, image=self.logo_img, bg=bg_color)
-                logo_lbl.place(relx=0.5, rely=0.25, anchor="center")
-
-                text_y_start = 0.55
-
+            if not os.path.exists(logo_path):
+                return
+            image = Image.open(logo_path).convert("RGBA")
+            box = image.getbbox()           # trim the transparent padding
+            if box:
+                image = image.crop(box)
+            target_h = 22
+            ratio = target_h / image.height
+            image = image.resize((max(1, int(image.width * ratio)), target_h),
+                                 Image.Resampling.LANCZOS)
+            # Fade the white mark so it sits quietly in the footer
+            alpha = image.getchannel("A").point(lambda a: int(a * 0.45))
+            image.putalpha(alpha)
+            self.logo_img = ImageTk.PhotoImage(image)
+            tk.Label(self, image=self.logo_img, bg=bg).place(
+                relx=0.04, rely=0.93, anchor="sw")
         except Exception as e:
             logging.getLogger("LoopStation").warning(f"Could not load logo: {e}")
-
-        # B. TEXT
-        tk.Label(self, text="LOOP STATION", font=("Segoe UI", 36, "bold"),
-                 bg=bg_color, fg="#ffffff").place(relx=0.5, rely=text_y_start, anchor="center")
-
-        tk.Label(self, text="Professional Audio Looper", font=("Segoe UI", 12),
-                 bg=bg_color, fg="#3b8ed0").place(relx=0.5, rely=text_y_start + 0.10, anchor="center")
-
-        # C. PROGRESS BAR (Determinate)
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure("Horizontal.TProgressbar", background="#3b8ed0",
-                        troughcolor="#222222", bordercolor="#111111", thickness=6)
-
-        self.progress = ttk.Progressbar(self, style="Horizontal.TProgressbar",
-                                        mode='determinate', maximum=100,
-                                        value=0, length=400)
-        self.progress.place(relx=0.5, rely=0.79, anchor="center")
-
-        # D. STEP STATUS
-        self.status = tk.Label(self, text="Starting up...", font=("Segoe UI", 11),
-                               bg=bg_color, fg="#888888", width=50)
-        self.status.place(relx=0.5, rely=0.85, anchor="center")
-
-        # E. PERCENT LABEL
-        self.percent_label = tk.Label(self, text="0%", font=("Consolas", 9),
-                                      bg=bg_color, fg="#555555")
-        self.percent_label.place(relx=0.5, rely=0.91, anchor="center")
-
-        # F. FIRST-RUN HINT
-        self.hint = tk.Label(self, text="This may take a moment on first launch",
-                             font=("Segoe UI", 9), bg=bg_color, fg="#333333")
-        self.hint.place(relx=0.5, rely=0.95, anchor="center")
-
-        # G. FOOTER
-        tk.Label(self, text=f"v{__version__}", font=("Segoe UI", 8),
-                 bg=bg_color, fg="#333333").place(relx=0.98, rely=0.98, anchor="se")
 
     def update_status(self, text, step=None):
         """Update status text and advance progress to the next step target."""
@@ -240,24 +245,22 @@ class BootstrapSplash(tk.Toplevel):
         if not self.winfo_exists():
             return
         if self._current_progress < self._target_progress:
-            # Move in increments for smooth animation
-            step_size = max(1, (self._target_progress - self._current_progress) // 8)
+            # Ease out: big steps first, then small ones
+            step_size = max(1, (self._target_progress - self._current_progress) // 6)
             self._current_progress = min(self._current_progress + step_size, self._target_progress)
 
             self.progress['value'] = self._current_progress
-            self.percent_label.config(text=f"{self._current_progress}%")
             self.update()
 
             if self._current_progress < self._target_progress:
-                self.after(30, self._animate_to_target)
+                self.after(16, self._animate_to_target)
 
     def finish(self):
         """Complete the progress bar and close."""
         self._target_progress = 100
         self._current_progress = 100
         self.progress['value'] = 100
-        self.percent_label.config(text="100%")
-        self.status.config(text="Ready!")
+        self.status.config(text="Ready")
         self.update()
         self.destroy()
 
@@ -280,17 +283,51 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         datefmt="%H:%M:%S"
     ))
 
+    handlers = [file_handler]
+    if sys.stdout is not None and getattr(sys.stdout, "name", None) != os.devnull:
+        handlers.insert(0, logging.StreamHandler(sys.stdout))
+
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout), file_handler]
+        handlers=handlers
     )
     # Third-party libraries are very chatty at DEBUG (font matching, PNG
     # chunks, HTTP requests); keep the log focused on Loop Station itself.
     for noisy in ("matplotlib", "PIL", "werkzeug", "numba", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     return logging.getLogger("LoopStation")
+
+
+def install_crash_handlers(logger: logging.Logger) -> None:
+    """
+    Route uncaught exceptions (main thread and worker threads) to the log
+    file: in a windowed build there is no console, so they would otherwise
+    vanish. Tk callback errors are routed by install_tk_crash_handler().
+    """
+    def _excepthook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+
+    def _thread_excepthook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread is not None else "?"
+        logger.critical(f"Uncaught exception in thread {name}",
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
+def install_tk_crash_handler(root, logger: logging.Logger) -> None:
+    """Log exceptions raised inside Tk callbacks (button handlers, after() jobs)."""
+    def _report_callback_exception(exc_type, exc, tb):
+        logger.error("Exception in Tk callback", exc_info=(exc_type, exc, tb))
+    root.report_callback_exception = _report_callback_exception
 
 
 def check_dependencies():
@@ -389,6 +426,7 @@ def main():
     args = parser.parse_args()
 
     logger = setup_logging(debug=args.debug)
+    install_crash_handlers(logger)
     logger.info(f"Loop Station {__version__} starting")
 
     # 1. Dependencies (before anything imports them)
@@ -433,6 +471,7 @@ def main():
             from frontend.app import LoopStationApp  # late import: fresh config colours
 
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
+            install_tk_crash_handler(app, logger)
             center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
 
             if first_run:

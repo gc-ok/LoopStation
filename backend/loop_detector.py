@@ -188,13 +188,9 @@ class LoopDetector:
                     continue
 
                 window = min(100, duration_samples // 10)
-                if window <= 0 or start_idx + window >= region_len or end_idx - window < 0:
+                phase_conf = self._loop_phase_score(region, start_idx, end_idx, window)
+                if phase_conf is None:
                     continue
-
-                phase_conf = self._calculate_phase_similarity(
-                    region[start_idx:start_idx + window],
-                    region[end_idx - window:end_idx]
-                )
 
                 candidates.append(LoopCandidate(
                     start=start_time + (start_idx / self.sr),
@@ -253,6 +249,36 @@ class LoopDetector:
         cur = seg[1:]
         mask = ((prev <= 0) & (cur > 0)) | ((prev >= 0) & (cur < 0))
         return (np.nonzero(mask)[0] + 1).tolist()
+
+    @classmethod
+    def _loop_phase_score(cls, region, start_idx, end_idx, window):
+        """
+        Phase match (0-1) of a loop [start_idx, end_idx) in ``region``, or
+        None if it cannot be scored.
+
+        At the wrap playback jumps from ``end_idx`` back to ``start_idx``, so
+        the audio that follows ``start_idx`` must look like the audio that
+        would have followed ``end_idx``: compare region[e:e+w] with
+        region[s:s+w] (or, at the region end, the windows just before both
+        points). Crossings of opposite direction (rising vs falling) flip the
+        polarity at the seam and score 0.
+        """
+        n = len(region)
+        if window <= 0 or start_idx < 1 or end_idx < 1 or end_idx >= n:
+            return None
+        rising_s = region[start_idx] > region[start_idx - 1]
+        rising_e = region[end_idx] > region[end_idx - 1]
+        if rising_s != rising_e:
+            return 0.0
+        if end_idx + window <= n:
+            a = region[start_idx:start_idx + window]
+            b = region[end_idx:end_idx + window]
+        elif start_idx >= window:
+            a = region[start_idx - window:start_idx]
+            b = region[end_idx - window:end_idx]
+        else:
+            return None
+        return cls._calculate_phase_similarity(a, b)
 
     @staticmethod
     def _calculate_phase_similarity(start_segment, end_segment):

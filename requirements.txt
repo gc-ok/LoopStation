@@ -8,8 +8,13 @@ Pillow>=10.0
 # Audio output (PortAudio) — the playback engine
 sounddevice>=0.5
 
-# MIDI input (mido parses messages; pygame's portmidi backend opens ports,
-# so no compiler is needed on any platform). python-rtmidi is optional.
+# MIDI input (mido parses messages and opens ports). python-rtmidi is the
+# recommended backend and is preferred when importable; pygame's portmidi
+# backend is the fallback (some pygame builds, e.g. for Python 3.14, ship
+# without portmidi, so MIDI would be unavailable without python-rtmidi).
+# Where no prebuilt wheel exists yet it builds from source (needs a C++
+# compiler: Xcode command line tools / MSVC build tools).
+python-rtmidi>=1.5
 pygame>=2.5
 mido>=1.3
 
@@ -18,6 +23,11 @@ python-osc>=1.9
 
 # Loop / tempo detection
 librosa>=0.10
+
+# Drag-and-drop of audio files from Finder / Explorer onto the show list.
+# Optional but recommended: without it the app still runs (no file drops;
+# "+ Add songs" still works). Ships tkdnd binaries for Windows/macOS/Linux.
+tkinterdnd2>=0.4
 
 # Web sharing (local network cue monitor)
 flask>=3.0

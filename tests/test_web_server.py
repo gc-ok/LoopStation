@@ -127,7 +127,8 @@ def test_start_stop_twice_rebinds_cleanly(state):
             assert server.running
             assert server.port == port
             assert server.token and ("?k=" + server.token) in url
-            assert first_token != server.token   # fresh token per start
+            # the token lives for the process: phones survive Share off/on
+            assert first_token in (None, server.token)
             first_token = server.token
             assert server.get_url() == url
             assert server.get_urls()[0] == url
@@ -201,8 +202,9 @@ def test_local_ips_prefers_lan_and_dedupes(monkeypatch):
         web_server, "_hostname_candidates",
         lambda: ["127.0.0.1", "169.254.1.2", "10.0.0.5", "192.168.1.20", "172.16.3.4"])
     ips = get_local_ips()
-    assert ips == ["192.168.1.20", "10.0.0.5", "172.16.3.4", "169.254.1.2"]
-    assert get_local_ip() == "192.168.1.20"
+    # the default-route interface wins; the rest by private range
+    assert ips == ["10.0.0.5", "192.168.1.20", "172.16.3.4", "169.254.1.2"]
+    assert get_local_ip() == "10.0.0.5"
 
 
 def test_local_ips_real_machine_does_not_raise():

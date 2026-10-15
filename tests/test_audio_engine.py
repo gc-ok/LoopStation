@@ -583,8 +583,8 @@ def test_events_are_delivered_off_the_render_thread(make_engine, song_wav):
     rec = Recorder()
     eng.on_event(rec)
     eng.load_file(song_wav[0])
-    eng.arm_loop(0.5, 0.7, count=1)
-    eng.play_transport(0.6)
+    eng.arm_loop(0.5, 1.0, count=1)     # MIN_LOOP_DURATION is 0.5 s
+    eng.play_transport(0.9)
     assert wait_until(lambda: "loop_exited" in rec.names(), timeout=3.0)
     assert rec.names()[:3] == ["loop_entered", "loop_cycle", "loop_exited"]
     stream = streams[-1]

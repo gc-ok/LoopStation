@@ -210,25 +210,44 @@ COLOR_LOOP_REGION = "#2d5a3d"
 COLOR_LOOP_IN = "#00ff00"
 COLOR_LOOP_OUT = "#ffa500"
 COLOR_MARKER = "#e8e82e"
+COLOR_VAMP = "#66bb6a"        # Vamp text / icons (cue sheet, cue details)
 COLOR_LOOP_GHOST = "#444444"
 COLOR_LOOP_GHOST_ALPHA = 0.2
 COLOR_BTN_PRIMARY = ""
 COLOR_BTN_SUCCESS = ""
 COLOR_BTN_WARNING = ""
 COLOR_BTN_DANGER = ""
-COLOR_BTN_DISABLED = "#3a4a3b"
+COLOR_BTN_DISABLED = ""
 COLOR_TEXT = ""
 COLOR_TEXT_DIM = ""
+COLOR_TEXT_DISABLED = ""
+COLOR_BORDER = ""            # Hairline borders / dividers
+COLOR_HOVER = ""             # Hover fill for neutral buttons
 COLOR_SKIP_REGION = ""       # For the waveform box
 COLOR_SKIP_CANDIDATE = ""    # For text highlighting
 COLOR_BTN_SKIP = ""          # For buttons
+
+def mix(a: str, b: str, t: float) -> str:
+    """Blend hex colour a toward b by t (0 = a, 1 = b)."""
+    ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(ca, cb))
+
+
+def tint(color: str, amount: float = 0.18) -> str:
+    """A panel-coloured surface washed with color (state cards, selected rows).
+
+    Works on light and dark themes alike, unlike a fixed dark hex."""
+    return mix(COLOR_BG_MEDIUM, color, amount)
+
 
 def load_theme():
     """Loads the user's theme preference and updates global color variables."""
     global COLOR_BG_DARK, COLOR_BG_MEDIUM, COLOR_BG_LIGHT, COLOR_WAVEFORM, \
            COLOR_WAVEFORM_BG, COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, \
            COLOR_BTN_WARNING, COLOR_BTN_DANGER, COLOR_TEXT, COLOR_TEXT_DIM, \
-           COLOR_BTN_TEXT, COLOR_SKIP_REGION, COLOR_SKIP_CANDIDATE, COLOR_BTN_SKIP
+           COLOR_BTN_TEXT, COLOR_SKIP_REGION, COLOR_SKIP_CANDIDATE, COLOR_BTN_SKIP, \
+           COLOR_BTN_DISABLED, COLOR_TEXT_DISABLED, COLOR_BORDER, COLOR_HOVER
 
     # 1. Load User Preference
     _user_theme = get_theme_preference()
@@ -241,7 +260,6 @@ def load_theme():
     # 3. Apply Colors
     COLOR_BG_DARK = _palette["bg_primary"]
     COLOR_BG_MEDIUM = _palette["bg_secondary"]
-    COLOR_BG_LIGHT = _palette["bg_secondary"]
     COLOR_WAVEFORM = _palette["waveform_fg"]
     COLOR_WAVEFORM_BG = _palette["waveform_bg"]
     COLOR_BTN_PRIMARY = _palette["fg_primary"]
@@ -254,7 +272,15 @@ def load_theme():
     COLOR_SKIP_REGION = _palette.get("skip_region", "#882222")
     COLOR_SKIP_CANDIDATE = _palette.get("skip_candidate", "#ff5555")
     COLOR_BTN_SKIP = _palette.get("btn_skip", "#d63031")
-    
+
+    # 4. Derived surfaces: window < panel < raised control, plus hairlines.
+    #    Blending toward the text colour works for light and dark themes.
+    COLOR_BG_LIGHT = mix(COLOR_BG_MEDIUM, COLOR_TEXT, 0.07)
+    COLOR_BORDER = mix(COLOR_BG_MEDIUM, COLOR_TEXT, 0.14)
+    COLOR_HOVER = mix(COLOR_BG_MEDIUM, COLOR_TEXT, 0.16)
+    COLOR_BTN_DISABLED = mix(COLOR_BG_MEDIUM, COLOR_TEXT, 0.09)
+    COLOR_TEXT_DISABLED = mix(COLOR_BG_MEDIUM, COLOR_TEXT_DIM, 0.75)
+
     # Set the appearance mode based on background brightness for CTk components
     # This is a simple heuristic; you might need to manually flag themes as 'light' or 'dark'
     bg_brightness = int(COLOR_BG_DARK[1:3], 16) + int(COLOR_BG_DARK[3:5], 16) + int(COLOR_BG_DARK[5:7], 16)

@@ -22,6 +22,12 @@ background thread and hot-swaps the buffers inside the callback at the
 equivalent source position. Loop points, holds and skips are kept in source
 seconds, so cue times never move.
 
+Preload
+-------
+``preload_file`` decodes (and, for a saved tempo/key, renders) the NEXT song
+on a background worker into one preload slot, so ``load_file`` can adopt the
+finished files without running ffmpeg. See docs/audio-engine-api.md.
+
 Events are delivered on a worker thread, never from the audio callback.
 
 Device loss
@@ -46,6 +52,7 @@ import struct
 import logging
 import tempfile
 import threading
+import time
 import subprocess
 import numpy as np
 
@@ -80,6 +87,23 @@ if os.name == 'nt':
 TEMP_FILE_PREFIX = "loopstation_"
 
 _STOP_EVENTS = object()
+
+# How often a cancellable ffmpeg run (preload) checks its cancel flag.
+_CANCEL_POLL_S = 0.05
+# How long cancel_preload()/cleanup() wait for a running preload worker to
+# kill its ffmpeg and delete its files.
+_PRELOAD_JOIN_S = 5.0
+
+
+class _Cancelled(Exception):
+    """A cancellable ffmpeg run (preload) was stopped on request."""
+
+# Memmap prefetch: a background thread touches the pages the callback will
+# read in the next PREFETCH_AHEAD_S seconds, every PREFETCH_INTERVAL_S, so the
+# audio thread does not take page faults (disk reads) on the decoded files.
+PREFETCH_AHEAD_S = 3.0
+PREFETCH_INTERVAL_S = 0.25
+_PAGE_FRAMES = 1024     # int16 stereo = 4 bytes/frame -> one frame per 4 KiB page
 
 
 # =============================================================================
@@ -216,6 +240,63 @@ def atempo_chain(factor):
     return chain
 
 
+def _clamp_tempo_pitch(tempo_pitch):
+    """(tempo_ratio, semitones) clamped exactly like ``set_tempo_pitch``."""
+    tempo_ratio, semitones = tempo_pitch
+    return (max(TEMPO_MIN, min(TEMPO_MAX, float(tempo_ratio))),
+            max(-SEMITONES_MAX, min(SEMITONES_MAX, float(semitones))))
+
+
+def _is_identity(tempo_pitch):
+    return abs(tempo_pitch[0] - 1.0) < 1e-9 and abs(tempo_pitch[1]) < 1e-9
+
+
+def _same_tempo_pitch(a, b):
+    return a is not None and b is not None and \
+        abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9
+
+
+def _norm_path(path):
+    """Comparable form of a path (case-insensitive on Windows)."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _stem_items(stem_paths):
+    """[(name, path)] of the extra stems load_file would decode, in order."""
+    return [(name, p) for name, p in (stem_paths or {}).items() if name != "mix" and p]
+
+
+class _Preload:
+    """One background decode/render of a song (see AudioEngine.preload_file).
+
+    ``state`` (changed under the engine's ``_preload_lock``):
+    "running" -> "ready" (decode done; ``rendered`` may be None) | "failed"
+    (decode failed) | "cancelled"; "ready" -> "taken" (adopted by load_file)
+    | "cancelled". Whoever moves a finished preload to "cancelled" deletes
+    its files; a running worker deletes them itself when it notices.
+    """
+
+    def __init__(self, path, stem_paths, key, sig, tempo_pitch):
+        self.path = path
+        self.stem_paths = dict(stem_paths)
+        self.key = key
+        self.sig = sig
+        self.tempo_pitch = tempo_pitch      # clamped request
+        self.state = "running"
+        self.error = None
+        self.cancel = threading.Event()
+        self.skip_render = threading.Event()   # load_file wants the decode only
+        self.done = threading.Event()
+        self.owned = []         # every temp file this preload created
+        self.decoded = {}       # name -> padded decoded WAV (equal lengths)
+        self.infos = {}         # name -> parse_wav_data_chunk() of decoded
+        self.frames = 0
+        self.rendered = None    # name -> (path, info), each >= n_render frames
+        self.render_tp = None
+        self.n_render = 0
+        self.thread = None
+
+
 def build_tempo_pitch_filter(tempo_ratio, semitones, sample_rate=SAMPLE_RATE):
     """
     ffmpeg ``-af`` string for a tempo/pitch render, or None for identity.
@@ -286,11 +367,23 @@ class AudioEngine:
         self._closed = False
         self._render_lock = threading.RLock()
 
+        # Preload slot (never touched by the audio callback; the lock is
+        # never held while ffmpeg runs)
+        self._preload = None
+        self._preload_lock = threading.Lock()
+        self._preload_leftovers = []    # preload files that could not be deleted yet
+        self._preload_retiring = []     # cancelled workers still winding down
+
         # Events
         self._callbacks = []
         self._event_thread = threading.Thread(
             target=self._event_loop, name="AudioEngineEvents", daemon=True)
         self._event_thread.start()
+
+        self._prefetch_stop = threading.Event()
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop, name="AudioPrefetch", daemon=True)
+        self._prefetch_thread.start()
 
         # Stream
         self._stream = None
@@ -335,6 +428,29 @@ class AudioEngine:
                     cb(name, dict(payload))
                 except Exception:
                     logger.exception(f"Event callback failed for {name}")
+
+    def _prefetch_loop(self):
+        """Touch upcoming memmap pages off the audio thread (see PREFETCH_*)."""
+        ahead = int(PREFETCH_AHEAD_S * self.SAMPLE_RATE)
+        while not self._prefetch_stop.wait(PREFETCH_INTERVAL_S):
+            # The render lock keeps _release_audio from unmapping/deleting
+            # the files while we read them (Windows cannot delete a mapped
+            # file); never wait long for it.
+            if not self._render_lock.acquire(timeout=0.05):
+                continue
+            try:
+                self._touch_pages(self.core.prefetch_spans(ahead))
+            except Exception as e:
+                logger.debug(f"prefetch skipped: {e}")
+            finally:
+                self._render_lock.release()
+
+    @staticmethod
+    def _touch_pages(spans):
+        """Read one sample per page of each span. A separate function so no
+        memmap reference outlives the render lock (Windows file deletion)."""
+        for buf, a, b in spans:
+            np.asarray(buf[a:b:_PAGE_FRAMES, 0]).sum()
 
     # =========================================================================
     # DEVICES / STREAM
@@ -608,7 +724,9 @@ class AudioEngine:
         if status is not None and getattr(status, 'output_underflow', False):
             self._underflows += 1
         try:
-            outdata[:] = self.core.render(frames)
+            # Render into the stream's real channel count: during a routing
+            # change the core's count changes before the stream reopens.
+            outdata[:] = self.core.render(frames, outdata.shape[1])
         except Exception as e:
             outdata.fill(0)
             if not self._callback_error_logged:
@@ -656,10 +774,17 @@ class AudioEngine:
     # FILE LOADING
     # =========================================================================
 
-    def load_file(self, path, stem_paths=None):
+    def load_file(self, path, stem_paths=None, tempo_pitch=None):
         """
         Decode ``path`` (stem "mix") and each ``stem_paths[name]`` to WAV
         temp files, memmap them and hand them to the mixer.
+
+        If a finished preload (``preload_file``) matches ``path``, the stems
+        and the files' size/mtime, its files are adopted instead (no ffmpeg).
+        If ``tempo_pitch`` is given and the preload rendered exactly that,
+        the rendered buffers are installed too: playback starts at that
+        tempo/key and ``get_tempo_pitch()`` returns it. Without a matching
+        preload ``tempo_pitch`` is ignored (the song loads at 1.0 / 0 st).
 
         Returns:
             (duration_seconds, 1.0)   # second value kept for compatibility
@@ -671,10 +796,49 @@ class AudioEngine:
         self._release_audio()
         self.current_file_path = path
 
+        want_tp = None if tempo_pitch is None else _clamp_tempo_pitch(tempo_pitch)
+        buffers = active = None
+        applied_tp = (1.0, 0.0)
+        pre = self._claim_preload(path, stem_paths, want_tp)
+        if pre is not None:
+            unusable = False
+            try:
+                buffers, active, applied_tp, target = self._adopt_preload(pre, stem_paths, want_tp)
+                logger.info("Loaded from preload" + (
+                    f" (rendered at tempo {applied_tp[0]:g}, {applied_tp[1]:+g} st)"
+                    if active is not None else ""))
+            except Exception as e:
+                logger.warning(f"Preloaded files unusable ({e}); decoding again")
+                unusable = True
+            if unusable:
+                # Outside the except block, so the traceback no longer keeps
+                # partial maps alive (Windows cannot delete mapped files).
+                buffers = active = None
+                applied_tp = (1.0, 0.0)
+                self._stem_sources = {}
+                self._discard_preload_files(pre)
+
+        if buffers is None:
+            buffers, target = self._decode_song(path, stem_paths)
+
+        with self._render_lock:
+            if self._closed:
+                buffers.clear()
+                active = None
+                self._release_audio_locked()
+                raise RuntimeError("Audio engine closed while the song was loading")
+            self.core.set_stems(buffers, active, *applied_tp)
+            self.raw_audio_data = buffers["mix"]
+            self.song_length = target / self.SAMPLE_RATE
+            self._tempo_pitch = applied_tp
+            self._ensure_stream()
+        logger.info(f"Song duration: {self.song_length:.3f}s, stems: {list(buffers)}")
+        return self.song_length, 1.0
+
+    def _decode_song(self, path, stem_paths):
+        """The normal (non-preloaded) decode of load_file -> (buffers, frames)."""
         decoded = {"mix": self._decode(path)}
-        for name, stem_path in (stem_paths or {}).items():
-            if name == "mix" or not stem_path:
-                continue
+        for name, stem_path in _stem_items(stem_paths):
             try:
                 decoded[name] = self._decode(stem_path)
             except Exception as e:
@@ -693,41 +857,379 @@ class AudioEngine:
         for name, p in decoded.items():
             buffers[name] = self._map_wav(p, infos[name])
             self._stem_sources[name] = {"path": p, "data": buffers[name]}
+        return buffers, target
 
-        with self._render_lock:
-            if self._closed:
-                buffers.clear()
-                self._release_audio_locked()
-                raise RuntimeError("Audio engine closed while the song was loading")
-            self.core.set_stems(buffers)
-            self.raw_audio_data = buffers["mix"]
-            self.song_length = target / self.SAMPLE_RATE
-            self._tempo_pitch = (1.0, 0.0)
-            self._ensure_stream()
-        logger.info(f"Song duration: {self.song_length:.3f}s, stems: {list(buffers)}")
-        return self.song_length, 1.0
+    # =========================================================================
+    # PRELOAD (next song decoded/rendered in the background)
+    # =========================================================================
+
+    @staticmethod
+    def _preload_key(path, stem_paths):
+        return (_norm_path(path),
+                tuple((name, _norm_path(p)) for name, p in _stem_items(stem_paths)))
+
+    @staticmethod
+    def _file_sig(path, stem_paths):
+        """(size, mtime_ns) of the song and every stem, or None if one is missing."""
+        sig = []
+        try:
+            for p in [path] + [sp for _n, sp in _stem_items(stem_paths)]:
+                st = os.stat(p)
+                sig.append((st.st_size, st.st_mtime_ns))
+        except (OSError, TypeError, ValueError):
+            return None
+        return tuple(sig)
+
+    def preload_file(self, path, stem_paths=None, tempo_pitch=(1.0, 0.0)):
+        """
+        Decode ``path`` + ``stem_paths`` (and render ``tempo_pitch`` when it
+        is not identity) on a background worker, so a later ``load_file`` of
+        the same song is near-instant. Non-blocking. One slot: a different
+        request cancels/replaces the previous one; the same request (same
+        files, unchanged on disk, same tempo/key) is a no-op.
+
+        Emits "preload_ready" {path} or "preload_failed" {path, error}.
+        Returns True if the request is running or ready.
+        """
+        if self._closed:
+            return False
+        tp = _clamp_tempo_pitch(tempo_pitch if tempo_pitch is not None else (1.0, 0.0))
+        key = self._preload_key(path, stem_paths)
+        sig = self._file_sig(path, stem_paths)
+        with self._preload_lock:
+            old = self._preload
+            if old is not None and old.key == key and old.sig == sig and sig is not None \
+                    and _same_tempo_pitch(old.tempo_pitch, tp) \
+                    and old.state in ("running", "ready", "failed"):
+                return old.state != "failed"
+            discard_old = self._cancel_locked(old)
+            pre = None
+            if sig is not None:
+                pre = _Preload(path, stem_paths or {}, key, sig, tp)
+                pre.thread = threading.Thread(target=self._preload_worker, args=(pre,),
+                                              name="AudioPreload", daemon=True)
+                self._preload = pre
+        if discard_old:
+            self._discard_preload_files(old)
+        if pre is None:
+            self._emit("preload_failed", path=path, error="file not found")
+            return False
+        logger.info(f"Preloading {os.path.basename(path)}"
+                    + ("" if _is_identity(tp) else f" at tempo {tp[0]:g}, {tp[1]:+g} st"))
+        pre.thread.start()
+        return True
+
+    def cancel_preload(self):
+        """Cancel the preload (killing its ffmpeg) and delete its files."""
+        with self._preload_lock:
+            pre = self._preload
+            discard = self._cancel_locked(pre)
+            retiring = list(self._preload_retiring)
+        if discard:
+            self._discard_preload_files(pre)
+        # Running workers (this one or ones replaced earlier) kill ffmpeg
+        # within _CANCEL_POLL_S and delete their own files.
+        deadline = time.monotonic() + _PRELOAD_JOIN_S
+        for r in retiring:
+            if r.thread is not threading.current_thread():
+                r.done.wait(max(0.0, deadline - time.monotonic()))
+        self._retry_preload_leftovers()
+
+    def _cancel_locked(self, pre):
+        """Detach/cancel ``pre`` (preload lock held). True = caller deletes
+        its files (it had finished); a running worker deletes them itself."""
+        if pre is None:
+            return False
+        if self._preload is pre:
+            self._preload = None
+        pre.cancel.set()
+        if pre.state in ("ready", "failed"):
+            pre.state = "cancelled"
+            return True
+        if pre.state == "running" and pre not in self._preload_retiring:
+            self._preload_retiring.append(pre)
+        return False
+
+    def is_preloaded(self, path, stem_paths=None, tempo_pitch=None):
+        """
+        True if a finished preload matches ``path``/``stem_paths`` (None = no
+        stems) and the files are unchanged on disk. ``tempo_pitch`` None =
+        any; identity always matches a finished decode; otherwise the
+        preload must have rendered exactly that tempo/key.
+        """
+        key = self._preload_key(path, stem_paths)
+        with self._preload_lock:
+            pre = self._preload
+            if pre is None or pre.state != "ready" or pre.key != key:
+                return False
+        if self._file_sig(path, stem_paths) != pre.sig:
+            return False
+        if tempo_pitch is None:
+            return True
+        want = _clamp_tempo_pitch(tempo_pitch)
+        if _is_identity(want):
+            return True
+        return pre.rendered is not None and _same_tempo_pitch(want, pre.render_tp)
+
+    def get_preloaded_audio(self, path):
+        """
+        Read-only int16 memmap (frames, 2) of the preloaded "mix" at the
+        original tempo (for a waveform), or None. Drop the reference when
+        done: on Windows a mapped file cannot be deleted.
+        """
+        norm = _norm_path(path)
+        with self._preload_lock:
+            pre = self._preload
+            if pre is None or pre.state != "ready" or pre.key[0] != norm:
+                return None
+            try:
+                return self._map_wav(pre.decoded["mix"], pre.infos["mix"])
+            except Exception as e:
+                logger.debug(f"preloaded audio unavailable: {e}")
+                return None
+
+    def _claim_preload(self, path, stem_paths, want_tp):
+        """
+        The finished preload matching this load (taken out of the slot), or
+        None. A matching preload that is still running is waited for: its
+        decode is always ahead of a fresh decode. Its tempo render is only
+        waited for when ``want_tp`` asks for exactly that render (otherwise
+        the render is aborted and only the decode is waited for).
+        """
+        key = self._preload_key(path, stem_paths)
+        with self._preload_lock:
+            pre = self._preload
+            if pre is None or pre.key != key or pre.state not in ("running", "ready"):
+                return None
+        if self._file_sig(path, stem_paths) != pre.sig:
+            logger.info("Preload is out of date (file changed); decoding again")
+            with self._preload_lock:
+                discard = self._cancel_locked(pre) if self._preload is pre else False
+            if discard:
+                self._discard_preload_files(pre)
+            return None
+        if not pre.done.is_set():
+            if want_tp is None or _is_identity(want_tp) \
+                    or not _same_tempo_pitch(want_tp, pre.tempo_pitch):
+                pre.skip_render.set()
+            logger.info("Waiting for the running preload of this song")
+            while not pre.done.wait(0.05):
+                if self._closed or pre.cancel.is_set():
+                    break
+        with self._preload_lock:
+            if self._preload is not pre or pre.state != "ready":
+                return None
+            pre.state = "taken"
+            self._preload = None
+        return pre
+
+    def _adopt_preload(self, pre, stem_paths, want_tp):
+        """Map a claimed preload's files; they become this song's temp files.
+        Returns (buffers, active | None, (tempo, semitones), frames)."""
+        order = ["mix"] + [n for n, _p in _stem_items(stem_paths) if n in pre.decoded]
+        order += [n for n in pre.decoded if n not in order]
+        use_render = (pre.rendered is not None and want_tp is not None
+                      and not _is_identity(want_tp) and _same_tempo_pitch(want_tp, pre.render_tp))
+        buffers = {}
+        for name in order:
+            buffers[name] = self._map_wav(pre.decoded[name], pre.infos[name])
+            self._stem_sources[name] = {"path": pre.decoded[name], "data": buffers[name]}
+        active = None
+        render_files = [rp for rp, _i in (pre.rendered or {}).values()]
+        if use_render:
+            active = {name: self._map_wav(*pre.rendered[name])[:pre.n_render] for name in order}
+        owned, pre.owned = pre.owned, []
+        self._temp_paths = [p for p in owned if p not in render_files]
+        if use_render:
+            self._render_paths = list(render_files)
+        else:
+            self._remove_files(*render_files)
+        tp = pre.render_tp if use_render else (1.0, 0.0)
+        return buffers, active, tp, pre.frames
+
+    def _preload_worker(self, pre):
+        error = None
+        decoded_ok = False
+        try:
+            self._preload_decode(pre)
+            decoded_ok = True
+            if not _is_identity(pre.tempo_pitch) and not pre.skip_render.is_set():
+                try:
+                    self._preload_render(pre)
+                except _Cancelled:
+                    if pre.cancel.is_set():
+                        raise
+                    logger.info("Preload render skipped (song loaded meanwhile)")
+                except Exception as e:
+                    error = f"tempo/key render failed: {e}"
+                    logger.error(f"Preload of {os.path.basename(pre.path)}: {error}")
+        except _Cancelled:
+            pass
+        except Exception as e:
+            error = str(e) or type(e).__name__
+            logger.error(f"Preload of {os.path.basename(pre.path)} failed: {error}")
+        with self._preload_lock:
+            cancelled = pre.cancel.is_set()
+            if cancelled:
+                pre.state = "cancelled"
+            else:
+                pre.state = "ready" if decoded_ok else "failed"
+                pre.error = error
+            current = self._preload is pre
+        if cancelled or not decoded_ok:
+            self._discard_preload_files(pre)
+        with self._preload_lock:
+            if pre in self._preload_retiring:
+                self._preload_retiring.remove(pre)
+        pre.done.set()
+        if current and not cancelled:
+            if error is None:
+                self._emit("preload_ready", path=pre.path)
+            else:
+                self._emit("preload_failed", path=pre.path, error=error)
+
+    def _check_cancel(self, pre):
+        if pre.cancel.is_set():
+            raise _Cancelled()
+
+    def _preload_decode(self, pre):
+        """Decode + pad exactly like load_file, into files owned by ``pre``."""
+        stop = pre.cancel.is_set
+        sources = [("mix", pre.path)] + _stem_items(pre.stem_paths)
+        decoded = {}
+        for name, src in sources:
+            self._check_cancel(pre)
+            try:
+                out = self._decode(src, should_stop=stop, track=False)
+            except _Cancelled:
+                raise
+            except Exception as e:
+                if name == "mix":
+                    raise
+                logger.error(f"Stem {name!r} could not be decoded, skipping: {e}")
+                continue
+            if out != src:
+                pre.owned.append(out)
+            decoded[name] = out
+        self._check_cancel(pre)
+        infos = {name: parse_wav_data_chunk(p) for name, p in decoded.items()}
+        target = max(info['frames'] for info in infos.values())
+        if target <= 0:
+            raise ValueError("Decoded audio is empty")
+        for name, info in infos.items():
+            if info['frames'] < target:
+                self._check_cancel(pre)
+                src = decoded[name]
+                padded = self._pad_wav(src, info, target, track=False)
+                pre.owned.append(padded)
+                decoded[name] = padded
+                infos[name] = parse_wav_data_chunk(padded)
+                if src in pre.owned:
+                    pre.owned.remove(src)
+                    self._remove_files(src)
+                    if os.path.exists(src):
+                        pre.owned.append(src)
+        pre.decoded, pre.infos, pre.frames = decoded, infos, target
+
+    def _preload_render(self, pre):
+        """Render every decoded stem exactly like ``_render_worker``."""
+        tempo_ratio, semitones = pre.tempo_pitch
+        filt = build_tempo_pitch_filter(tempo_ratio, semitones, self.SAMPLE_RATE)
+        n_nominal = max(1, int(round(pre.frames / float(tempo_ratio))))
+
+        def stop():
+            return pre.cancel.is_set() or pre.skip_render.is_set()
+
+        rendered = {}
+        try:
+            for name, src in pre.decoded.items():
+                if stop():
+                    raise _Cancelled()
+                rendered[name] = self._render_stem_file(
+                    src, filt, n_nominal, f"rendering {name}", should_stop=stop)
+        except BaseException:
+            self._remove_files(*[rp for rp, _i in rendered.values()])
+            raise
+        pre.owned.extend(rp for rp, _i in rendered.values())
+        pre.rendered, pre.render_tp, pre.n_render = rendered, pre.tempo_pitch, n_nominal
+
+    def _discard_preload_files(self, pre):
+        """Delete an unadopted preload's files (maps dropped first: Windows)."""
+        if pre is None:
+            return
+        paths, pre.owned = pre.owned, []
+        pre.decoded, pre.rendered = {}, None
+        gc.collect()
+        for p in paths:
+            if not self._try_unlink(p):
+                self._preload_leftovers.append(p)
+        self._retry_preload_leftovers(collect=False)
+
+    def _retry_preload_leftovers(self, collect=True):
+        if not self._preload_leftovers:
+            return
+        if collect:
+            gc.collect()
+        self._preload_leftovers = [p for p in self._preload_leftovers if not self._try_unlink(p)]
+
+    @staticmethod
+    def _try_unlink(path):
+        """Delete ``path``; True if it is gone (missing counts as gone)."""
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            logger.debug(f"Could not delete {path} yet ({e})")
+            return False
+
+    # =========================================================================
+    # DECODING HELPERS
+    # =========================================================================
 
     def _new_temp_path(self, suffix=".wav"):
         return os.path.join(self.temp_dir, f"{TEMP_FILE_PREFIX}{os.getpid()}_{uuid.uuid4().hex}{suffix}")
 
-    def _run_ffmpeg(self, args, out_path, what):
-        """Run ffmpeg; returns None if the binary is missing, raises on failure."""
+    def _run_ffmpeg(self, args, out_path, what, should_stop=None):
+        """
+        Run ffmpeg; returns None if the binary is missing, raises on failure.
+        ``should_stop()`` (optional) is polled while it runs: when it turns
+        true ffmpeg is killed, ``out_path`` deleted and _Cancelled raised.
+        """
         cmd = [self.ffmpeg_path, '-nostdin', '-v', 'error', '-y'] + args
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                  timeout=FFMPEG_DECODE_TIMEOUT_S, **_SUBPROCESS_FLAGS)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, **_SUBPROCESS_FLAGS)
         except FileNotFoundError:
             logger.error(f"ffmpeg not found at '{self.ffmpeg_path}'")
             self._remove_files(out_path)
             return None
-        except subprocess.TimeoutExpired:
-            self._remove_files(out_path)
-            raise RuntimeError(f"ffmpeg timed out after {FFMPEG_DECODE_TIMEOUT_S}s ({what})")
         except OSError as e:
             logger.error(f"ffmpeg could not be run: {e}")
             self._remove_files(out_path)
             return None
-        stderr = proc.stderr.decode('utf-8', errors='replace').strip()
+        deadline = time.monotonic() + FFMPEG_DECODE_TIMEOUT_S
+        while True:
+            left = deadline - time.monotonic()
+            wait = left if should_stop is None else min(left, _CANCEL_POLL_S)
+            try:
+                _out, err = proc.communicate(timeout=max(0.001, wait))
+                break
+            except subprocess.TimeoutExpired:
+                stop = should_stop is not None and should_stop()
+                if not stop and time.monotonic() < deadline:
+                    continue
+                self._kill(proc)
+                self._remove_files(out_path)
+                if stop:
+                    raise _Cancelled(what)
+                raise RuntimeError(f"ffmpeg timed out after {FFMPEG_DECODE_TIMEOUT_S}s ({what})")
+            except BaseException:
+                self._kill(proc)
+                self._remove_files(out_path)
+                raise
+        stderr = (err or b'').decode('utf-8', errors='replace').strip()
         if proc.returncode != 0:
             self._remove_files(out_path)
             logger.error(f"ffmpeg failed (rc={proc.returncode}) {what}:\n{stderr}")
@@ -739,44 +1241,94 @@ class AudioEngine:
             raise RuntimeError(f"ffmpeg produced no output ({what})")
         return out_path
 
-    def _decode(self, path):
-        """Decode ``path`` to a temp WAV; returns the WAV path."""
+    @staticmethod
+    def _kill(proc):
+        """Kill ffmpeg and reap it (its output file is closed afterwards,
+        which Windows needs before the file can be deleted)."""
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5.0)
+        except Exception:
+            pass
+
+    def _decode(self, path, should_stop=None, track=True):
+        """Decode ``path`` to a temp WAV; returns the WAV path. ``track``
+        adds it to this song's temp files (False: the caller owns it)."""
         out = self._new_temp_path(".wav")
         args = ['-i', path, '-vn', '-f', 'wav', '-acodec', 'pcm_s16le',
                 '-ar', str(self.SAMPLE_RATE), '-ac', str(CHANNELS), out]
-        result = self._run_ffmpeg(args, out, f"decoding {os.path.basename(path)}")
+        kw = {} if should_stop is None else {"should_stop": should_stop}
+        result = self._run_ffmpeg(args, out, f"decoding {os.path.basename(path)}", **kw)
         if result is not None:
-            self._temp_paths.append(result)
+            if track:
+                self._temp_paths.append(result)
             return result
         if self._is_native_pcm_wav(path):
             logger.warning("ffmpeg unavailable; using the source WAV directly")
             return path
         raise RuntimeError(f"ffmpeg is unavailable and {path!r} is not a native PCM WAV")
 
-    def _pad_wav(self, src_path, info, target_frames):
+    def _pad_wav(self, src_path, info, target_frames, track=True):
         """Copy a WAV, appending silence so it has ``target_frames`` frames."""
         out = self._new_temp_path(".wav")
         frame_bytes = info['channels'] * (info['bits_per_sample'] // 8)
-        with open(src_path, 'rb') as f, wave.open(out, 'wb') as wf:
-            wf.setnchannels(info['channels'])
-            wf.setsampwidth(info['bits_per_sample'] // 8)
-            wf.setframerate(info['sample_rate'])
-            f.seek(info['data_offset'])
-            remaining = info['frames'] * frame_bytes
-            while remaining > 0:
-                chunk = f.read(min(remaining, 1 << 20))
-                if not chunk:
-                    break
-                wf.writeframes(chunk)
-                remaining -= len(chunk)
-            pad = (target_frames - info['frames']) * frame_bytes
-            zeros = bytes(1 << 20)
-            while pad > 0:
-                n = min(pad, len(zeros))
-                wf.writeframes(zeros[:n])
-                pad -= n
-        self._temp_paths.append(out)
+        try:
+            with open(src_path, 'rb') as f, wave.open(out, 'wb') as wf:
+                wf.setnchannels(info['channels'])
+                wf.setsampwidth(info['bits_per_sample'] // 8)
+                wf.setframerate(info['sample_rate'])
+                f.seek(info['data_offset'])
+                remaining = info['frames'] * frame_bytes
+                while remaining > 0:
+                    chunk = f.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    wf.writeframes(chunk)
+                    remaining -= len(chunk)
+                pad = (target_frames - info['frames']) * frame_bytes
+                zeros = bytes(1 << 20)
+                while pad > 0:
+                    n = min(pad, len(zeros))
+                    wf.writeframes(zeros[:n])
+                    pad -= n
+        except BaseException:
+            self._remove_files(out)
+            raise
+        if track:
+            self._temp_paths.append(out)
         return out
+
+    def _render_stem_file(self, src_path, filt, n_nominal, what, should_stop=None):
+        """
+        Render one decoded WAV through ``filt`` into a temp WAV of at least
+        ``n_nominal`` frames (a short render is padded with silence BEFORE
+        anything maps it). Shared by set_tempo_pitch and preload so both
+        produce identical audio. Returns (path, info); the caller owns path.
+        """
+        out = self._new_temp_path(".wav")
+        args = ['-i', src_path, '-vn', '-af', filt, '-f', 'wav',
+                '-acodec', 'pcm_s16le', '-ar', str(self.SAMPLE_RATE),
+                '-ac', str(CHANNELS), out]
+        kw = {} if should_stop is None else {"should_stop": should_stop}
+        result = self._run_ffmpeg(args, out, what, **kw)
+        if result is None:
+            raise RuntimeError(f"ffmpeg not found at '{self.ffmpeg_path}'")
+        try:
+            info = parse_wav_data_chunk(out)
+            if 0 < info['frames'] < n_nominal:
+                short = out
+                out = self._pad_wav(short, info, n_nominal, track=False)
+                self._remove_files(short)
+                info = parse_wav_data_chunk(out)
+            if info['frames'] <= 0:
+                raise RuntimeError("render produced empty audio")
+        except BaseException:
+            self._remove_files(out)
+            raise
+        return out, info
 
     @staticmethod
     def _remove_files(*paths):
@@ -842,9 +1394,11 @@ class AudioEngine:
                                    "it will be swept on next start")
 
     def cleanup(self):
-        """Stop playback, release audio, delete temp files and close the stream."""
+        """Stop playback, release audio, cancel the preload, delete temp
+        files and close the stream."""
         logger.info("Cleaning up AudioEngine resources...")
         self.stop()
+        self.cancel_preload()
         self._release_audio()
         self._close_stream()
 
@@ -855,11 +1409,14 @@ class AudioEngine:
                 return
             self._closed = True
             self.cleanup()
+            self._prefetch_stop.set()
+            self.core.shutdown()
             self.core.events.put(_STOP_EVENTS)
             self._callbacks.clear()
-        for thread in (self._render_thread, self._event_thread):
+        for thread in (self._render_thread, self._event_thread, self._prefetch_thread):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
+        self._retry_preload_leftovers()
 
     def sweep_stale_temp_files(self):
         return sweep_stale_temp_files(self.temp_dir, keep_pid=os.getpid())
@@ -948,34 +1505,43 @@ class AudioEngine:
         new_paths = []
         try:
             buffers = {}
-            for name, src in list(self._stem_sources.items()):
-                semi = 0.0 if is_click_stem(name) else semitones
-                filt = build_tempo_pitch_filter(tempo_ratio, semi, self.SAMPLE_RATE)
+            # Every stem (the click included) goes through the SAME filter
+            # chain: asetrate/aresample/atempo have their own rounding and
+            # latency, so a click rendered with atempo alone could drift
+            # against the music. A slightly pitched click is the price.
+            filt = build_tempo_pitch_filter(tempo_ratio, semitones, self.SAMPLE_RATE)
+            sources = list(self._stem_sources.items())
+            n_src = min(len(src["data"]) for _name, src in sources)
+            # Nominal length of the render: the core maps positions linearly
+            # (source frames / active frames), so every stem gets exactly
+            # this many frames (trimmed, or padded with silence).
+            n_nominal = max(1, int(round(n_src / float(tempo_ratio))))
+            for name, src in sources:
                 if filt is None:
                     buffers[name] = src["data"]
                     continue
-                out = self._new_temp_path(".wav")
-                args = ['-i', src["path"], '-vn', '-af', filt, '-f', 'wav',
-                        '-acodec', 'pcm_s16le', '-ar', str(self.SAMPLE_RATE),
-                        '-ac', str(CHANNELS), out]
-                result = self._run_ffmpeg(args, out, f"rendering {name}")
-                if result is None:
-                    raise RuntimeError(f"ffmpeg not found at '{self.ffmpeg_path}'")
+                out, info = self._render_stem_file(src["path"], filt, n_nominal,
+                                                   f"rendering {name}")
                 if gen != self._render_gen:
-                    self._remove_files(out)
+                    buffers = None
+                    gc.collect()
+                    self._remove_files(out, *new_paths)
                     return
                 new_paths.append(out)
-                buffers[name] = self._map_wav(out)
-            # ffmpeg's resampler may round lengths differently per stem
+                buffers[name] = self._map_wav(out, info)[:n_nominal]
             n = min(len(b) for b in buffers.values())
             if n <= 0:
                 raise RuntimeError("render produced empty audio")
             buffers = {k: (b if len(b) == n else b[:n]) for k, b in buffers.items()}
             if gen != self._render_gen:
+                buffers = None
+                gc.collect()
                 self._remove_files(*new_paths)
                 return
             with self._render_lock:
                 if gen != self._render_gen or self._closed:
+                    buffers = None
+                    gc.collect()
                     self._remove_files(*new_paths)
                     return
                 self.core.swap_buffers(buffers, tempo_ratio, semitones)
@@ -983,6 +1549,8 @@ class AudioEngine:
                 self._apply_swap_if_no_stream()
         except Exception as e:
             logger.error(f"Tempo/pitch render failed: {e}")
+            buffers = None
+            gc.collect()    # drop maps of the failed render before removal (Windows)
             self._remove_files(*new_paths)
             if gen == self._render_gen:
                 self._emit("render_failed", message=str(e))

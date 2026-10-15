@@ -23,7 +23,9 @@ from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
+    COLOR_HOVER, COLOR_VAMP, tint,
     COLOR_BTN_DANGER, COLOR_BTN_SUCCESS,
     COLOR_TEXT, COLOR_TEXT_DIM, COLOR_BG_LIGHT, COLOR_BG_MEDIUM,
     COLOR_MARKER, COLOR_LOOP_REGION,
@@ -46,6 +48,7 @@ GO_ACTION_LABELS = {
     "play": "PLAY",
     "release_hold": "RELEASE",
     "exit_vamp": "EXIT VAMP",
+    "next_song": "NEXT SONG",
     "none": "—",
 }
 
@@ -141,6 +144,13 @@ class CueSheetPanel(ctk.CTkFrame):
         self._go_log_entries = []
         self._item_widgets = []
         self._item_metadata = []  # (item_type, data, ref_id) per row
+        # Rows are kept between updates: row key -> (widget, signature).
+        # Only rows whose content changed are rebuilt (see _rebuild_list).
+        self._rows_by_key = {}
+        self._row_order = []      # row keys in packed order
+        # Display names of the mapped keys (app.apply_key_map)
+        self._key_hints = {"add_marker": "M", "prev_cue": "[", "next_cue": "]",
+                           "add_hold": "H"}
         self._current_position = 0.0
         self._last_current_items = set()
 
@@ -164,21 +174,21 @@ class CueSheetPanel(ctk.CTkFrame):
         # Nav buttons
         self.btn_prev = ctk.CTkButton(
             toolbar, text="⏮", width=30, height=24,
-            fg_color=COLOR_BG_LIGHT,
+            fg_color=COLOR_BG_LIGHT, hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
             command=self._on_prev
         )
         self.btn_prev.pack(side="left", padx=(0, 3))
-        ToolTip(self.btn_prev, "Jump to previous cue, hold or vamp  ( [ )")
+        self._tip_prev = ToolTip(self.btn_prev, "Jump to previous cue, hold or vamp  ( [ )")
         
         self.btn_next = ctk.CTkButton(
             toolbar, text="⏭", width=30, height=24,
-            fg_color=COLOR_BG_LIGHT,
+            fg_color=COLOR_BG_LIGHT, hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
             command=self._on_next
         )
         self.btn_next.pack(side="left", padx=(0, 10))
-        ToolTip(self.btn_next, "Jump to next cue, hold or vamp  ( ] )")
+        self._tip_next = ToolTip(self.btn_next, "Jump to next cue, hold or vamp  ( ] )")
 
         # Editing tools live in their own frame so live mode can hide them
         # in one go (and restore them in the same place).
@@ -187,43 +197,47 @@ class CueSheetPanel(ctk.CTkFrame):
 
         # Add Cue button
         self.btn_add_cue = ctk.CTkButton(
-            self._edit_tools, text="+ 📍 Cue", width=80, height=24,
-            font=("Segoe UI", 10, "bold"),
-            fg_color=COLOR_MARKER,
-            text_color="#000000",
-            hover_color="#cccc22",
+            self._edit_tools, text="+ Cue", width=80, height=24,
+            font=(FONT_UI, 10, "bold"),
+            # Tinted, not filled: colour-coded like the waveform markers
+            # without three loud blocks competing with the transport
+            fg_color=tint(COLOR_MARKER, 0.16),
+            text_color=COLOR_MARKER,
+            hover_color=tint(COLOR_MARKER, 0.30),
             command=self._on_add_cue
         )
         self.btn_add_cue.pack(side="left", padx=(0, 5))
-        ToolTip(self.btn_add_cue, "Add a cue marker at the current playhead position  (M)")
+        self._tip_add_cue = ToolTip(self.btn_add_cue, "Add a cue marker at the current playhead position  (M)")
 
         # Add Hold button
         self.btn_add_hold = ctk.CTkButton(
-            self._edit_tools, text="+ ⏸ Hold", width=80, height=24,
-            font=("Segoe UI", 10, "bold"),
-            fg_color=COLOR_HOLD,
-            text_color="#000000",
-            hover_color="#8fdaf7",
+            self._edit_tools, text="+ Hold", width=80, height=24,
+            font=(FONT_UI, 10, "bold"),
+            fg_color=tint(COLOR_HOLD, 0.16),
+            text_color=COLOR_HOLD,
+            hover_color=tint(COLOR_HOLD, 0.30),
             command=self._on_add_hold
         )
         self.btn_add_hold.pack(side="left", padx=(0, 5))
-        ToolTip(self.btn_add_hold, "Add a hold at the playhead: playback parks there until GO")
+        self._tip_add_hold = ToolTip(self.btn_add_hold,
+                                     "Add a hold at the playhead: playback parks there until GO  (H)")
                 
         # Add Vamp dropdown menu
-        self.vamp_menu_var = tk.StringVar(value="+ 🔁 Vamp")
+        self.vamp_menu_var = tk.StringVar(value="+ Vamp")
         self.btn_add_vamp = ctk.CTkOptionMenu(
             self._edit_tools,
             values=["Manual Entry", "Auto-Detect"],
             width=100,
             height=24,
-            font=("Segoe UI", 10, "bold"),
+            font=(FONT_UI, 10, "bold"),
             command=self._on_add_vamp_selection,
-            fg_color="#336633",
-            button_color="#336633",
-            text_color="#ffffff",
-            dropdown_fg_color="#336633",
-            dropdown_text_color="#ffffff",
-            dropdown_hover_color="#448844",
+            fg_color=tint(COLOR_VAMP, 0.16),
+            button_color=tint(COLOR_VAMP, 0.16),
+            button_hover_color=tint(COLOR_VAMP, 0.30),
+            text_color=COLOR_VAMP,
+            dropdown_fg_color=COLOR_BG_LIGHT,
+            dropdown_text_color=COLOR_TEXT,
+            dropdown_hover_color=COLOR_HOVER,
             variable=self.vamp_menu_var
         )
         self.btn_add_vamp.pack(side="left")
@@ -232,12 +246,12 @@ class CueSheetPanel(ctk.CTkFrame):
         # Hint text (edit mode) / lock note (live mode) share the right edge
         self._hint_label = ctk.CTkLabel(
             toolbar, text="M = add cue at playhead",
-            font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM
+            font=(FONT_UI, 9), text_color=COLOR_TEXT_DIM
         )
         self._hint_label.pack(side="right", padx=5)
         self._live_label = ctk.CTkLabel(
-            toolbar, text="🔒 LIVE — editing locked",
-            font=("Segoe UI", 10, "bold"), text_color=COLOR_LIVE
+            toolbar, text="LIVE · editing locked",
+            font=(FONT_UI, 10, "bold"), text_color=COLOR_LIVE
         )
                 
         # Scrollable list
@@ -250,6 +264,20 @@ class CueSheetPanel(ctk.CTkFrame):
 
         # GO log footer (collapsed by default)
         self._create_go_log_footer()
+
+    def set_key_hints(self, hints):
+        """Show the currently mapped keys (action -> display text) in hints."""
+        self._key_hints.update({a: str(t) for a, t in (hints or {}).items()})
+        k = self._key_hints
+        self._tip_prev.text = f"Jump to previous cue, hold or vamp  ( {k.get('prev_cue', '—')} )"
+        self._tip_next.text = f"Jump to next cue, hold or vamp  ( {k.get('next_cue', '—')} )"
+        self._tip_add_cue.text = ("Add a cue marker at the current playhead position  "
+                                  f"({k.get('add_marker', '—')})")
+        self._tip_add_hold.text = ("Add a hold at the playhead: playback parks there until GO  "
+                                   f"({k.get('add_hold', '—')})")
+        self._hint_label.configure(text=f"{k.get('add_marker', '—')} = add cue at playhead")
+        if not self._build_items():
+            self._request_rebuild()     # the empty-state text names the key
 
     def update_data(self, markers, loops, selected_loop_index, skips=None, holds=None):
         """
@@ -311,7 +339,7 @@ class CueSheetPanel(ctk.CTkFrame):
 
         self._go_header = ctk.CTkButton(
             self._go_footer, text="", anchor="w", height=20,
-            font=("Segoe UI", 9, "bold"),
+            font=(FONT_UI, 9, "bold"),
             fg_color="transparent", hover_color=COLOR_BG_LIGHT,
             text_color=COLOR_TEXT_DIM,
             command=self._toggle_go_log
@@ -354,21 +382,21 @@ class CueSheetPanel(ctk.CTkFrame):
             w.destroy()
         if not recent:
             ctk.CTkLabel(self._go_body, text="No GO presses yet.", height=18,
-                         font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM
+                         font=(FONT_UI, 9), text_color=COLOR_TEXT_DIM
                          ).pack(anchor="w", padx=8, pady=2)
         for entry in recent:
             clock, action, label = format_go_entry(entry)
             row = ctk.CTkFrame(self._go_body, fg_color="transparent")
             row.pack(fill="x", padx=6)
-            ctk.CTkLabel(row, text=clock, font=("Consolas", 9), height=16,
+            ctk.CTkLabel(row, text=clock, font=(FONT_MONO, 9), height=16,
                          text_color=COLOR_TEXT_DIM, width=60, anchor="w").pack(side="left")
-            ctk.CTkLabel(row, text=action, font=("Segoe UI", 9, "bold"), height=16,
+            ctk.CTkLabel(row, text=action, font=(FONT_UI, 9, "bold"), height=16,
                          text_color=COLOR_BTN_SUCCESS, width=72, anchor="w").pack(side="left")
             source = str(entry.get("source") or "")
-            ctk.CTkLabel(row, text=label, font=("Segoe UI", 9), height=16,
+            ctk.CTkLabel(row, text=label, font=(FONT_UI, 9), height=16,
                          text_color=COLOR_TEXT, anchor="w").pack(side="left")
             if source:
-                ctk.CTkLabel(row, text=f"({source})", font=("Segoe UI", 8), height=16,
+                ctk.CTkLabel(row, text=f"({source})", font=(FONT_UI, 8), height=16,
                              text_color=COLOR_TEXT_DIM, anchor="w").pack(side="left", padx=6)
         self._refresh_go_header()
 
@@ -457,7 +485,7 @@ class CueSheetPanel(ctk.CTkFrame):
         # Ideally, we would use a theme variable for the bg, but for now 
         # we will use a semi-transparent version logic or a hardcoded dark overlay 
         # to ensure readability against the text color.
-        bg = "#331111" if skip.active else "transparent"
+        bg = tint(COLOR_BTN_DANGER, 0.15) if skip.active else "transparent"
         
         border = COLOR_SKIP_REGION if is_current else None
         
@@ -470,25 +498,25 @@ class CueSheetPanel(ctk.CTkFrame):
         
         # Time
         time_text = f"{self._format_time(skip.start)} → {self._format_time(skip.end)}"
-        ctk.CTkLabel(row, text=time_text, font=("Consolas", 10), 
+        ctk.CTkLabel(row, text=time_text, font=(FONT_MONO, 10), 
                      text_color=COLOR_SKIP_CANDIDATE, width=130).pack(side="left")
                      
         # Name
-        name_lbl = ctk.CTkLabel(row, text=skip.name, font=("Segoe UI", 11, "italic"),
+        name_lbl = ctk.CTkLabel(row, text=skip.name, font=(FONT_UI, 11, "italic"),
                                 text_color=COLOR_SKIP_CANDIDATE if skip.active else COLOR_TEXT_DIM)
         name_lbl.pack(side="left", padx=10, fill="x", expand=True)
         
         if self._live_mode:
             # Locked: show the state, no toggle / delete.
             ctk.CTkLabel(row, text="ON" if skip.active else "OFF", width=40,
-                         font=("Segoe UI", 9, "bold"),
+                         font=(FONT_UI, 9, "bold"),
                          text_color=COLOR_SKIP_CANDIDATE if skip.active else COLOR_TEXT_DIM
                          ).pack(side="right", padx=5)
             return row
 
         # Delete (rightmost, consistent with cue and vamp rows)
         btn_del_s = ctk.CTkButton(row, text="✕", width=25, height=20, fg_color="transparent",
-                      hover_color="#441111", text_color=COLOR_BTN_DANGER,
+                      hover_color=tint(COLOR_BTN_DANGER, 0.3), text_color=COLOR_BTN_DANGER,
                       command=lambda s=skip.id: self.on_delete_skip(s) if self.on_delete_skip else None
                       )
         btn_del_s.pack(side="right", padx=2)
@@ -557,52 +585,134 @@ class CueSheetPanel(ctk.CTkFrame):
         
         return highlighted
 
-    def _rebuild_list(self):
-        """Rebuild the item list, sorted by time."""
-        # Clear existing widgets
-        for w in self._item_widgets:
-            w.destroy()
-        self._item_widgets.clear()
-        self._item_metadata = []  # Track (item_type, data, ref_id) per row
+    def _row_identity(self, item_type, data, ref_id, is_current):
+        """(key, signature) of a row: the key follows the item across
+        updates, the signature is everything the row displays."""
+        live = self._live_mode
+        if item_type == 'marker':
+            return ('marker', data.id), (data.time, data.name, is_current, live)
+        if item_type == 'vamp':
+            is_selected = (ref_id == self._selected_loop_index)
+            return ('vamp', getattr(data, 'id', ref_id)), (
+                data.start, data.end, data.name, getattr(data, 'repeat_count', None),
+                ref_id, is_selected, is_current, live)
+        if item_type == 'hold':
+            return ('hold', data.id), (data.time, data.name, is_current, live)
+        return ('skip', data.id), (data.start, data.end, data.name,
+                                   bool(getattr(data, 'active', True)), is_current, live)
 
+    def _create_row(self, item_type, data, ref_id, is_current):
+        if item_type == 'marker':
+            return self._create_marker_row(data, is_current)
+        if item_type == 'vamp':
+            is_selected = (ref_id == self._selected_loop_index)
+            return self._create_vamp_row(data, ref_id, is_selected, is_current)
+        if item_type == 'hold':
+            return self._create_hold_row(data, is_current)
+        if item_type == 'skip':
+            return self._create_skip_row(data, is_current)
+        return None
+
+    @staticmethod
+    def _destroy_row(widget):
+        try:
+            widget.destroy()
+        except tk.TclError:
+            pass
+
+    def _rebuild_list(self):
+        """
+        Bring the rows in line with the data, sorted by time.
+
+        Rows are updated in place, keyed by item id: unchanged rows are kept,
+        only added / changed rows are created and removed ones destroyed,
+        and the rows are re-packed only when the order changed. (Rebuilding
+        every row took ~0.5 s for 180 items on the Tk thread, delaying GO.)
+        """
         # Unified list of (sort_time, type, data, ref_id)
         items = self._build_items()
+        old_rows = self._rows_by_key
+        new_rows = {}
+        order = []
+        widgets = []
+        metadata = []
 
         if not items:
-            lbl = ctk.CTkLabel(
-                self.item_list,
-                text=("No cues, holds, vamps, or cuts yet." if self._live_mode else
-                      "No cues, holds, vamps, or cuts yet. Press M to add a cue point, "
-                      "or use + buttons above."),
-                text_color=COLOR_TEXT_DIM, font=("Segoe UI", 10),
-                wraplength=400
-            )
-            lbl.pack(pady=8)
-            self._item_widgets.append(lbl)
+            text = ("No cues, holds, vamps, or cuts yet." if self._live_mode else
+                    "No cues, holds, vamps, or cuts yet. Press "
+                    f"{self._key_hints.get('add_marker', 'M')} to add a cue point, "
+                    "or use + buttons above.")
+            entry = old_rows.pop(('empty',), None)
+            if entry is not None and entry[1] == text and entry[0].winfo_exists():
+                lbl = entry[0]
+            else:
+                if entry is not None:
+                    self._destroy_row(entry[0])
+                lbl = ctk.CTkLabel(
+                    self.item_list, text=text,
+                    text_color=COLOR_TEXT_DIM, font=(FONT_UI, 10),
+                    wraplength=400
+                )
+                lbl.pack(pady=8)
+            for widget, _sig in old_rows.values():
+                self._destroy_row(widget)
+            self._rows_by_key = {('empty',): (lbl, text)}
+            self._row_order = [('empty',)]
+            self._item_widgets = [lbl]
+            self._item_metadata = []
+            self._last_current_items = set()
             return
 
         # Get current items for highlighting (set of indices)
         current_items = self._get_current_item_index()
         self._last_current_items = current_items
 
+        created = []
         for idx, (sort_time, item_type, data, ref_id) in enumerate(items):
             # Check if this item should be highlighted
             is_current = idx in current_items
-            
-            if item_type == 'marker':
-                row = self._create_marker_row(data, is_current)
-            elif item_type == 'vamp':
-                is_selected = (ref_id == self._selected_loop_index)
-                row = self._create_vamp_row(data, ref_id, is_selected, is_current)
-            elif item_type == 'hold':
-                row = self._create_hold_row(data, is_current)
-            elif item_type == 'skip':
-                row = self._create_skip_row(data, is_current)
-            else:
-                continue
-                        
-            self._item_widgets.append(row)
-            self._item_metadata.append((item_type, data, ref_id))
+            key, sig = self._row_identity(item_type, data, ref_id, is_current)
+            if key in new_rows:
+                key = key + (idx,)      # duplicate id (should not happen)
+            entry = old_rows.pop(key, None)
+            row = None
+            if entry is not None:
+                if entry[1] == sig:
+                    try:
+                        if entry[0].winfo_exists():
+                            row = entry[0]
+                    except tk.TclError:
+                        row = None
+                if row is None:
+                    self._destroy_row(entry[0])
+            if row is None:
+                row = self._create_row(item_type, data, ref_id, is_current)
+                if row is None:
+                    continue
+                created.append(key)
+            new_rows[key] = (row, sig)
+            order.append(key)
+            widgets.append(row)
+            metadata.append((item_type, data, ref_id))
+
+        # Rows of items that are gone
+        for widget, _sig in old_rows.values():
+            self._destroy_row(widget)
+
+        # New rows were packed at the end; re-pack only if that is not the
+        # time order (an item was inserted or moved).
+        kept = set(order) - set(created)
+        packed = [k for k in self._row_order if k in kept] + created
+        if packed != order:
+            for row in widgets:
+                row.pack_forget()
+            for row in widgets:
+                row.pack(fill="x", pady=1)
+
+        self._rows_by_key = new_rows
+        self._row_order = order
+        self._item_widgets = widgets
+        self._item_metadata = metadata
 
     _format_time = staticmethod(format_time)
 
@@ -624,15 +734,15 @@ class CueSheetPanel(ctk.CTkFrame):
         
         # Type icon
         ctk.CTkLabel(
-            row, text="📍", width=24,
-            font=("Segoe UI", 12)
+            row, text="◆", width=24,
+            font=(FONT_UI, 12)
         ).pack(side="left", padx=(4, 2))
 
         # Time - brighter if current
         time_color = "#ffff00" if is_current else COLOR_MARKER
         ctk.CTkLabel(
             row, text=self._format_time(marker.time),
-            font=("Consolas", 10),
+            font=(FONT_MONO, 10),
             text_color=time_color,
             width=55
         ).pack(side="left", padx=(0, 6))
@@ -641,7 +751,7 @@ class CueSheetPanel(ctk.CTkFrame):
         if is_current:
             ctk.CTkLabel(
                 row, text="▶",
-                font=("Segoe UI", 10),
+                font=(FONT_UI, 10),
                 text_color="#ffff00",
                 width=16
             ).pack(side="left", padx=(0, 4))
@@ -652,7 +762,7 @@ class CueSheetPanel(ctk.CTkFrame):
             text=marker.name,
             anchor="w",
             height=22,
-            font=("Segoe UI", 11, "bold" if is_current else "normal"),
+            font=(FONT_UI, 11, "bold" if is_current else "normal"),
             fg_color="transparent",
             hover_color=COLOR_BG_LIGHT,
             text_color="#ffffff" if is_current else COLOR_TEXT,
@@ -667,7 +777,7 @@ class CueSheetPanel(ctk.CTkFrame):
         # rightmost control on every row type (cues, vamps, cuts).
         btn_del_m = ctk.CTkButton(
             row, text="✕", width=24, height=20,
-            fg_color="transparent", hover_color="#442222",
+            fg_color="transparent", hover_color=tint(COLOR_BTN_DANGER, 0.3),
             text_color="#aa4444",
             command=lambda mid=marker.id: self._on_delete_marker(mid)
         )
@@ -716,8 +826,8 @@ class CueSheetPanel(ctk.CTkFrame):
 
         # Type icon
         ctk.CTkLabel(
-            row, text="📍", width=24,
-            font=("Segoe UI", 12)
+            row, text="◆", width=24,
+            font=(FONT_UI, 12)
         ).pack(side="left", padx=(4, 2))
         
         # Time range
@@ -726,7 +836,7 @@ class CueSheetPanel(ctk.CTkFrame):
         
         ctk.CTkLabel(
             row, text=time_text,
-            font=("Consolas", 10),
+            font=(FONT_MONO, 10),
             text_color="#66bb6a" if is_selected else "#558855",
             width=130
         ).pack(side="left", padx=(0, 4))
@@ -734,7 +844,7 @@ class CueSheetPanel(ctk.CTkFrame):
         # Duration badge
         ctk.CTkLabel(
             row, text=f"({duration:.1f}s)",
-            font=("Consolas", 9),
+            font=(FONT_MONO, 9),
             text_color=COLOR_TEXT_DIM,
             width=45
         ).pack(side="left", padx=(0, 4))
@@ -744,8 +854,8 @@ class CueSheetPanel(ctk.CTkFrame):
         counted = badge != "∞"
         badge_lbl = ctk.CTkLabel(
             row, text=badge, width=30, height=18,
-            font=("Segoe UI", 10, "bold"),
-            fg_color="#264026" if counted else "#2e2e2e",
+            font=(FONT_UI, 10, "bold"),
+            fg_color=tint(COLOR_VAMP, 0.2) if counted else COLOR_BG_LIGHT,
             corner_radius=8,
             text_color="#aaffaa" if counted else COLOR_TEXT_DIM,
         )
@@ -757,13 +867,13 @@ class CueSheetPanel(ctk.CTkFrame):
         # ● = selected for editing, ⬤ = both. (Kept away from the action
         # buttons so it is not mistaken for a second Play button.)
         if is_selected and is_current:
-            ctk.CTkLabel(row, text="⬤", font=("Segoe UI", 10),
+            ctk.CTkLabel(row, text="⬤", font=(FONT_UI, 10),
                          text_color="#66ff66", width=16).pack(side="left", padx=(0, 4))
         elif is_current:
-            ctk.CTkLabel(row, text="▶", font=("Segoe UI", 10),
+            ctk.CTkLabel(row, text="▶", font=(FONT_UI, 10),
                          text_color="#ffff00", width=16).pack(side="left", padx=(0, 4))
         elif is_selected:
-            ctk.CTkLabel(row, text="●", font=("Segoe UI", 10),
+            ctk.CTkLabel(row, text="●", font=(FONT_UI, 10),
                          text_color="#66bb6a", width=16).pack(side="left", padx=(0, 4))
 
         # Name (clickable to select this vamp)
@@ -773,7 +883,7 @@ class CueSheetPanel(ctk.CTkFrame):
             text=loop.name,
             anchor="w",
             height=22,
-            font=("Segoe UI", 11, "bold" if is_selected else "normal"),
+            font=(FONT_UI, 11, "bold" if is_selected else "normal"),
             fg_color="transparent",
             hover_color=COLOR_BG_LIGHT,
             text_color=name_color,
@@ -790,7 +900,7 @@ class CueSheetPanel(ctk.CTkFrame):
         btn_del = ctk.CTkButton(
             row, text="✕", width=28, height=22,
             fg_color="transparent",
-            hover_color="#442222",
+            hover_color=tint(COLOR_BTN_DANGER, 0.3),
             text_color="#aa4444",
             command=lambda idx=loop_idx: self._on_delete_vamp_row(idx)
         )
@@ -812,7 +922,7 @@ class CueSheetPanel(ctk.CTkFrame):
         btn_set = ctk.CTkButton(
             row, text="⚙️", width=28, height=22,
             fg_color=COLOR_BG_LIGHT,
-            hover_color="#555555",
+            hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
             command=lambda idx=loop_idx: self._on_open_settings_row(idx)
         )
@@ -849,31 +959,31 @@ class CueSheetPanel(ctk.CTkFrame):
 
         ctk.CTkLabel(
             row, text="⏸", width=24,
-            font=("Segoe UI", 12, "bold"), text_color=COLOR_HOLD
+            font=(FONT_UI, 12, "bold"), text_color=COLOR_HOLD
         ).pack(side="left", padx=(4, 2))
 
         ctk.CTkLabel(
             row, text=self._format_time(hold.time),
-            font=("Consolas", 10),
+            font=(FONT_MONO, 10),
             text_color="#bfeaff" if is_current else COLOR_HOLD,
             width=55
         ).pack(side="left", padx=(0, 6))
 
         ctk.CTkLabel(
             row, text="HOLD", width=40, height=18,
-            font=("Segoe UI", 9, "bold"),
-            fg_color="#1d3a4a", corner_radius=8, text_color=COLOR_HOLD
+            font=(FONT_UI, 9, "bold"),
+            fg_color=tint(COLOR_HOLD, 0.15), corner_radius=8, text_color=COLOR_HOLD
         ).pack(side="left", padx=(0, 6))
 
         if is_current:
             ctk.CTkLabel(
-                row, text="▶", font=("Segoe UI", 10),
+                row, text="▶", font=(FONT_UI, 10),
                 text_color=COLOR_HOLD, width=16
             ).pack(side="left", padx=(0, 4))
 
         name_btn = ctk.CTkButton(
             row, text=hold.name, anchor="w", height=22,
-            font=("Segoe UI", 11, "bold" if is_current else "normal"),
+            font=(FONT_UI, 11, "bold" if is_current else "normal"),
             fg_color="transparent", hover_color=COLOR_BG_LIGHT,
             text_color="#ffffff" if is_current else COLOR_TEXT,
             command=lambda hid=hold.id: self._on_jump_hold(hid)
@@ -886,7 +996,7 @@ class CueSheetPanel(ctk.CTkFrame):
 
         btn_del = ctk.CTkButton(
             row, text="✕", width=24, height=20,
-            fg_color="transparent", hover_color="#442222",
+            fg_color="transparent", hover_color=tint(COLOR_BTN_DANGER, 0.3),
             text_color="#aa4444",
             command=lambda hid=hold.id: self._on_delete_hold(hid)
         )
@@ -916,15 +1026,19 @@ class CueSheetPanel(ctk.CTkFrame):
         if self.on_jump_to_marker:
             self.on_jump_to_marker(marker_id)
     
-    def _ask_name(self, text, title):
+    def _ask_name(self, text, title, initial=""):
         """
         Show a modal name prompt. Row rebuilds are held off while it is open
         (the Tk loop keeps running underneath a modal dialog) and applied
         once it closes. Returns the stripped name, or None.
+
+        The prompt (widgets.NamePrompt) forwards GO / play-pause / stop to
+        the app when focus is not in its entry, unlike CTkInputDialog.
         """
+        from .widgets import NamePrompt
         self._rename_open = True
         try:
-            dialog = ctk.CTkInputDialog(text=text, title=title)
+            dialog = NamePrompt(self.winfo_toplevel(), title, text, initial=initial or "")
             new_name = dialog.get_input()
         finally:
             self._rename_open = False
@@ -935,7 +1049,7 @@ class CueSheetPanel(ctk.CTkFrame):
         return None
 
     def _on_rename_marker(self, marker_id, current_name):
-        new_name = self._ask_name("Rename cue point:", "Rename Cue")
+        new_name = self._ask_name("Rename cue point:", "Rename Cue", current_name)
         if new_name and self.on_rename_marker:
             self.on_rename_marker(marker_id, new_name)
     
@@ -956,7 +1070,9 @@ class CueSheetPanel(ctk.CTkFrame):
             self.on_jump_hold(hold_id)
 
     def _on_rename_hold(self, hold_id):
-        new_name = self._ask_name("Rename hold:", "Rename Hold")
+        hold = next((h for h in self._holds if h.id == hold_id), None)
+        new_name = self._ask_name("Rename hold:", "Rename Hold",
+                                  getattr(hold, "name", "") if hold else "")
         if new_name and self.on_rename_hold:
             self.on_rename_hold(hold_id, new_name)
 
@@ -981,6 +1097,10 @@ class CueSheetPanel(ctk.CTkFrame):
         
     def _on_prev(self):
         """Jump to previous item (cue, hold or vamp) in timeline."""
+        if self._live_mode and self.on_jump_prev_marker:
+            # Live: same as the prev-cue key (allowed); free jumps are locked
+            self.on_jump_prev_marker()
+            return
         for t, kind, ref in reversed(self._nav_items()):
             if t < self._current_position - 0.5:  # Must be at least 0.5s back
                 self._jump_to_nav_item(kind, ref)
@@ -988,6 +1108,9 @@ class CueSheetPanel(ctk.CTkFrame):
 
     def _on_next(self):
         """Jump to next item (cue, hold or vamp) in timeline."""
+        if self._live_mode and self.on_jump_next_marker:
+            self.on_jump_next_marker()
+            return
         for t, kind, ref in self._nav_items():
             if t > self._current_position + 0.1:  # Small buffer
                 self._jump_to_nav_item(kind, ref)
@@ -1002,7 +1125,7 @@ class CueSheetPanel(ctk.CTkFrame):
         if self.on_add_vamp:
             self.on_add_vamp(choice)
         # Reset dropdown to default text
-        self.vamp_menu_var.set("+ 🔁 Vamp")
+        self.vamp_menu_var.set("+ Vamp")
     
     def _on_select_vamp_row(self, loop_idx):
         """Select a vamp (clicking on name)."""
@@ -1021,7 +1144,9 @@ class CueSheetPanel(ctk.CTkFrame):
     
     def _on_rename_vamp_row(self, loop_id):
         """Rename a vamp (clicking ✏ button)."""
-        new_name = self._ask_name("Rename vamp:", "Rename Vamp")
+        loop = next((l for l in self._loops if l.id == loop_id), None)
+        new_name = self._ask_name("Rename vamp:", "Rename Vamp",
+                                  getattr(loop, "name", "") if loop else "")
         if not new_name or not self.on_rename_vamp:
             return
         # The list may have changed while the dialog was open, so resolve

@@ -13,13 +13,9 @@ import sys
 import tkinter as tk
 
 
-# Cross-platform font: Segoe UI (Windows), SF Pro (macOS), sans-serif (Linux)
-if sys.platform == "darwin":
-    _TIP_FONT = ("SF Pro Text", 11)
-elif sys.platform == "win32":
-    _TIP_FONT = ("Segoe UI", 10)
-else:
-    _TIP_FONT = ("Sans", 10)
+from utils.fonts import FONT_UI
+
+_TIP_FONT = (FONT_UI, 11 if sys.platform == "darwin" else 10)
 
 
 class ToolTip:

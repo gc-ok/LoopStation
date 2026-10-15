@@ -16,12 +16,14 @@ Sections:
 """
 
 import logging
+import math
 import time
 from typing import Callable, Dict, List, Optional
 
 import tkinter as tk
 import customtkinter as ctk
 
+from utils.fonts import FONT_UI, FONT_MONO
 from config import (
     COLOR_BG_DARK, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BTN_PRIMARY, COLOR_BTN_SUCCESS, COLOR_BTN_WARNING, COLOR_BTN_DANGER,
@@ -43,6 +45,12 @@ ROUTING_BY_LABEL = {v: k for k, v in ROUTING_LABELS.items()}
 DEFAULT_DEVICE = "System default"
 
 
+def sanitize_osc_cue(value) -> str:
+    """OSC cue text without characters an OSC address part cannot hold."""
+    from backend.osc_output import sanitize_osc_cue as backend_sanitize
+    return backend_sanitize(value)
+
+
 def tap_bpm(taps: List[float]) -> Optional[float]:
     """BPM from tap timestamps (seconds): mean interval of the last taps."""
     if len(taps) < 2:
@@ -62,6 +70,9 @@ class SongSettingsDialog(ModalDialog):
         # Non-modal: GO and the transport must stay usable while it is open
         super().__init__(parent, f"Song Settings: {song}", on_close=on_close, modal=False)
         self.app_state = state_manager
+        # The song this dialog edits; every save refuses once another song
+        # is loaded (the app also closes the dialog on a song change).
+        self._song_path = getattr(state_manager, "current_song_path", None)
         self._rendering = False
         self._live = bool(getattr(state_manager, "live_mode", False))
         self._taps: List[float] = []
@@ -79,7 +90,7 @@ class SongSettingsDialog(ModalDialog):
         self._build_stems(settings)
         self._build_osc(settings)
 
-        self.lbl_status = ctk.CTkLabel(self.actions, text="", font=("Segoe UI", 11),
+        self.lbl_status = ctk.CTkLabel(self.actions, text="", font=(FONT_UI, 11),
                                        text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(self.actions, text="Close", width=100, height=36,
@@ -88,6 +99,18 @@ class SongSettingsDialog(ModalDialog):
 
         self.set_live_mode(self._live)
         self.finish_layout()
+
+    def _song_changed(self, label=None) -> bool:
+        """True (and says so on ``label``) if a different song is loaded now."""
+        if getattr(self.app_state, "current_song_path", None) == self._song_path:
+            return False
+        if label is not None:
+            try:
+                label.configure(text="Another song is loaded now — reopen Song Settings.",
+                                text_color="#ff7b72")
+            except tk.TclError:
+                pass
+        return True
 
     # ------------------------------------------------------- tempo & key
 
@@ -100,7 +123,7 @@ class SongSettingsDialog(ModalDialog):
                                           number_of_steps=TEMPO_MAX - TEMPO_MIN,
                                           command=self._on_tempo_slide)
         self.tempo_slider.pack(side="left", fill="x", expand=True, padx=6)
-        self.lbl_tempo = ctk.CTkLabel(r1, text="", width=56, font=("Consolas", 13, "bold"),
+        self.lbl_tempo = ctk.CTkLabel(r1, text="", width=56, font=(FONT_MONO, 13, "bold"),
                                       text_color=COLOR_TEXT)
         self.lbl_tempo.pack(side="left")
         pct = int(round(max(TEMPO_MIN, min(TEMPO_MAX, s.tempo_ratio * 100))))
@@ -112,7 +135,7 @@ class SongSettingsDialog(ModalDialog):
         ctk.CTkLabel(r2, text="Key", width=60, anchor="w", text_color=COLOR_TEXT).pack(side="left")
         ctk.CTkButton(r2, text="−", width=32, height=28, **SECONDARY_BTN,
                       text_color=COLOR_TEXT, command=lambda: self._step_semis(-1)).pack(side="left", padx=(6, 0))
-        self.lbl_semis = ctk.CTkLabel(r2, text="", width=110, font=("Consolas", 13, "bold"),
+        self.lbl_semis = ctk.CTkLabel(r2, text="", width=110, font=(FONT_MONO, 13, "bold"),
                                       text_color=COLOR_TEXT)
         self.lbl_semis.pack(side="left")
         ctk.CTkButton(r2, text="+", width=32, height=28, **SECONDARY_BTN,
@@ -126,10 +149,10 @@ class SongSettingsDialog(ModalDialog):
         self.btn_reset_tk.pack(side="right")
         self.btn_apply = ctk.CTkButton(r2, text="Apply", width=90, height=30,
                                        fg_color=COLOR_BTN_SUCCESS, text_color=COLOR_BTN_TEXT,
-                                       font=("Segoe UI", 12, "bold"), command=self._apply_tempo_key)
+                                       font=(FONT_UI, 12, "bold"), command=self._apply_tempo_key)
         self.btn_apply.pack(side="right", padx=6)
         self.lbl_render = ctk.CTkLabel(box, text="Cue times stay on the original song time.",
-                                       font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM, anchor="w")
+                                       font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_render.pack(fill="x")
 
     def _on_tempo_slide(self, value):
@@ -150,12 +173,12 @@ class SongSettingsDialog(ModalDialog):
         self._show_semis()
 
     def _apply_tempo_key(self):
-        if self._rendering:
+        if self._rendering or self._song_changed(self.lbl_render):
             return
         ratio = int(round(self.tempo_slider.get())) / 100.0
         ok = self.app_state.set_tempo_pitch(ratio, float(self._semis))
         if ok is False:
-            self.lbl_render.configure(text="🔒 Blocked in Live Mode" if self._live else "Tempo/key request failed",
+            self.lbl_render.configure(text="Blocked in Live Mode" if self._live else "Tempo/key request failed",
                                       text_color="#ff7b72")
             return
         # The render_state events arrive through the app's queue; lock Apply now
@@ -189,7 +212,7 @@ class SongSettingsDialog(ModalDialog):
     # --------------------------------------------------------- tempo map
 
     def _build_tempo_map(self, s):
-        box = self.section("🥁 Tempo map (bar:beat readout, bar grid, Go to bar)")
+        box = self.section("Tempo map (bar:beat readout, bar grid, Go to bar)")
         r = ctk.CTkFrame(box, fg_color="transparent")
         r.pack(fill="x", pady=2)
         self.entry_bpm = self._labeled_entry(r, "BPM", 70, f"{s.bpm:g}" if s.bpm > 0 else "")
@@ -198,11 +221,11 @@ class SongSettingsDialog(ModalDialog):
 
         r2 = ctk.CTkFrame(box, fg_color="transparent")
         r2.pack(fill="x", pady=(4, 2))
-        self.btn_detect = ctk.CTkButton(r2, text="🔎 Detect", width=90, height=28,
+        self.btn_detect = ctk.CTkButton(r2, text="Detect", width=90, height=28,
                                         fg_color=COLOR_BTN_PRIMARY, text_color=COLOR_BTN_TEXT,
                                         command=self._detect)
         self.btn_detect.pack(side="left")
-        self.btn_tap = ctk.CTkButton(r2, text="👆 Tap tempo", width=110, height=28,
+        self.btn_tap = ctk.CTkButton(r2, text="Tap tempo", width=110, height=28,
                                      **SECONDARY_BTN, text_color=COLOR_TEXT,
                                      command=self._tap)
         self.btn_tap.pack(side="left", padx=6)
@@ -213,7 +236,7 @@ class SongSettingsDialog(ModalDialog):
         self.btn_save_map = ctk.CTkButton(r2, text="Save", width=70, height=28, fg_color=COLOR_BTN_SUCCESS,
                       text_color=COLOR_BTN_TEXT, command=self._save_tempo_map)
         self.btn_save_map.pack(side="right")
-        self.lbl_map = ctk.CTkLabel(box, text="BPM 0 = no tempo map.", font=("Segoe UI", 10),
+        self.lbl_map = ctk.CTkLabel(box, text="BPM 0 = no tempo map.", font=(FONT_UI, 10),
                                     text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_map.pack(fill="x")
 
@@ -230,7 +253,7 @@ class SongSettingsDialog(ModalDialog):
         entry.insert(0, value)
 
     def _detect(self):
-        if self._live:
+        if self._live or self._song_changed(self.lbl_map):
             return
         try:
             self.app_state.estimate_tempo()
@@ -242,9 +265,9 @@ class SongSettingsDialog(ModalDialog):
 
     def on_tempo_estimated(self, bpm, offset):
         """'tempo_estimated' from the app (Tk thread): fill the fields."""
-        if self._closed:
+        if self._closed or self._song_changed():
             return
-        self.btn_detect.configure(state="normal", text="🔎 Detect")
+        self.btn_detect.configure(state="normal", text="Detect")
         if not bpm:
             self.lbl_map.configure(text="No steady tempo found.", text_color="#ff7b72")
             return
@@ -275,27 +298,37 @@ class SongSettingsDialog(ModalDialog):
 
     def _save_tempo_map(self):
         if self._live:
-            self.lbl_map.configure(text="🔒 Blocked in Live Mode", text_color="#ff7b72")
+            self.lbl_map.configure(text="Blocked in Live Mode", text_color="#ff7b72")
+            return
+        if self._song_changed(self.lbl_map):
             return
         try:
             bpm_text = self.entry_bpm.get().strip()
             bpm = float(bpm_text) if bpm_text else 0.0
             bpb = int(self.entry_bpb.get().strip() or 4)
             offset = float(self.entry_offset.get().strip() or 0.0)
+            # float() accepts "nan" / "inf"; neither is a usable tempo map
+            if not (math.isfinite(bpm) and math.isfinite(offset)):
+                raise ValueError
             if bpm < 0 or bpm > 400 or bpb < 1 or bpb > 32:
                 raise ValueError
         except ValueError:
             self.lbl_map.configure(text="BPM 0-400, beats/bar 1-32, offset in seconds.",
                                    text_color="#ff7b72")
             return
-        self.app_state.set_song_tempo_map(bpm, bpb, offset)
+        try:
+            self.app_state.set_song_tempo_map(bpm, bpb, offset)
+        except ValueError:
+            self.lbl_map.configure(text="BPM 0-400, beats/bar 1-32, offset in seconds.",
+                                   text_color="#ff7b72")
+            return
         self.lbl_map.configure(text="Saved." if bpm > 0 else "Tempo map cleared.",
                                text_color="#4cd38a")
 
     # -------------------------------------------------------------- stems
 
     def _build_stems(self, s):
-        box = self.section("🎚 Stems & output")
+        box = self.section("Stems & output")
         self.source_menu = ctk.CTkSegmentedButton(
             box, values=["Full mix", "Stems", "Custom"], command=self._on_source)
         self.source_menu.pack(fill="x", pady=(0, 4))
@@ -322,7 +355,7 @@ class SongSettingsDialog(ModalDialog):
         self.device_menu.pack(side="left")
         self.lbl_out = ctk.CTkLabel(box, text="Click → right: song in the left output, click in "
                                     "the right (for in-ear click). Multichannel: song 1-2, click 3-4.",
-                                    font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM, anchor="w",
+                                    font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM, anchor="w",
                                     wraplength=540, justify="left")
         self.lbl_out.pack(fill="x")
         self._load_devices()
@@ -345,7 +378,7 @@ class SongSettingsDialog(ModalDialog):
             if len(stems) <= 1:
                 ctk.CTkLabel(
                     self.stems_box, anchor="w", justify="left", wraplength=540,
-                    font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM,
+                    font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM,
                     text=("No stems for this song. Put stems in a folder named "
                           "\"<song>.stems\" next to the song, or name files "
                           "\"<song> - click.wav\", \"<song> - vocals.wav\"…"),
@@ -367,9 +400,9 @@ class SongSettingsDialog(ModalDialog):
     def _add_stem_row(self, st):
         r = ctk.CTkFrame(self.stems_box, fg_color=COLOR_BG_DARK, corner_radius=6)
         r.pack(fill="x", pady=2)
-        label = st.name + ("  🎧" if "click" in st.name.lower() else "")
+        label = st.name
         ctk.CTkLabel(r, text=label, width=110, anchor="w", text_color=COLOR_TEXT,
-                     font=("Segoe UI", 12, "bold")).pack(side="left", padx=(8, 4))
+                     font=(FONT_UI, 12, "bold")).pack(side="left", padx=(8, 4))
         btn_m = ctk.CTkButton(r, text="M", width=30, height=26, **SECONDARY_BTN,
                               text_color=COLOR_TEXT,
                               command=lambda n=st.name: self._toggle_mute(n))
@@ -378,7 +411,7 @@ class SongSettingsDialog(ModalDialog):
                               text_color=COLOR_TEXT,
                               command=lambda n=st.name: self._toggle_solo(n))
         btn_s.pack(side="left", padx=2)
-        lbl = ctk.CTkLabel(r, text="", width=72, font=("Consolas", 11), text_color=COLOR_TEXT)
+        lbl = ctk.CTkLabel(r, text="", width=72, font=(FONT_MONO, 11), text_color=COLOR_TEXT)
         lbl.pack(side="right", padx=(4, 8))
         slider = ctk.CTkSlider(r, from_=GAIN_MIN, to=GAIN_MAX, number_of_steps=60,
                                command=lambda v, n=st.name: self._on_gain(n, v))
@@ -409,6 +442,8 @@ class SongSettingsDialog(ModalDialog):
     def _flush_gain(self):
         self._gain_after = None
         pending, self._gain_pending = self._gain_pending, {}
+        if self._song_changed():
+            return      # never apply one song's stem gains to another
         for name, value in pending.items():
             self.app_state.set_stem_gain(name, round(value, 1))
 
@@ -459,7 +494,7 @@ class SongSettingsDialog(ModalDialog):
     # ---------------------------------------------------------------- OSC
 
     def _build_osc(self, s):
-        box = self.section("📤 OSC cue for this song")
+        box = self.section("OSC cue for this song")
         r = ctk.CTkFrame(box, fg_color="transparent")
         r.pack(fill="x", pady=2)
         self.entry_osc = ctk.CTkEntry(r, width=200, placeholder_text="e.g. 12.5")
@@ -471,15 +506,27 @@ class SongSettingsDialog(ModalDialog):
                       text_color=COLOR_BTN_TEXT, command=self._save_osc)
         self.btn_save_osc.pack(side="left", padx=6)
         self.lbl_osc = ctk.CTkLabel(box, text="Sent when GO starts this song (OSC must be on in ⚙ Settings).",
-                                    font=("Segoe UI", 10), text_color=COLOR_TEXT_DIM, anchor="w")
+                                    font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM, anchor="w")
         self.lbl_osc.pack(fill="x")
 
     def _save_osc(self):
         if self._live:
-            self.lbl_osc.configure(text="🔒 Blocked in Live Mode", text_color="#ff7b72")
+            self.lbl_osc.configure(text="Blocked in Live Mode", text_color="#ff7b72")
             return
-        self.app_state.set_song_osc_cue(self.entry_osc.get().strip())
-        self.lbl_osc.configure(text="Saved.", text_color="#4cd38a")
+        if self._song_changed(self.lbl_osc):
+            return
+        raw = self.entry_osc.get().strip()
+        cue = sanitize_osc_cue(raw)
+        self.app_state.set_song_osc_cue(cue)
+        if cue != raw:
+            # Show what is actually stored
+            self._set_entry(self.entry_osc, cue)
+            self.lbl_osc.configure(
+                text=f"Saved as \"{cue}\" — removed characters OSC addresses cannot "
+                     "contain (spaces / * ? [ ] { } # ,).",
+                text_color="#f0a020")
+        else:
+            self.lbl_osc.configure(text="Saved.", text_color="#4cd38a")
 
     # ---------------------------------------------------------- live mode
 
@@ -496,7 +543,7 @@ class SongSettingsDialog(ModalDialog):
             except (tk.TclError, ValueError):
                 pass
         self.lbl_status.configure(
-            text="🔒 Live Mode: song editing is locked" if self._live else "")
+            text="Live Mode: song editing is locked" if self._live else "")
         if not self._live:
             self.on_stems_changed(self.app_state.stems)
 

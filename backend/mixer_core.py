@@ -13,8 +13,9 @@ Everything that has to be sample-accurate happens inside ``render``:
 * queued "cut" exits (continue the song seamlessly from the loop end),
 * fade exits (linear gain ramp, then stopped),
 * holds (stop exactly at a sample, hold the state, silence until release),
-* entry fade-in, pause/stop, end of song,
-* a short declick crossfade on every discontinuity,
+* manual-entry fade-in, pause/stop, end of song,
+* a short declick crossfade on every discontinuity (loop edits included),
+* gain/mute/solo ramps over the declick length,
 * routing (stereo / click_right / multichannel), applied last.
 
 All positions handed to and from the core are **source seconds** (the time
@@ -32,18 +33,25 @@ Loop bodies are built outside the lock so the audio callback is never
 starved by a long numpy job, and they are NEVER built inside ``render``:
 a pending tempo swap carries prebuilt bodies for its own buffers; if those
 are stale when the callback wants to apply the swap, the swap is deferred
-and the bodies are rebuilt on a worker thread.
+and the bodies are rebuilt on a long-lived worker thread (``render`` only
+sets an Event; it never starts a thread).
 
 ``_buf_gen`` is bumped every time the active buffers change; code that
 builds bodies outside the lock rechecks it before installing them.
 """
 
 import logging
+import math
 import queue
 import threading
 from typing import NamedTuple
 
 import numpy as np
+
+try:
+    from config import MIN_LOOP_DURATION
+except ImportError:  # pragma: no cover - core used without the app config
+    MIN_LOOP_DURATION = 0.5
 
 logger = logging.getLogger("LoopStation.MixerCore")
 
@@ -125,7 +133,8 @@ def build_loop_body(audio, start_sample, end_sample, crossfade_samples):
 
 class _Stem:
     __slots__ = ("name", "source", "active", "gain_db", "gain_lin",
-                 "muted", "solo", "body", "is_click")
+                 "muted", "solo", "body", "is_click",
+                 "g_cur", "g_target", "g_step", "g_left")
 
     def __init__(self, name, data):
         self.name = name
@@ -137,6 +146,12 @@ class _Stem:
         self.solo = False
         self.body = None        # int16 loop body built from ``active``
         self.is_click = is_click_stem(name)
+        # Applied gain (linear, mute/solo included) ramps toward the target
+        # over the declick length so gain/mute/solo changes never click.
+        self.g_cur = None       # None until the first _update_gains
+        self.g_target = 0.0
+        self.g_step = 0.0
+        self.g_left = 0         # frames left in the current ramp
 
 
 class _PendingSwap:
@@ -183,6 +198,7 @@ class MixerCore:
         self._loop_out = 0.0
         self._crossfade_ms = 20
         self._loop_ready = False
+        self._installed_key = None  # (in, out, cf_ms) of the bodies in use
         self._loop_in_f = 0
         self._loop_out_f = 0
         self._cf = 0
@@ -224,6 +240,11 @@ class MixerCore:
         self._pending_swap = None
         self._buf_gen = 0           # bumped whenever the active buffers change
         self._rebuild_running = False
+        # Long-lived worker that rebuilds stale pending-swap bodies. Started
+        # from swap_buffers (never from render); render only sets the event.
+        self._rebuild_event = threading.Event()
+        self._rebuild_thread = None
+        self._shutdown = False
 
         # monotonic count of frames rendered (never reset; device watchdog)
         self._frames_rendered = 0
@@ -261,23 +282,41 @@ class MixerCore:
 
     # -------------------------------------------------------------- stems --
 
-    def set_stems(self, stems):
+    @staticmethod
+    def _check_buffers(buffers, what):
+        lengths = {len(a) for a in buffers.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"{what} must have equal length, got {sorted(lengths)}")
+        n = lengths.pop()
+        if n <= 0:
+            raise ValueError(f"{what} are empty")
+        for name, a in buffers.items():
+            if a.ndim != 2 or a.shape[1] != 2 or a.dtype != np.int16:
+                raise ValueError(f"Stem {name!r} must be int16 (frames, 2), got {a.dtype} {a.shape}")
+        return n
+
+    def set_stems(self, stems, active=None, tempo_ratio=1.0, semitones=0.0):
         """
         Replace all stems. ``stems`` maps name -> int16 (frames, 2) array;
         every array must have the same length. Resets the transport.
+
+        ``active`` (optional, same names, equal lengths) installs already
+        rendered tempo/key buffers for ``tempo_ratio``/``semitones``: the
+        result is the state a completed ``swap_buffers`` leaves at position
+        0 (``source`` = ``stems``, ``active`` = renders, positions mapped
+        through ``n_source / n_active``).
         """
         if not stems:
             self.clear_stems()
             return
-        lengths = {len(a) for a in stems.values()}
-        if len(lengths) != 1:
-            raise ValueError(f"Stems must have equal length, got {sorted(lengths)}")
-        n = lengths.pop()
-        if n <= 0:
-            raise ValueError("Stems are empty")
-        for name, a in stems.items():
-            if a.ndim != 2 or a.shape[1] != 2 or a.dtype != np.int16:
-                raise ValueError(f"Stem {name!r} must be int16 (frames, 2), got {a.dtype} {a.shape}")
+        n = self._check_buffers(stems, "Stems")
+        n_act = n
+        if active is not None:
+            if set(active) != set(stems):
+                raise ValueError("set_stems: active stem names differ from the stems")
+            n_act = self._check_buffers(active, "Active buffers")
+        else:
+            tempo_ratio, semitones = 1.0, 0.0
         with self.lock:
             old = self._stems
             new = {}
@@ -290,12 +329,15 @@ class MixerCore:
                 prev = old.get(name)
                 if prev is not None:
                     s.gain_db, s.gain_lin, s.muted, s.solo = prev.gain_db, prev.gain_lin, prev.muted, prev.solo
+                if active is not None:
+                    s.active = active[name]
                 new[name] = s
             self._stems = new
+            self._update_gains(snap=True)
             self._n_src = n
-            self._n_active = n
-            self._tempo_ratio = 1.0
-            self._semitones = 0.0
+            self._n_active = n_act
+            self._tempo_ratio = float(tempo_ratio)
+            self._semitones = float(semitones)
             self._pending_swap = None
             self._buf_gen += 1
             self._reset_transport_state()
@@ -318,6 +360,7 @@ class MixerCore:
         self._held = False
         self._frames_since_jump = 0
         self._loop_ready = False
+        self._installed_key = None
         self._in_loop = False
         self._loop_pos = 0
         self._cycles = 0
@@ -364,16 +407,25 @@ class MixerCore:
         if s is not None:
             s.solo = bool(solo)
 
-    def _effective_gains(self):
-        stems = list(self._stems.values())
+    def _update_gains(self, snap=False):
+        """
+        Retarget each stem's applied gain from gain/mute/solo (lock held).
+        A changed target starts a linear ramp over ``declick_frames`` that
+        ``_read_span`` advances; with ``snap`` (or no declick, or nothing
+        audible) the applied gain jumps to the target.
+        """
+        stems = self._stems.values()
         any_solo = any(s.solo for s in stems)
-        out = []
+        n = self.declick_frames
+        snap = snap or n <= 0 or not self._active()
         for s in stems:
-            if s.muted or (any_solo and not s.solo):
-                continue
-            if s.gain_lin > 0.0:
-                out.append((s, np.float32(s.gain_lin) * _INT16_SCALE))
-        return out
+            t = 0.0 if (s.muted or (any_solo and not s.solo)) else float(s.gain_lin)
+            if snap or s.g_cur is None:
+                s.g_cur, s.g_target, s.g_step, s.g_left = t, t, 0.0, 0
+            elif t != s.g_target:
+                s.g_target = t
+                s.g_step = (t - s.g_cur) / n
+                s.g_left = n
 
     @property
     def n_source_frames(self):
@@ -560,17 +612,27 @@ class MixerCore:
 
     # -------------------------------------------------------------- loops --
 
+    def _reported_loop(self):
+        """
+        Loop points to report: while looping, the points of the bodies that
+        are actually playing (a set_loop_points still building keeps the
+        old ones audible); otherwise the requested points.
+        """
+        if self._in_loop and self._installed_key is not None:
+            return self._installed_key
+        return self._loop_key()
+
     @property
     def loop_in(self):
-        return self._loop_in
+        return self._reported_loop()[0]
 
     @property
     def loop_out(self):
-        return self._loop_out
+        return self._reported_loop()[1]
 
     @property
     def crossfade_ms(self):
-        return self._crossfade_ms
+        return self._reported_loop()[2]
 
     @property
     def loop_duration(self):
@@ -583,7 +645,7 @@ class MixerCore:
 
     def get_loop_points(self):
         with self.lock:
-            return self._loop_in, self._loop_out, self._crossfade_ms
+            return tuple(self._reported_loop())
 
     def _loop_frames_for(self, n_active, loop_in, loop_out, crossfade_ms):
         """Frame positions of a loop in a buffer of ``n_active`` frames."""
@@ -610,6 +672,12 @@ class MixerCore:
     def _loop_key(self):
         return (self._loop_in, self._loop_out, self._crossfade_ms)
 
+    def _loop_too_short(self, loop_in, loop_out):
+        """True for an empty loop or one shorter than MIN_LOOP_DURATION
+        (after clamping to the song end), which the core rejects."""
+        end = min(loop_out, self.song_length) if self._n_src else loop_out
+        return end - loop_in < MIN_LOOP_DURATION - 1e-9
+
     def set_loop_points(self, loop_in, loop_out, crossfade_ms=20):
         """
         Store loop points (source seconds) and build the loop bodies now.
@@ -619,6 +687,13 @@ class MixerCore:
         so ``render`` only installs prebuilt data). If the active buffers
         change while building (a swap applied by the callback), the build is
         retried against the new buffers.
+
+        A loop with ``loop_out <= loop_in`` or shorter than
+        ``MIN_LOOP_DURATION`` (``config``) is rejected: the points are stored
+        but no loop is ready (and a running loop is left, reason "seek").
+        Editing the loop that is playing keeps the playhead on the same song
+        sample (or restarts at the new loop_in when it falls outside) and
+        declicks the body change.
         """
         loop_in = float(loop_in)
         loop_out = float(loop_out)
@@ -630,8 +705,12 @@ class MixerCore:
             if changed:
                 self._entry_min_frame = 0
             stems = self._stems
-            if not stems or loop_out <= loop_in:
+            if not stems or self._loop_too_short(loop_in, loop_out):
+                if stems and loop_out > loop_in:
+                    logger.warning(f"Loop {loop_in:.3f}-{loop_out:.3f} s is shorter than "
+                                   f"{MIN_LOOP_DURATION} s; rejected")
                 self._loop_ready = False
+                self._installed_key = None
                 self._body_len = 0
                 for s in stems.values():
                     s.body = None
@@ -657,10 +736,7 @@ class MixerCore:
                     return  # superseded while building
                 if self._buf_gen != gen:
                     continue  # buffers swapped while building: rebuild
-                bodies, in_f, out_f, cf = built
-                for name, s in stems.items():
-                    s.body = bodies.get(name)
-                self._install_loop_frames(in_f, out_f, cf, len(next(iter(bodies.values()))))
+                self._install_bodies(*built, key)
                 if pending is not None and self._pending_swap is pending:
                     pending.bodies, pending.loop_key = pending_built, key
                 return
@@ -669,19 +745,43 @@ class MixerCore:
         with self.lock:
             if self._stems is stems and key == self._loop_key():
                 self._loop_ready = False
+                self._installed_key = None
                 self._body_len = 0
                 if self._in_loop:
                     self._jump_to(self._clamp_frame(self._loop_song_frame()), reason="seek")
 
-    def _install_loop_frames(self, in_f, out_f, cf, body_len):
+    def _install_bodies(self, bodies, in_f, out_f, cf, key):
+        """
+        Install freshly built bodies for the active buffers (lock held).
+        In a running loop the old body's tail is captured first (declick)
+        and the playhead keeps the same song sample; if that sample is not
+        inside the new loop it restarts at the new loop_in.
+        """
+        body_len = len(next(iter(bodies.values())))
+        remap = self._in_loop and self._body_len > 0 and body_len > 0
+        if remap:
+            self._capture_tail()
+            song_f = self._loop_song_frame()
+        for name, s in self._stems.items():
+            s.body = bodies.get(name)
+        if remap:
+            lp = song_f - in_f
+            if not 0 <= lp < body_len:
+                lp = 0
+                self._frames_since_jump = 0
+            self._loop_pos = lp
+        self._install_loop_frames(in_f, out_f, cf, body_len, key)
+
+    def _install_loop_frames(self, in_f, out_f, cf, body_len, key):
         self._loop_in_f, self._loop_out_f, self._cf = in_f, out_f, cf
         self._body_len = body_len
         self._loop_ready = body_len > 0
+        self._installed_key = key if body_len > 0 else None
         if self._in_loop:
-            if body_len > 0:
-                self._loop_pos %= body_len
-            else:
+            if body_len <= 0:
                 self._jump_to(self._clamp_frame(self._loop_song_frame()), reason="seek")
+            elif self._loop_pos > body_len:
+                self._loop_pos %= body_len
 
     def _loop_song_frame(self):
         """Song frame equivalent to the current loop body position."""
@@ -698,6 +798,9 @@ class MixerCore:
             self.set_loop_points(loop_in, loop_out, crossfade_ms)
         with self.lock:
             self._loop_count = None if count is None else int(count)
+            # Stored for compatibility only: an armed entry is sample-
+            # continuous (body sample 0 == song sample loop_out), so a fade-in
+            # would only dip a signal that is already playing.
             self._entry_fade_ms = int(entry_fade_ms)
             if not self._in_loop:
                 self._armed = True
@@ -721,8 +824,9 @@ class MixerCore:
                 return True
             lo = self._loop_in_f
             hi = self._loop_out_f
-            if self._active() and lo <= self._pos <= hi:
-                # Same samples as the song: no discontinuity.
+            if self._active() and lo + self._cf <= self._pos <= hi:
+                # Same samples as the song (past the blended head): no
+                # discontinuity.
                 self._loop_pos = self._pos - lo
             else:
                 self._capture_tail()
@@ -739,7 +843,7 @@ class MixerCore:
             self._held = False
             self._playing = True
             self._paused = False
-            self._emit("loop_entered", loop_in=self._loop_in, loop_out=self._loop_out)
+            self._emit("loop_entered", loop_in=self.loop_in, loop_out=self.loop_out)
             return True
 
     def queue_loop_exit(self, mode="cut", fade_ms=None):
@@ -884,6 +988,7 @@ class MixerCore:
         if len(lengths) != 1 or lengths == {0}:
             raise ValueError("swap_buffers: buffers must be non-empty and of equal length")
         tempo_ratio, semitones = float(tempo_ratio), float(semitones)
+        self._ensure_rebuild_worker()
 
         for _attempt in range(_MAX_BUILD_RETRIES):
             with self.lock:
@@ -939,13 +1044,40 @@ class MixerCore:
                 if self._pending_swap is p and key == self._loop_key():
                     p.bodies, p.loop_key = built, key
 
+    def _ensure_rebuild_worker(self):
+        """Start the long-lived body rebuild worker (never on the audio thread)."""
+        with self.lock:
+            t = self._rebuild_thread
+            if self._shutdown or (t is not None and t.is_alive()):
+                return
+            self._rebuild_thread = threading.Thread(
+                target=self._rebuild_loop, name="LoopBodyRebuild", daemon=True)
+            self._rebuild_thread.start()
+
+    def _rebuild_loop(self):
+        while True:
+            self._rebuild_event.wait()
+            self._rebuild_event.clear()
+            if self._shutdown:
+                return
+            self._refresh_pending_bodies(worker=True)
+
+    def shutdown(self):
+        """Stop the rebuild worker (idempotent; the core stays usable for
+        rendering, but stale swaps then wait for apply_pending_swap)."""
+        self._shutdown = True
+        self._rebuild_event.set()
+        t = self._rebuild_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)
+
     def _kick_rebuild(self):
-        """Start the off-thread body rebuild for a stale pending swap (lock held)."""
+        """Wake the rebuild worker for a stale pending swap (lock held).
+        Real-time safe: only sets an Event, never starts a thread."""
         if self._rebuild_running:
             return
         self._rebuild_running = True
-        threading.Thread(target=self._refresh_pending_bodies, kwargs={"worker": True},
-                         name="LoopBodyRebuild", daemon=True).start()
+        self._rebuild_event.set()
 
     def apply_pending_swap(self):
         """
@@ -965,10 +1097,18 @@ class MixerCore:
         new_n = p.n
         old_scale = self._scale()
         new_scale = self._n_src / new_n
+        ratio = old_scale / new_scale
         self._capture_tail()
+        old_song_f = self._loop_song_frame()
+        old_out_f = self._loop_out_f
         # Move the playhead to the equivalent source position
-        self._pos = int(round(self._pos * old_scale / new_scale))
+        self._pos = int(round(self._pos * ratio))
         self._pos = max(0, min(self._pos, new_n))
+        # Re-entry guard: keep blocking the loop just left, else rescale.
+        emf = self._entry_min_frame
+        blocks_loop = emf > 0 and emf == old_out_f + 1
+        if emf > 0:
+            self._entry_min_frame = int(math.ceil(emf * ratio))
         for name, s in self._stems.items():
             s.active = p.buffers[name]
         self._buf_gen += 1
@@ -986,8 +1126,16 @@ class MixerCore:
                 s.body = body_map.get(name)
             new_len = len(next(iter(body_map.values())))
             if self._in_loop and old_len > 0:
-                self._loop_pos = int(round(self._loop_pos * new_len / old_len)) % new_len
-            self._install_loop_frames(in_f, out_f, cf, new_len)
+                if p.loop_key == self._installed_key:
+                    self._loop_pos = int(round(self._loop_pos * new_len / old_len)) % new_len
+                else:
+                    # The playing bodies were for older points (a
+                    # set_loop_points still building): keep the song sample.
+                    lp = int(round(old_song_f * ratio)) - in_f
+                    self._loop_pos = lp if 0 <= lp < new_len else 0
+            self._install_loop_frames(in_f, out_f, cf, new_len, p.loop_key)
+            if blocks_loop:
+                self._entry_min_frame = out_f + 1
         else:
             # No matching bodies (only reachable when no loop is ready, since
             # render defers stale swaps): old bodies would be wrong now.
@@ -1002,24 +1150,64 @@ class MixerCore:
                     self._emit("loop_exited", position=self._to_sec(self._pos), reason="seek")
         self._emit("render_done", tempo_ratio=p.tempo, semitones=p.semitones)
 
+    def prefetch_spans(self, frames):
+        """
+        [(buffer, start, end)] of active/pending buffer frames the callback
+        may read within the next ``frames`` frames: the playhead (or, in a
+        loop, the cut-exit continuation after loop_out; bodies are in RAM),
+        the next skip target, and a pending swap's equivalent position. A
+        non-real-time thread touches these memmap pages so the audio
+        callback does not page-fault on them.
+        """
+        frames = max(0, int(frames))
+        with self.lock:
+            if not self._stems or not self._playing:
+                return []
+            if self._in_loop:
+                starts = [self._loop_out_f]
+                here = self._loop_song_frame()
+            else:
+                starts = [self._pos]
+                here = self._pos
+                nxt = next((e for s0, e in self._skips_f if s0 >= self._pos), None)
+                if nxt is not None:
+                    starts.append(nxt)
+            spans = [(s.active, a, min(a + frames, self._n_active))
+                     for s in self._stems.values() for a in starts]
+            p = self._pending_swap
+            if p is not None:
+                a = int(round(here * self._scale() * p.n / self._n_src))
+                spans += [(b, a, min(a + frames, p.n)) for b in p.buffers.values()]
+        return [sp for sp in spans if sp[2] > sp[1] >= 0]
+
     # ---------------------------------------------------------- rendering --
 
-    def render(self, frames):
-        """Render ``frames`` frames; returns float32 (frames, output_channels)."""
+    def render(self, frames, channels=None):
+        """
+        Render ``frames`` frames; returns float32 (frames, channels).
+        ``channels`` defaults to ``output_channels``; the audio callback
+        passes the stream's channel count so a routing change that has not
+        reopened the stream yet is routed into the channels that exist.
+        """
         frames = int(frames)
         with self.lock:
             self._frames_rendered += frames
-            out = np.zeros((frames, self.output_channels), dtype=np.float32)
+            nch = self.output_channels if channels is None else max(1, int(channels))
+            out = np.zeros((frames, nch), dtype=np.float32)
+            guard = 0
             if self._pending_swap is not None:
                 if self._pending_stale(self._pending_swap):
                     # Never build bodies here: defer one block, rebuild off-thread.
                     self._kick_rebuild()
                 else:
+                    # Events due exactly at the current frame belong to the
+                    # old buffers; rounding the playhead could skip them.
+                    guard = self._handle_due_events(guard)
                     self._apply_swap()
+            self._update_gains()
             mix = np.zeros((frames, 2), dtype=np.float32)
             click = np.zeros((frames, 2), dtype=np.float32)
             i = 0
-            guard = 0
             while i < frames:
                 n = frames - i
                 if self._active():
@@ -1027,17 +1215,53 @@ class MixerCore:
                     if dist <= 0:
                         guard += 1
                         if guard > _MAX_EVENTS_PER_BLOCK:
-                            logger.error("Too many zero-length events in one block; stopping")
-                            self._playing = False
+                            self._abort_playback()
                             continue
                         self._handle_event(kind)
                         continue
                     n = min(n, dist)
                     self._pull(mix, click, i, n)
+                    guard = 0   # only consecutive zero-length events count
                 self._blend_tail(mix, click, i, n)
                 i += n
             self._route(mix, click, out)
         return out
+
+    def _handle_due_events(self, guard):
+        """Handle the zero-distance events at the playhead (lock held)."""
+        while self._active():
+            dist, kind = self._next_event()
+            if dist > 0:
+                break
+            guard += 1
+            if guard > _MAX_EVENTS_PER_BLOCK:
+                break   # render's loop trips the guard
+            self._handle_event(kind)
+        return guard
+
+    def _abort_playback(self):
+        """
+        Safety valve: zero-length events keep firing without any audio
+        (state is bad). Stop and report it like a finished fade: a running
+        loop ends with "loop_exited" (reason "seek"), then "stopped"
+        (reason "error") so the state manager leaves PLAYING.
+        """
+        logger.error("Too many zero-length events in one block; stopping")
+        self._capture_tail()
+        was_loop = self._in_loop
+        frame = self._clamp_frame(self._loop_song_frame() if was_loop else self._pos)
+        self._playing = False
+        self._paused = False
+        self._held = False
+        self._in_loop = False
+        self._armed = False
+        self._exit_queued = None
+        self._fadein_total = self._fadein_done = 0
+        self._fadeout_total = self._fadeout_done = 0
+        self._pos = frame
+        if was_loop:
+            self._emit("loop_exited", position=self._to_sec(frame), reason="seek")
+        self._emit("stopped", position=self._to_sec(frame), reason="error")
 
     def _next_event(self):
         best = None
@@ -1097,7 +1321,7 @@ class MixerCore:
             self._automatic_entry = True
             self._armed = False
             self._exit_queued = None
-            self._emit("loop_entered", loop_in=self._loop_in, loop_out=self._loop_out)
+            self._emit("loop_entered", loop_in=self.loop_in, loop_out=self.loop_out)
             self._emit("loop_cycle", cycle=self._cycles)
         elif kind == "wrap":
             if self._exit_queued == "cut":
@@ -1130,7 +1354,7 @@ class MixerCore:
         else:
             self._emit("stopped", position=self._to_sec(self._pos), reason="fade")
 
-    def _read_into(self, mix, click, i, n):
+    def _read_into(self, mix, click, i, n, advance=False):
         """Add up to ``n`` frames of the current state to the buses (no
         advance); returns the number of frames actually available."""
         if self._in_loop:
@@ -1141,16 +1365,32 @@ class MixerCore:
             avail = self._n_active - p
         k = min(n, avail)
         if k > 0:
-            self._read_span(mix, click, i, k, self._in_loop, p)
+            self._read_span(mix, click, i, k, self._in_loop, p, advance)
         return max(0, k)
 
-    def _read_span(self, mix, click, i, k, from_body, p):
-        for s, g in self._effective_gains():
+    def _read_span(self, mix, click, i, k, from_body, p, advance=False):
+        """Mix ``k`` frames at ``p`` into the buses. ``advance`` moves the
+        gain ramps on (playback); tails read at the current gain."""
+        for s in self._stems.values():
+            ramping = advance and s.g_left > 0
+            if not ramping and not s.g_cur:
+                continue
             buf = s.body if from_body else s.active
             if buf is None:
                 continue
             bus = click if s.is_click else mix
-            bus[i:i + k] += np.asarray(buf[p:p + k], dtype=np.float32) * g
+            data = np.asarray(buf[p:p + k], dtype=np.float32)
+            if ramping:
+                m = min(k, s.g_left)
+                g = (s.g_cur + s.g_step * np.arange(1, m + 1, dtype=np.float32)) * _INT16_SCALE
+                data[:m] *= g[:, None]
+                s.g_left -= m
+                s.g_cur = s.g_target if s.g_left == 0 else s.g_cur + s.g_step * m
+                if m < k:
+                    data[m:] *= np.float32(s.g_cur) * _INT16_SCALE
+            else:
+                data *= np.float32(s.g_cur) * _INT16_SCALE
+            bus[i:i + k] += data
 
     def _read_tail(self, mix, click, n):
         """
@@ -1175,7 +1415,7 @@ class MixerCore:
             click[:k] *= fade
 
     def _pull(self, mix, click, i, n):
-        self._read_into(mix, click, i, n)
+        self._read_into(mix, click, i, n, advance=True)
         env = self._envelope(n)
         if env is not None:
             mix[i:i + n] *= env
@@ -1239,7 +1479,9 @@ class MixerCore:
     def _route(self, mix, click, out):
         outch = out.shape[1]
         mode = self._routing
-        if mode == "stereo":
+        if outch < 2:
+            out[:, 0] = (mix + click).mean(axis=1)
+        elif mode == "stereo":
             out[:, 0:2] = mix + click
         elif mode == "click_right":
             out[:, 0] = mix.mean(axis=1)

@@ -79,13 +79,13 @@ def controller(ports):
 
 
 def test_message_key_rules():
-    assert message_key(_note(60)) == "note_on:60"
+    assert message_key(_note(60)) == "note_on:1:60"            # channel 1-16 in the key
     assert message_key(_note(60, velocity=0)) is None          # note-off in disguise
     assert message_key(mido.Message("note_off", note=60)) is None
-    assert message_key(_cc(64, 127)) == "cc:64"
-    assert message_key(_cc(64, 64)) == "cc:64"
+    assert message_key(_cc(64, 127)) == "cc:1:64"
+    assert message_key(_cc(64, 64)) == "cc:1:64"
     assert message_key(_cc(64, 63)) is None                     # pedal released
-    assert message_key(mido.Message("program_change", program=5)) == "pc:5"
+    assert message_key(mido.Message("program_change", program=5)) == "pc:1:5"
     assert message_key(mido.Message("pitchwheel", pitch=100)) is None
     assert message_key(object()) is None
 
@@ -122,8 +122,8 @@ def test_learn_then_dispatch_through_polling_thread(controller, ports):
     assert controller.learning == "go"
     port.push(_note(60, velocity=0))                            # ignored, still learning
     port.push(_note(60))
-    assert wait_until(lambda: controller.learned == [("go", "note_on:60")], timeout=2.0)
-    assert controller.mappings == {"note_on:60": "go"}
+    assert wait_until(lambda: controller.learned == [("go", "note_on:1:60")], timeout=2.0)
+    assert controller.mappings == {"note_on:1:60": "go"}
     assert controller.learning is None
     assert controller.actions == []                             # the learned message is not dispatched
 
@@ -135,8 +135,8 @@ def test_learn_then_dispatch_through_polling_thread(controller, ports):
     # Learning again moves the action to the new key (one key per action)
     controller.learn("go")
     port.push(_cc(64, 127))
-    assert wait_until(lambda: controller.mappings == {"cc:64": "go"}, timeout=2.0)
-    assert controller.key_for("go") == "cc:64"
+    assert wait_until(lambda: controller.mappings == {"cc:1:64": "go"}, timeout=2.0)
+    assert controller.key_for("go") == "cc:1:64"
     port.push(_note(60))
     port.push(_cc(64, 100))                                     # still held since learning: no edge
     port.push(_cc(64, 0))                                       # released
