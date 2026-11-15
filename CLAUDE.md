@@ -56,8 +56,13 @@ MIDI in, OSC out). Entry point: `main.py`.
 - `tests/conftest.py` marks every test that uses the `_app`/`ui` fixture as
   `gui`. CI runs `-m "not gui"` and `-m gui` as separate steps. On the
   macOS runner, tests marked `mac_ci_hang` (modal dialogs) run in a final
-  step that reports failures without failing the build. A test in a
-  non-GUI step must import what it needs itself.
+  step that reports failures without failing the build. `conftest.py`
+  applies `mac_ci_hang` automatically to any GUI test whose body names a
+  modal opener (`MODAL_OPENERS`: `_open_settings_dialog`,
+  `_open_song_dialog`, `_open_vamp_settings`, `NamePrompt`, `VampModal`).
+  A test that opens a modal through a helper needs the marker by hand, and
+  a new modal opener must be added to that pattern. A test in a non-GUI
+  step must import what it needs itself.
 
 ## Design rules (keep consistent)
 
