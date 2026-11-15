@@ -7,7 +7,7 @@ rehearsal director an at-a-glance view of what's coming up next.
 
 REDESIGNED: Includes inline action buttons for vamps:
 - ▶ Jump to and play
-- ⚙️ Open settings modal
+- ⚙ Open settings modal
 - ✏ Rename
 - ✕ Delete
 
@@ -25,7 +25,7 @@ import customtkinter as ctk
 
 from utils.fonts import FONT_UI, FONT_MONO
 from config import (
-    COLOR_HOVER, COLOR_VAMP, tint,
+    COLOR_HOVER, COLOR_VAMP, tint, mix,
     COLOR_BTN_DANGER, COLOR_BTN_SUCCESS,
     COLOR_TEXT, COLOR_TEXT_DIM, COLOR_BG_LIGHT, COLOR_BG_MEDIUM,
     COLOR_MARKER, COLOR_LOOP_REGION,
@@ -39,8 +39,26 @@ logger = logging.getLogger("LoopStation.CueSheet")
 
 # Hold cues: same colour as the waveform's hold lines.
 COLOR_HOLD = "#5ec8f2"
-COLOR_HOLD_CURRENT_BG = "#1a2e3a"
 COLOR_LIVE = "#ff9f43"
+
+
+def row_style(item_type, is_current=False, is_selected=False):
+    """
+    (fg_color, border_color, border_width) of a cue-sheet row. Highlighted
+    surfaces are theme tints (config.tint), so they read on light themes too.
+    """
+    if item_type == 'marker' and is_current:
+        return tint(COLOR_MARKER, 0.18), COLOR_MARKER, 2
+    if item_type == 'vamp':
+        if is_selected and is_current:
+            return tint(COLOR_VAMP, 0.28), COLOR_VAMP, 2
+        if is_selected:
+            return tint(COLOR_VAMP, 0.14), COLOR_LOOP_REGION, 1
+        if is_current:
+            return tint(COLOR_MARKER, 0.14), COLOR_MARKER, 2
+    if item_type == 'hold' and is_current:
+        return tint(COLOR_HOLD, 0.18), COLOR_HOLD, 2
+    return "transparent", None, 0
 
 # GO log footer: newest first, at most this many rows.
 GO_LOG_MAX_ROWS = 20
@@ -444,29 +462,13 @@ class CueSheetPanel(ctk.CTkFrame):
             is_current = idx in new_idx
             
             try:
-                if item_type == 'marker':
-                    if is_current:
-                        row.configure(fg_color="#3a3a1a", border_width=2, border_color=COLOR_MARKER)
+                if item_type in ('marker', 'vamp', 'hold'):
+                    is_selected = item_type == 'vamp' and ref_id == self._selected_loop_index
+                    bg, border, width = row_style(item_type, is_current, is_selected)
+                    if border is None:
+                        row.configure(fg_color=bg, border_width=width)
                     else:
-                        row.configure(fg_color="transparent", border_width=0)
-                        
-                elif item_type == 'vamp':
-                    is_selected = (ref_id == self._selected_loop_index)
-                    if is_selected and is_current:
-                        row.configure(fg_color="#2a4a2a", border_width=2, border_color="#66ff66")
-                    elif is_selected:
-                        row.configure(fg_color="#1a331a", border_width=1, border_color=COLOR_LOOP_REGION)
-                    elif is_current:
-                        row.configure(fg_color="#2a2a1a", border_width=2, border_color="#ffff00")
-                    else:
-                        row.configure(fg_color="transparent", border_width=0)
-                        
-                elif item_type == 'hold':
-                    if is_current:
-                        row.configure(fg_color=COLOR_HOLD_CURRENT_BG, border_width=2,
-                                      border_color=COLOR_HOLD)
-                    else:
-                        row.configure(fg_color="transparent", border_width=0)
+                        row.configure(fg_color=bg, border_width=width, border_color=border)
 
                 elif item_type == 'skip':
                     if is_current:
@@ -718,16 +720,14 @@ class CueSheetPanel(ctk.CTkFrame):
 
     def _create_marker_row(self, marker, is_current=False):
         """Create a row widget for a cue point marker."""
-        # Highlight if current
-        bg = "#3a3a1a" if is_current else "transparent"
-
+        bg, border_color, border_width = row_style('marker', is_current)
         row = ctk.CTkFrame(
-            self.item_list, 
-            fg_color=bg, 
+            self.item_list,
+            fg_color=bg,
             height=28,
             corner_radius=4,
-            border_width=2 if is_current else 0,
-            border_color=COLOR_MARKER if is_current else None  # CHANGED: Don't use "transparent"
+            border_width=border_width,
+            border_color=border_color
         )
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
@@ -738,21 +738,19 @@ class CueSheetPanel(ctk.CTkFrame):
             font=(FONT_UI, 12)
         ).pack(side="left", padx=(4, 2))
 
-        # Time - brighter if current
-        time_color = "#ffff00" if is_current else COLOR_MARKER
         ctk.CTkLabel(
             row, text=self._format_time(marker.time),
-            font=(FONT_MONO, 10),
-            text_color=time_color,
+            font=(FONT_MONO, 10, "bold" if is_current else "normal"),
+            text_color=COLOR_MARKER,
             width=55
         ).pack(side="left", padx=(0, 6))
-        
+
         # Current indicator
         if is_current:
             ctk.CTkLabel(
                 row, text="▶",
                 font=(FONT_UI, 10),
-                text_color="#ffff00",
+                text_color=COLOR_MARKER,
                 width=16
             ).pack(side="left", padx=(0, 4))
         
@@ -765,7 +763,7 @@ class CueSheetPanel(ctk.CTkFrame):
             font=(FONT_UI, 11, "bold" if is_current else "normal"),
             fg_color="transparent",
             hover_color=COLOR_BG_LIGHT,
-            text_color="#ffffff" if is_current else COLOR_TEXT,
+            text_color=COLOR_TEXT,
             command=lambda mid=marker.id: self._on_jump_marker(mid)
         )
         name_btn.pack(side="left", fill="x", expand=True, padx=2)
@@ -778,7 +776,7 @@ class CueSheetPanel(ctk.CTkFrame):
         btn_del_m = ctk.CTkButton(
             row, text="✕", width=24, height=20,
             fg_color="transparent", hover_color=tint(COLOR_BTN_DANGER, 0.3),
-            text_color="#aa4444",
+            text_color=COLOR_BTN_DANGER,
             command=lambda mid=marker.id: self._on_delete_marker(mid)
         )
         btn_del_m.pack(side="right", padx=1)
@@ -797,29 +795,12 @@ class CueSheetPanel(ctk.CTkFrame):
 
     def _create_vamp_row(self, loop, loop_idx, is_selected, is_current=False):
         """Create a row widget for a vamp (loop region) with inline action buttons."""
-        # Highlight: selected OR current
-        if is_selected and is_current:
-            bg = "#2a4a2a"  # Both selected and current
-            border_color = "#66ff66"
-            border_width = 2
-        elif is_selected:
-            bg = "#1a331a"  # Just selected
-            border_color = COLOR_LOOP_REGION
-            border_width = 1
-        elif is_current:
-            bg = "#2a2a1a"  # Just current (yellowish)
-            border_color = "#ffff00"
-            border_width = 2
-        else:
-            bg = "transparent"
-            border_color = None  # CHANGED: None instead of "transparent"
-            border_width = 0
-        
+        bg, border_color, border_width = row_style('vamp', is_current, is_selected)
         row = ctk.CTkFrame(
             self.item_list, fg_color=bg, height=30,
             corner_radius=4,
             border_width=border_width,
-            border_color=border_color  # Now either a real color or None
+            border_color=border_color
         )
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
@@ -837,7 +818,7 @@ class CueSheetPanel(ctk.CTkFrame):
         ctk.CTkLabel(
             row, text=time_text,
             font=(FONT_MONO, 10),
-            text_color="#66bb6a" if is_selected else "#558855",
+            text_color=COLOR_VAMP if is_selected else mix(COLOR_VAMP, COLOR_TEXT_DIM, 0.5),
             width=130
         ).pack(side="left", padx=(0, 4))
         
@@ -857,7 +838,7 @@ class CueSheetPanel(ctk.CTkFrame):
             font=(FONT_UI, 10, "bold"),
             fg_color=tint(COLOR_VAMP, 0.2) if counted else COLOR_BG_LIGHT,
             corner_radius=8,
-            text_color="#aaffaa" if counted else COLOR_TEXT_DIM,
+            text_color=COLOR_VAMP if counted else COLOR_TEXT_DIM,
         )
         badge_lbl.pack(side="left", padx=(0, 6))
         ToolTip(badge_lbl, f"Plays {badge[1:]} times in total, then continues"
@@ -868,16 +849,16 @@ class CueSheetPanel(ctk.CTkFrame):
         # buttons so it is not mistaken for a second Play button.)
         if is_selected and is_current:
             ctk.CTkLabel(row, text="⬤", font=(FONT_UI, 10),
-                         text_color="#66ff66", width=16).pack(side="left", padx=(0, 4))
+                         text_color=COLOR_VAMP, width=16).pack(side="left", padx=(0, 4))
         elif is_current:
             ctk.CTkLabel(row, text="▶", font=(FONT_UI, 10),
-                         text_color="#ffff00", width=16).pack(side="left", padx=(0, 4))
+                         text_color=COLOR_MARKER, width=16).pack(side="left", padx=(0, 4))
         elif is_selected:
             ctk.CTkLabel(row, text="●", font=(FONT_UI, 10),
-                         text_color="#66bb6a", width=16).pack(side="left", padx=(0, 4))
+                         text_color=COLOR_VAMP, width=16).pack(side="left", padx=(0, 4))
 
-        # Name (clickable to select this vamp)
-        name_color = "#aaffaa" if is_selected else COLOR_TEXT
+        # Name (clickable to select this vamp); bold marks the selection
+        name_color = COLOR_TEXT
         name_btn = ctk.CTkButton(
             row,
             text=loop.name,
@@ -901,7 +882,7 @@ class CueSheetPanel(ctk.CTkFrame):
             row, text="✕", width=28, height=22,
             fg_color="transparent",
             hover_color=tint(COLOR_BTN_DANGER, 0.3),
-            text_color="#aa4444",
+            text_color=COLOR_BTN_DANGER,
             command=lambda idx=loop_idx: self._on_delete_vamp_row(idx)
         )
         btn_del.pack(side="right", padx=2)
@@ -918,9 +899,9 @@ class CueSheetPanel(ctk.CTkFrame):
         btn_ren.pack(side="right", padx=2)
         ToolTip(btn_ren, "Rename this vamp")
         
-        # Settings button (⚙️)
+        # Settings button
         btn_set = ctk.CTkButton(
-            row, text="⚙️", width=28, height=22,
+            row, text="⚙", width=28, height=22,
             fg_color=COLOR_BG_LIGHT,
             hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
@@ -946,13 +927,14 @@ class CueSheetPanel(ctk.CTkFrame):
 
     def _create_hold_row(self, hold, is_current=False):
         """Create a row widget for a hold cue (caesura)."""
+        bg, border_color, border_width = row_style('hold', is_current)
         row = ctk.CTkFrame(
             self.item_list,
-            fg_color=COLOR_HOLD_CURRENT_BG if is_current else "transparent",
+            fg_color=bg,
             height=28,
             corner_radius=4,
-            border_width=2 if is_current else 0,
-            border_color=COLOR_HOLD if is_current else None
+            border_width=border_width,
+            border_color=border_color
         )
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
@@ -964,8 +946,8 @@ class CueSheetPanel(ctk.CTkFrame):
 
         ctk.CTkLabel(
             row, text=self._format_time(hold.time),
-            font=(FONT_MONO, 10),
-            text_color="#bfeaff" if is_current else COLOR_HOLD,
+            font=(FONT_MONO, 10, "bold" if is_current else "normal"),
+            text_color=COLOR_HOLD,
             width=55
         ).pack(side="left", padx=(0, 6))
 
@@ -985,7 +967,7 @@ class CueSheetPanel(ctk.CTkFrame):
             row, text=hold.name, anchor="w", height=22,
             font=(FONT_UI, 11, "bold" if is_current else "normal"),
             fg_color="transparent", hover_color=COLOR_BG_LIGHT,
-            text_color="#ffffff" if is_current else COLOR_TEXT,
+            text_color=COLOR_TEXT,
             command=lambda hid=hold.id: self._on_jump_hold(hid)
         )
         name_btn.pack(side="left", fill="x", expand=True, padx=2)
@@ -997,7 +979,7 @@ class CueSheetPanel(ctk.CTkFrame):
         btn_del = ctk.CTkButton(
             row, text="✕", width=24, height=20,
             fg_color="transparent", hover_color=tint(COLOR_BTN_DANGER, 0.3),
-            text_color="#aa4444",
+            text_color=COLOR_BTN_DANGER,
             command=lambda hid=hold.id: self._on_delete_hold(hid)
         )
         btn_del.pack(side="right", padx=1)
@@ -1138,7 +1120,7 @@ class CueSheetPanel(ctk.CTkFrame):
             self.on_jump_to_vamp(loop_idx)
     
     def _on_open_settings_row(self, loop_idx):
-        """Open vamp settings modal (clicking ⚙️ button)."""
+        """Open vamp settings modal (clicking ⚙ button)."""
         if self.on_open_vamp_settings:
             self.on_open_vamp_settings(loop_idx)
     

@@ -171,6 +171,7 @@ def test_live_mode_blocks_delete(ui, caplog):
     _no_handler_errors(caplog, ui)
 
 
+@pytest.mark.mac_ci_hang      # Tk hangs in update() when a modal opens there
 def test_dialogs_open_and_close(ui, caplog):
     ui._open_settings_dialog()
     pump(ui, 0.3)

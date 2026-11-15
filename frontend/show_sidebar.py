@@ -402,7 +402,7 @@ class ShowSidebar(ctk.CTkFrame):
 
     def _apply_enabled(self):
         editable = "normal" if self.accepting_clicks else "disabled"
-        for widget in (self.btn_add, self.theme_menu, *getattr(self, "welcome_buttons", ())):
+        for widget in (self.btn_add, self.theme_menu, *self.welcome_buttons):
             try:
                 widget.configure(state=editable)
             except (tk.TclError, ValueError):
@@ -474,7 +474,8 @@ class ShowSidebar(ctk.CTkFrame):
         w = self.welcome = ctk.CTkFrame(self.song_list_frame, fg_color="transparent")
         ctk.CTkLabel(w, text="Get started", font=(FONT_UI, 13, "bold"),
                      text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(8, 6))
-        self.welcome_buttons = []
+        self._welcome_static = []     # the three choices; recent ones are rebuilt
+        self._welcome_recent_btns = []
         choices = (
             ("Open a music folder…", "Every audio file in the folder, in name order",
              self.open_folder_dialog, True),
@@ -495,36 +496,52 @@ class ShowSidebar(ctk.CTkFrame):
             ctk.CTkLabel(w, text=hint, font=(FONT_UI, 10), text_color=COLOR_TEXT_DIM,
                          anchor="w", justify="left",
                          wraplength=SIDEBAR_WIDTH - 50).pack(fill="x", pady=(1, 8))
-            self.welcome_buttons.append(btn)
+            self._welcome_static.append(btn)
         self.welcome_recent = ctk.CTkFrame(w, fg_color="transparent")
         self.welcome_recent.pack(fill="x", pady=(4, 0))
         self._welcome_recent_refs = None
+        self._recent_cache = None     # (preferences.change_token(), refs)
+
+    @property
+    def welcome_buttons(self) -> list:
+        """The live welcome-panel buttons (static choices + current recent shows)."""
+        return [*getattr(self, "_welcome_static", ()), *getattr(self, "_welcome_recent_btns", ())]
+
+    def recent_shows(self) -> list:
+        """preferences.get_recent_shows(), re-read only after a preferences save
+        (render runs often on the Tk thread; a locked file retries ~0.5 s)."""
+        token = preferences.change_token()
+        if self._recent_cache is None or self._recent_cache[0] != token:
+            self._recent_cache = (token, preferences.get_recent_shows())
+        return [dict(r) for r in self._recent_cache[1]]
+
+    def recent_label(self, ref) -> str:
+        """'Name · show' / 'Name · folder' (welcome panel and Recent menu)."""
+        if ref["kind"] == "file":
+            return f"{os.path.splitext(os.path.basename(ref['path']))[0]}  ·  show"
+        return f"{self.folder_display_name(ref['path'])}  ·  folder"
 
     def _refresh_welcome_recent(self):
-        refs = preferences.get_recent_shows()[:RECENT_ON_WELCOME]
+        refs = self.recent_shows()[:RECENT_ON_WELCOME]
         key = [(r.get("kind"), r.get("path")) for r in refs]
         if key == self._welcome_recent_refs:
             return
         self._welcome_recent_refs = key
         for child in self.welcome_recent.winfo_children():
             child.destroy()
+        self._welcome_recent_btns = []
         if not refs:
             return
         ctk.CTkLabel(self.welcome_recent, text="RECENT", font=(FONT_UI, 10, "bold"),
                      text_color=COLOR_TEXT_DIM, anchor="w").pack(fill="x", pady=(0, 2))
         for ref in refs:
-            if ref["kind"] == "file":
-                name = os.path.splitext(os.path.basename(ref["path"]))[0]
-                kind = "show"
-            else:
-                name, kind = self.folder_display_name(ref["path"]), "folder"
             btn = ctk.CTkButton(
-                self.welcome_recent, text=f"{name}   ·  {kind}", height=26, anchor="w",
+                self.welcome_recent, text=self.recent_label(ref), height=26, anchor="w",
                 font=(FONT_UI, 11), fg_color="transparent", hover_color=COLOR_HOVER,
                 text_color=COLOR_TEXT, command=lambda r=ref: self.open_recent(r))
             btn.pack(fill="x")
             ToolTip(btn, ref["path"])
-            self.welcome_buttons.append(btn)
+            self._welcome_recent_btns.append(btn)
         self._apply_enabled()
 
     def is_no_show(self) -> bool:
@@ -1102,12 +1119,10 @@ class ShowSidebar(ctk.CTkFrame):
         menu.add_command(label="Open Show…", command=self.open_show_dialog, state=live)
         menu.add_command(label="Open Folder…", command=self.open_folder_dialog, state=live)
         recent = tk.Menu(menu, tearoff=0)
-        refs = preferences.get_recent_shows()
+        refs = self.recent_shows()
         for ref in refs:
-            icon = "📄" if ref["kind"] == "file" else "📁"
-            name = (os.path.splitext(os.path.basename(ref["path"]))[0] if ref["kind"] == "file"
-                    else self.folder_display_name(ref["path"]))
-            recent.add_command(label=f"{icon} {name}", command=lambda r=ref: self.open_recent(r))
+            recent.add_command(label=self.recent_label(ref),
+                               command=lambda r=ref: self.open_recent(r))
         if not refs:
             recent.add_command(label="(none yet)", state="disabled")
         menu.add_cascade(label="Recent", menu=recent, state=live)

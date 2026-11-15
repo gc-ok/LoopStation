@@ -44,6 +44,7 @@ from config import (
 )
 from utils.paths import get_asset_path
 from backend import StateManager, PlaybackState
+from backend.state_manager import FOLLOW_LOCKED_ACTIONS
 from backend.web_server import CueWebServer, SharedCueState, WebServerStartError
 from utils.formatting import format_time
 from utils.tooltip import ToolTip
@@ -106,6 +107,37 @@ class LoadingOverlay(ctk.CTkFrame):
         self.sub_msg.place(relx=0.5, rely=0.55, anchor="center")
 
 
+class StartupCover(ctk.CTkFrame):
+    """
+    Covers the main window while the engine starts, in the window's own
+    theme, so launch is one window that fades in and then reveals the UI
+    (no separate splash that flashes and swaps). See begin_startup().
+    """
+    def __init__(self, parent, version=""):
+        super().__init__(parent, fg_color=COLOR_BG_DARK, corner_radius=0)
+        box = ctk.CTkFrame(self, fg_color="transparent")
+        box.place(relx=0.5, rely=0.46, anchor="center")
+        ctk.CTkLabel(box, text="↻", font=(FONT_UI, 40, "bold"),
+                     text_color=COLOR_BTN_PRIMARY).pack()
+        ctk.CTkLabel(box, text="Loop Station", font=(FONT_UI, 28, "bold"),
+                     text_color=COLOR_TEXT).pack(pady=(2, 0))
+        if version:
+            ctk.CTkLabel(box, text=f"Version {version}", font=(FONT_UI, 11),
+                         text_color=COLOR_TEXT_DIM).pack()
+        self.bar = ctk.CTkProgressBar(box, width=260, height=4, corner_radius=2,
+                                      fg_color=COLOR_BG_LIGHT,
+                                      progress_color=COLOR_BTN_PRIMARY)
+        self.bar.set(0.0)
+        self.bar.pack(pady=(22, 8))
+        self.step = ctk.CTkLabel(box, text="Starting…", font=(FONT_UI, 12),
+                                 text_color=COLOR_TEXT_DIM)
+        self.step.pack()
+
+    def set_step(self, text, fraction):
+        self.step.configure(text=text)
+        self.bar.set(max(0.0, min(1.0, float(fraction))))
+
+
 class LoopStationApp(ctk.CTk, *_DND_BASES):
     def __init__(self, ffmpeg_path: str = "ffmpeg"):
         super().__init__()
@@ -119,6 +151,11 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
         # Song loading guard: True from click until the worker reports back
         self._loading = False
         self._autoplay_path = None      # GO-advanced song: play once loaded
+        self._gc_paused = False         # automatic GC paused for a GO load
+        # Last-song preference is written on a worker (_remember_last_song)
+        self._last_song_lock = threading.Lock()
+        self._last_song_pending = None
+        self._last_song_writer = None
         self._overlay_after = None      # delayed overlay (preloaded song)
 
         # path (normcase'd) -> (frames, envelope) from preloaded songs
@@ -248,6 +285,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             'loop_cycle': self._on_loop_cycle,
             'live_mode_changed': self._on_live_mode_changed,
             'blocked_in_live_mode': self._on_blocked_in_live_mode,
+            'blocked_following': self._on_blocked_following,
             # Song settings / engine
             'settings_changed': self._on_settings_changed,
             'stems_changed': self._on_stems_changed,
@@ -315,28 +353,102 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             logger.info(f"File drag-and-drop disabled (tkdnd failed to load: {e})")
             return False
 
-    def initialize_audio_system(self):
+    # =========================================================================
+    # STARTUP (one window: fade in under a cover, start the engine, reveal)
+    # =========================================================================
+
+    STARTUP_FADE_STEPS = 8
+    STARTUP_FADE_S = 0.16
+
+    def begin_startup(self, version=""):
         """
-        Initializes the audio engine and wires up callbacks.
-        Called by main.py AFTER the splash screen is visible.
+        Show the window (call once, while withdrawn) fully drawn under the
+        startup cover and fade it in; initialize_audio_system() then reports
+        its steps on the cover and finish_startup() reveals the UI.
+        """
+        self._startup_cover = StartupCover(self, version=version)
+        self._startup_cover.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._startup_cover.lift()
+        alpha = self._set_alpha(0.0)
+        self.deiconify()
+        self.update()                   # map + paint the cover while invisible
+        if alpha:
+            for i in range(1, self.STARTUP_FADE_STEPS + 1):
+                self._set_alpha(i / self.STARTUP_FADE_STEPS)
+                self.update()
+                time.sleep(self.STARTUP_FADE_S / self.STARTUP_FADE_STEPS)
+        self._set_alpha(1.0)
+
+    def _set_alpha(self, value) -> bool:
+        """Window opacity (Windows and macOS; a no-op where unsupported)."""
+        try:
+            self.attributes("-alpha", value)
+            return True
+        except tk.TclError:
+            return False
+
+    @property
+    def starting_up(self) -> bool:
+        return getattr(self, "_startup_cover", None) is not None
+
+    def set_startup_step(self, text, fraction):
+        """Progress on the startup cover. A full update() so it really reaches
+        the screen (macOS paints in its run loop, not in idle tasks); the
+        cover sits over every control, so no click gets through meanwhile."""
+        cover = getattr(self, "_startup_cover", None)
+        if cover is None:
+            return
+        try:
+            cover.set_step(text, fraction)
+            self.update()
+        except tk.TclError:
+            pass
+
+    def finish_startup(self):
+        """Lay the finished UI out under the cover, then lift the cover off."""
+        cover, self._startup_cover = getattr(self, "_startup_cover", None), None
+        if cover is None:
+            return
+        try:
+            cover.set_step("Ready", 1.0)
+            self.update_idletasks()     # UI fully laid out beneath the cover
+            cover.place_forget()
+            cover.destroy()
+        except tk.TclError:
+            pass
+        if self._loading:
+            self.show_loading()         # last song still loading: same surface
+        self.focus_set()
+
+    def initialize_audio_system(self, progress=None):
+        """
+        Initializes the audio engine and wires up callbacks. ``progress``
+        (text, fraction) reports each step (main.py: set_startup_step).
         """
         if self.app_state is not None:
             logger.warning("initialize_audio_system called twice; ignoring")
             return
 
+        def step(text, fraction):
+            if progress is not None:
+                progress(text, fraction)
+
         logger.info("Initializing Audio Backend...")
 
         # 0. Create the WaveformWidget NOW (deferred from __init__ to avoid
-        #    matplotlib segfault on macOS ARM during splash screen rendering)
+        #    a matplotlib segfault on macOS ARM while the window first draws)
+        step("Preparing the waveform…", 0.15)
         if self.waveform is None:
             self.waveform = WaveformWidget(self.wave_container, on_seek=self._on_waveform_seek)
             self.waveform.on_selection_change = self._on_selection_change
             self.waveform.pack(fill="x")
 
         # 1. Create the heavy Audio Engine / State Manager now
+        step("Starting the audio engine…", 0.35)
         self.app_state = StateManager(ffmpeg_path=self.ffmpeg_path)
 
         # 2. NOW it is safe to wire callbacks because app_state exists
+        step("Connecting controls…", 0.65)
         self._wire_callbacks()
 
         # 3. Re-sync any UI elements if necessary
@@ -348,6 +460,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             self.msg_queue.put(('data_load_failed', (self.app_state.last_load_error,)))
 
         # 5. Library folder / last song (and sharing after a theme restart)
+        step("Opening your show…", 0.85)
         self._restore_session()
 
         logger.info("Audio Backend Ready")
@@ -939,7 +1052,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
 
     def _on_exit_loop(self):
         """EXIT LOOP (in loop mode) / SKIP VAMP (in transport mode)."""
-        if self.app_state is None:
+        if self.app_state is None or self._blocked_by_following():
             return
         in_loop = self.app_state.is_in_loop_mode()
         self.app_state.queue_exit(fade_mode=False)
@@ -949,7 +1062,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
 
     def _on_fade_exit(self, fade_ms=None):
         """Fade out of the loop (fade_ms=None uses the vamp's own exit fade)."""
-        if self.app_state is None:
+        if self.app_state is None or self._blocked_by_following():
             return
         if self.app_state.is_in_loop_mode():
             self.app_state.queue_exit(fade_mode=True, fade_ms=fade_ms)
@@ -1444,7 +1557,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             'data_load_failed', 'save_failed', 'save_succeeded', 'preview_changed',
             'standby_changed', 'go_fired', 'go_next_song',
             'hold_reached', 'hold_released',
-            'live_mode_changed', 'blocked_in_live_mode',
+            'live_mode_changed', 'blocked_in_live_mode', 'blocked_following',
             'settings_changed', 'stems_changed', 'render_state',
             'tempo_estimated', 'device_error', 'device_lost', 'device_restored',
             'go_next_entry', 'show_changed', 'current_entry_changed', 'next_up_changed',
@@ -1691,7 +1804,14 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
         # Free unreachable Tk objects (images, widgets) HERE on the Tk thread:
         # the decode allocates heavily, and a collection triggered on the
         # worker would run their __del__ Tcl calls on the wrong thread.
-        gc.collect()
+        # A GO-advance must start instantly, and a full collection late in a
+        # show can take 100+ ms: pause automatic collection for the load
+        # instead (_on_load_finished resumes it); the next load collects.
+        if from_go:
+            self._gc_paused = gc.isenabled()
+            gc.disable()
+        else:
+            gc.collect()
         threading.Thread(target=self._load_song_thread, args=(path, from_go, entry_id),
                          daemon=True).start()
 
@@ -1750,10 +1870,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             self.waveform.begin_song(duration)
         path = getattr(self.app_state, 'current_song_path', None) if self.app_state else None
         if path:
-            try:
-                preferences.save_preferences({self.PREF_LAST_SONG: path})
-            except Exception:
-                logger.debug("Could not remember the last song", exc_info=True)
+            self._remember_last_song(path)
         self._refresh_cue_sheet()
         # Refresh notes sidebar with new song's timeline
         self._refresh_notes_timeline()
@@ -1790,6 +1907,9 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
 
     def _on_load_finished(self):
         self._loading = False
+        if self._gc_paused:
+            self._gc_paused = False
+            gc.enable()
         if self._overlay_after is not None:
             try:
                 self.after_cancel(self._overlay_after)
@@ -1807,8 +1927,8 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
         """Saved vamp/cue data could not be read; tell the user once."""
         if message in self._shown_load_errors:
             return
-        if not self.winfo_viewable():
-            # Window still withdrawn (splash) — try again shortly
+        if not self.winfo_viewable() or self.starting_up:
+            # Window still withdrawn or starting up: try again shortly
             self.after(500, lambda: self._on_data_load_failed(message))
             return
         self._shown_load_errors.add(message)
@@ -2241,9 +2361,13 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
         """Backup following: its own transport would race the mirrored actions."""
         if not self.mirror_following():
             return False
+        self._on_blocked_following()
+        return True
+
+    def _on_blocked_following(self, _what=None):
+        """Also the 'blocked_following' event: state refused a local action."""
         self.status_label.configure(text=self.FOLLOWING_TEXT, text_color="#f0a020")
         self.go_panel.flash("following main", "#f0a020")
-        return True
 
     def _apply_following_lock(self, following):
         state = "disabled" if following else "normal"
@@ -2578,7 +2702,7 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
             if self._loading:
                 logger.info(f"MIDI {action!r} ignored while a song is loading")
                 return
-            if action in ('go', 'play_pause', 'stop') and self._blocked_by_following():
+            if action in FOLLOW_LOCKED_ACTIONS and self._blocked_by_following():
                 return      # backup following the main: its transport is the main's
             if action == 'toggle_live' and not self.app_state.live_mode:
                 self._prepare_enter_live()
@@ -2704,8 +2828,41 @@ class LoopStationApp(ctk.CTk, *_DND_BASES):
         except tk.TclError:
             pass
 
+    def _remember_last_song(self, path):
+        """
+        Store the last song off the Tk thread: the prefs write fsyncs and can
+        retry for ~0.5 s on a locked file (Windows), which must never delay a
+        GO-advance. Rapid loads coalesce to one write of the latest path.
+        """
+        with self._last_song_lock:
+            self._last_song_pending = path
+            if self._last_song_writer is not None and self._last_song_writer.is_alive():
+                return
+            self._last_song_writer = threading.Thread(
+                target=self._last_song_writer_loop, name="last-song-pref", daemon=True)
+            self._last_song_writer.start()
+
+    def _last_song_writer_loop(self):
+        while True:
+            with self._last_song_lock:
+                path, self._last_song_pending = self._last_song_pending, None
+                if path is None:
+                    self._last_song_writer = None
+                    return
+            try:
+                preferences.save_preferences({self.PREF_LAST_SONG: path})
+            except Exception:
+                logger.debug("Could not remember the last song", exc_info=True)
+
+    def _flush_last_song(self, timeout=2.0):
+        """Shutdown: let a pending last-song write finish."""
+        writer = self._last_song_writer
+        if writer is not None:
+            writer.join(timeout)
+
     def _shutdown_backend(self):
         """Stop sharing, stop playback, flush saves and release the engine."""
+        self._flush_last_song()
         if self._web_server:
             # stop() is safe when the serve thread already died; it still
             # closes the listening socket.

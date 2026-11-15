@@ -91,6 +91,12 @@ DEVICE_LOST_LABEL = "Audio device lost - check interface"
 # (not "skip the next vamp").
 LATE_EXIT_GRACE_S = 1.5
 
+# Control actions a backup refuses while it follows its main (TAKE OVER first).
+FOLLOW_LOCKED_ACTIONS = frozenset({
+    "go", "play_pause", "stop", "exit_vamp", "fade_exit", "skip_vamp",
+    "next_cue", "prev_cue",
+})
+
 # MIDI toggle_live: leaving Live Mode needs a second press within this window.
 LIVE_EXIT_CONFIRM_S = 2.0
 
@@ -585,6 +591,8 @@ class StateManager:
     - 'blocked_in_live_mode': (what: str)
         what is a method name, or "leave_live_confirm" when a MIDI
         toggle_live needs a second press to leave Live Mode
+    - 'blocked_following': (what: str)  -- a backup following its main
+        refused a local transport action (GO, exit, cue jump, seek...)
     - 'device_error': (message: str)
     - 'device_lost': (message: str)   -- emitted (once) just before the
         matching 'device_error' when the output device stopped while playing
@@ -603,7 +611,7 @@ class StateManager:
         'tempo_estimated', 'blocked_in_live_mode', 'device_error',
         'device_lost', 'device_restored',
         'go_next_entry', 'show_changed', 'current_entry_changed', 'next_up_changed',
-        'show_save_failed', 'preload_ready', 'preload_failed',
+        'show_save_failed', 'preload_ready', 'preload_failed', 'blocked_following',
     )
 
     def __init__(self, ffmpeg_path: str = "ffmpeg", data_file: Optional[str] = None,
@@ -931,6 +939,26 @@ class StateManager:
         if self.live_mode:
             logger.info(f"Blocked in live mode: {what}")
             self._emit('blocked_in_live_mode', what)
+            return True
+        return False
+
+    def _follow_blocked(self, what: str) -> bool:
+        """
+        True (and emits 'blocked_following') when this is a backup following
+        its main: a local transport action would race the mirrored ones and
+        leave the backup at the wrong place for TAKE OVER. The mirror's own
+        applier runs inside _mirror_quiet() and is never blocked.
+        """
+        if getattr(self._mirror_tls, 'quiet', 0):
+            return False
+        mirror = getattr(self, 'mirror', None)
+        try:
+            following = mirror is not None and mirror.is_following()
+        except Exception:
+            following = False
+        if following:
+            logger.info(f"Blocked while following the main: {what}")
+            self._emit('blocked_following', what)
             return True
         return False
 
@@ -1364,7 +1392,7 @@ class StateManager:
         vamp's start). Returns False (and emits 'blocked_in_live_mode') in
         live mode.
         """
-        if self._blocked("play_from"):
+        if self._blocked("play_from") or self._follow_blocked("play_from"):
             return False
         self._play_from(position)
         return True
@@ -1488,7 +1516,7 @@ class StateManager:
 
     def nudge(self, amount: float) -> bool:
         """Nudge position by a small amount (seconds). Blocked in live mode."""
-        if self._blocked("nudge"):
+        if self._blocked("nudge") or self._follow_blocked("nudge"):
             return False
         pos = self.audio.get_position()
         self.seek(pos + amount)
@@ -1496,21 +1524,21 @@ class StateManager:
 
     def user_seek(self, position: float) -> bool:
         """A free seek from the UI (waveform click). Blocked in live mode."""
-        if self._blocked("seek"):
+        if self._blocked("seek") or self._follow_blocked("seek"):
             return False
         self.seek(position)
         return True
 
     def seek_to_start(self) -> bool:
         """Home: seek to the top of the song. Blocked in live mode."""
-        if self._blocked("seek_start"):
+        if self._blocked("seek_start") or self._follow_blocked("seek_start"):
             return False
         self.seek(0.0)
         return True
 
     def preview_from(self, position: float) -> bool:
         """Audition from ``position`` (detector cut preview). Blocked in live mode."""
-        if self._blocked("preview"):
+        if self._blocked("preview") or self._follow_blocked("preview"):
             return False
         self._play_from(position)
         return True
@@ -1678,6 +1706,8 @@ class StateManager:
         (no action, or a second GO within GO_DEBOUNCE_MS). ``source`` is
         recorded in the GO log ("ui", "midi", "web", "segue", ...).
         """
+        if self._follow_blocked("go"):
+            return False
         next_entry_id = None
         now = time.monotonic()
         with self._go_lock:
@@ -1909,7 +1939,7 @@ class StateManager:
         engine points. Returns False (and emits 'blocked_in_live_mode') in
         live mode, or when there is nothing to preview.
         """
-        if self._blocked("preview_loop"):
+        if self._blocked("preview_loop") or self._follow_blocked("preview_loop"):
             return False
         if not self.current_song_path:
             logger.warning("preview_loop: no song loaded")
@@ -1980,6 +2010,8 @@ class StateManager:
             fade_mode: If True, fade out instead of cutting to transport
             fade_ms: Fade duration in ms (defaults to the vamp's exit_fade_ms)
         """
+        if self._follow_blocked("exit_vamp"):
+            return False
         if self.audio.mode != "loop" and self._clock() - self._count_exit_time < LATE_EXIT_GRACE_S:
             # The vamp ended on its own count a moment ago: this press was
             # meant for that vamp, not "skip the next one".
@@ -2098,7 +2130,7 @@ class StateManager:
         Seek to a marker's position and start playing (cue-sheet click: an
         arbitrary jump). Blocked in live mode; next/prev cue stay allowed.
         """
-        if self._blocked("jump_to_marker"):
+        if self._blocked("jump_to_marker") or self._follow_blocked("jump_to_marker"):
             return False
         for marker in self.markers:
             if marker.id == marker_id:
@@ -2112,6 +2144,8 @@ class StateManager:
         Jump to the next marker after current position. Allowed in
         live mode (key / MIDI next_cue walk the cue list in order).
         """
+        if self._follow_blocked("next_cue"):
+            return False
         pos = self.audio.get_position()
         for marker in sorted(self.markers, key=lambda m: m.time):
             if marker.time > pos + 0.1:
@@ -2124,6 +2158,8 @@ class StateManager:
         Jump to the previous marker before current position. Allowed in
         live mode (key / MIDI prev_cue walk the cue list in order).
         """
+        if self._follow_blocked("prev_cue"):
+            return False
         pos = self.audio.get_position()
         prev_marker = None
         for marker in sorted(self.markers, key=lambda m: m.time):
@@ -3405,6 +3441,8 @@ class StateManager:
 
     def perform_action(self, action: str, source: str = "midi") -> None:
         """Perform a named control action (see midi_control.ACTIONS)."""
+        if action in FOLLOW_LOCKED_ACTIONS and self._follow_blocked(action):
+            return      # backup following its main: transport is the main's
         if action == "go":
             self.go(source)
         elif action == "play_pause":

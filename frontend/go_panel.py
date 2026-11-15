@@ -287,7 +287,7 @@ class GoPanel(ctk.CTkFrame):
 
     def set_previewing(self, previewing: bool):
         self._previewing = bool(previewing)
-        # Text comes from _update_loop_sel_state (keeps "🔒" while live)
+        # Text comes from _update_loop_sel_state (says "(locked)" while live)
         self._update_loop_sel_state()
         self.btn_loop_sel.configure(
             fg_color=COLOR_BTN_PRIMARY if previewing else COLOR_BG_LIGHT,

@@ -129,10 +129,6 @@ def show_fatal_error(title, message):
 
 
 # =============================================================================
-# BOOTSTRAP SPLASH SCREEN
-# =============================================================================
-
-# =============================================================================
 # UTILS
 # =============================================================================
 
@@ -338,15 +334,17 @@ def main():
             from frontend.app import LoopStationApp  # late import: fresh config colours
 
             app = LoopStationApp(ffmpeg_path=ffmpeg_path)
-            # Build everything hidden and show the window ONCE, fully drawn.
-            # (A splash card used to flash for ~1 s before the main window,
-            # and centring could map the half-built window for a frame.)
+            # One window from first frame to ready: it is placed while hidden,
+            # fades in under a startup cover in the app's own theme, shows the
+            # startup steps there and then reveals the UI. (A separate splash
+            # used to flash and swap to the main window, which felt jarring;
+            # a hidden window for the whole startup looked like nothing ran.)
             app.withdraw()
             install_tk_crash_handler(app, logger)
             center_window(app, WINDOW_WIDTH, WINDOW_HEIGHT)
-            app.initialize_audio_system()
-            app.update_idletasks()
-            app.deiconify()
+            app.begin_startup(version=__version__)
+            app.initialize_audio_system(progress=app.set_startup_step)
+            app.finish_startup()
             first_run = False
 
             app.run()

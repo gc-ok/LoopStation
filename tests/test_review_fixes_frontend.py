@@ -402,9 +402,12 @@ def test_position_throttle_delivers_latest_update(ui):
 
 
 def test_throttle_and_countdown_use_monotonic_clock():
+    import importlib
     import inspect
-    app_src = inspect.getsource(mod("frontend.app").LoopStationApp._update_position)
-    side_src = inspect.getsource(mod("frontend.notes_sidebar").NotesSidebar.update_position)
+    # Source only: import it here too (CI runs this without the gui tests)
+    app_src = inspect.getsource(importlib.import_module("frontend.app").LoopStationApp._update_position)
+    side_src = inspect.getsource(
+        importlib.import_module("frontend.notes_sidebar").NotesSidebar.update_position)
     assert "time.monotonic()" in app_src and "time.time()" not in app_src
     assert "time.monotonic()" in side_src and "time.time()" not in side_src
 

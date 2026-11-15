@@ -53,6 +53,11 @@ MIDI in, OSC out). Entry point: `main.py`.
   must pass in any file order; check by running the frontend test files in
   reverse order.
 - `tests/fake_engine.py` is a fake audio engine for state and UI tests.
+- `tests/conftest.py` marks every test that uses the `_app`/`ui` fixture as
+  `gui`. CI runs `-m "not gui"` and `-m gui` as separate steps. On the
+  macOS runner, tests marked `mac_ci_hang` (modal dialogs) run in a final
+  step that reports failures without failing the build. A test in a
+  non-GUI step must import what it needs itself.
 
 ## Design rules (keep consistent)
 
@@ -75,7 +80,11 @@ MIDI in, OSC out). Entry point: `main.py`.
     click jumps through `jump_to_marker`/`play_from`), editing, key/MIDI/OSC
     remapping, mirror settings, and opening or reordering a Show.
   - Separately, a backup that is following its main has its own transport
-    locked until TAKE OVER.
+    locked until TAKE OVER: GO, play/pause/stop, exit/fade/skip, next/prev
+    cue and every seek or jump. `StateManager._follow_blocked()` enforces
+    it (it emits `blocked_following`; `FOLLOW_LOCKED_ACTIONS` covers control
+    surfaces). It is skipped inside `_mirror_quiet()`, so the mirror applier
+    still drives the backup.
   - The rule is enforced in `state_manager` (`_blocked()`) as well as in the
     UI.
 - **UI styling:**
@@ -91,6 +100,18 @@ MIDI in, OSC out). Entry point: `main.py`.
     breaks the light themes.
   - Use text or monochrome glyphs (◆ ↻ ⏸ ▶ ⏹) in controls, not colour
     emoji, because they render differently on each platform.
+- **Startup is one window:**
+  - `main.py` places the main window while it is hidden. `begin_startup()`
+    fades it in under a themed `StartupCover`.
+    `initialize_audio_system(progress=...)` reports its steps on the cover,
+    and `finish_startup()` lifts the cover off.
+  - The owner found a separate splash that flashes and then swaps to the
+    main window jarring ("felt like malware"), so never bring one back.
+    Don't leave the window hidden for the whole startup either.
+- **Instant GO:** keep the GO-advance load path free of Tk-thread disk
+  I/O and full GC passes. The last-song preference is written on a worker
+  (`_remember_last_song`), and a `from_go` load pauses automatic GC instead
+  of calling `gc.collect()`.
 - **Saved data is precious:**
   - Never overwrite `loop_data.json` or preferences that failed to read.
     Quarantine only real parse errors.

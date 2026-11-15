@@ -23,6 +23,15 @@ PREFS_FILE = os.path.join(get_data_dir(), "user_preferences.json")
 # Serialises read-modify-write cycles across threads
 _lock = threading.RLock()
 
+# Bumped by every save, so UI caches (the recent shows list) can skip re-reading
+# the file on hot paths until something actually changed it.
+_write_count = 0
+
+
+def change_token():
+    """Changes whenever this process saves preferences (or the file is switched)."""
+    return PREFS_FILE, _write_count
+
 
 def _read_prefs():
     """
@@ -72,7 +81,9 @@ def _merge(current: dict, prefs: dict) -> None:
 
 def save_preferences(prefs: dict) -> None:
     """Merge `prefs` into the stored preferences and write atomically."""
+    global _write_count
     with _lock:
+        _write_count += 1     # even a failed write may have changed the file
         try:
             current, status, raw = _read_prefs()
             if status == "unreadable":

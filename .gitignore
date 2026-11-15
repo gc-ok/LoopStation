@@ -17,3 +17,8 @@ logs/
 # Editors
 .vscode/
 .idea/
+
+# Local screenshots (keep them out of the repo)
+/Screenshot*.png
+videos/
+marketing/
